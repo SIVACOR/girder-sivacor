@@ -4,7 +4,9 @@ with open('README.md') as readme_file:
     readme = readme_file.read()
 
 requirements = [
-    'girder>=5.0.0a1'
+    'girder>=5.0.0a1',
+    'girder-oauth>=5.0.0a1',
+    'girder-jobs>=5.0.0a1'
 ]
 
 setup(
@@ -22,7 +24,7 @@ setup(
     long_description=readme,
     long_description_content_type='text/x-rst',
     include_package_data=True,
-    keywords='girder-plugin, girder_sivacor',
+    keywords='girder-plugin',
     name='girder_sivacor',
     packages=find_packages(exclude=['test', 'test.*']),
     url='https://github.com/SIVACOR/girder-sivacor',
@@ -30,7 +32,7 @@ setup(
     zip_safe=False,
     entry_points={
         'girder.plugin': [
-            'girder_sivacor = girder_sivacor:GirderPlugin'
+            'sivacor = girder_sivacor:SIVACORPlugin'
         ]
     }
 )
