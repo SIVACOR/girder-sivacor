@@ -164,7 +164,7 @@ def run_tro(submission, action):
     job = Job().load(submission["job_id"], force=True)
     job = Job().updateJob(
         job,
-        "Running TRO utilities on workspace.\n",
+        f"Running TRO utilities on workspace. ({action})\n",
         status=JobStatus.RUNNING,
     )
     try:
@@ -261,7 +261,7 @@ def run_tro(submission, action):
 
     job = Job().updateJob(
         job,
-        "TRO utilities completed successfully.\n",
+        f"TRO utilities completed successfully. ({action})\n",
         status=JobStatus.RUNNING,
     )
     return submission
