@@ -91,7 +91,8 @@ def prepare_submission(userId, fileId, image_tag, job_id):
         item = Item().load(fobj["itemId"], user=user, level=AccessType.READ)
         Item().move(item, submission_folder)
         Folder().setMetadata(
-            submission_folder, {"image_tag": image_tag, "status": "submitted"}
+            submission_folder,
+            {"image_tag": image_tag, "status": "submitted", "job_id": job_id},
         )
         Job().updateJob(
             job,
@@ -197,6 +198,8 @@ def run_tro(submission, action):
 
         files_to_upload = []
 
+        meta = {}
+
         if action == "add_arrangement":
             arrangements = tro.list_arrangements()
             if not arrangements:
@@ -217,9 +220,12 @@ def run_tro(submission, action):
             )
         elif action == "sign":
             tro.request_timestamp()
-            for filename in (tro.sig_filename, tro.tsr_filename):
+
+            for meta_key, filename in zip(
+                ("sig_file_id", "tsr_file_id"), (tro.sig_filename, tro.tsr_filename)
+            ):
                 with open(filename, "rb") as f:
-                    Upload().uploadFromFile(
+                    fobj = Upload().uploadFromFile(
                         f,
                         os.path.getsize(filename),
                         os.path.basename(filename),
@@ -227,6 +233,8 @@ def run_tro(submission, action):
                         parent=submission_folder,
                         user=admin,
                     )
+                    meta[meta_key] = str(fobj["_id"])
+
         tro.save()
         if tro_obj:
             _update_file_from_path(tro_obj, tro.tro_filename, admin)
@@ -240,6 +248,8 @@ def run_tro(submission, action):
                 user=admin,
             )
             submission["troId"] = str(tro_obj["_id"])
+        meta["tro_file_id"] = str(tro_obj["_id"])
+        Folder().setMetadata(submission_folder, meta)
         files_to_upload.append(tro.tro_filename)
     except Exception as exc:
         Job().updateJob(
