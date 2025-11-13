@@ -1,0 +1,93 @@
+from girder.api import access
+from girder.api.describe import Description, autoDescribeRoute
+from girder.api.rest import Resource, filtermodel
+from girder.constants import AccessType
+from girder.exceptions import ValidationException
+from girder.models.file import File as FileModel
+from girder.models.setting import Setting as SettingModel
+from girder.models.user import User as UserModel
+from girder_jobs.constants import JobStatus
+from girder_jobs.models.job import Job as JobModel
+
+from .settings import PluginSettings
+from .worker_plugin.run_submission import (
+    create_workspace,
+    execute_workflow,
+    finalize_job,
+    prepare_submission,
+    run_tro,
+)
+
+
+class SIVACOR(Resource):
+    def __init__(self):
+        super(SIVACOR, self).__init__()
+        self.resourceName = "sivacor"
+        self.route("POST", ("submit_job",), self.submit_job)
+        self.route("GET", ("image_tags",), self.get_image_tags)
+
+    @access.user
+    @autoDescribeRoute(
+        Description("Submit a job to SIVACOR.")
+        .modelParam(
+            "id",
+            "The ID of the file to process.",
+            model=FileModel,
+            level=AccessType.ADMIN,
+            required=True,
+            paramType="query",
+        )
+        .param(
+            "image_tag", "The Docker image tag to use for processing.", required=True
+        )
+    )
+    @filtermodel(model=JobModel)
+    def submit_job(self, file, image_tag):
+        if image_tag not in SettingModel().get(PluginSettings.IMAGE_TAGS):
+            raise ValidationException(f"Invalid image tag: {image_tag}")
+        # Job submission logic goes here
+        user = self.getCurrentUser()
+        job = JobModel().createJob(
+            title=f"SIVACOR Run for {file['name']} by {user['firstName']} {user['lastName']}",
+            type="sivacor_submission",
+            public=False,
+            user=user,
+        )
+
+        workflow = prepare_submission.s(
+            str(user["_id"]),
+            str(file["_id"]),
+            image_tag,
+            str(job["_id"]),
+        ).set(
+            girder_job_title=f"Moving {file['name']} to submission collection",
+        )
+        workflow |= create_workspace.s().set(girder_job_title="Create Workspace")
+        workflow |= run_tro.s("add_arrangement").set(
+            girder_job_title="Record initial arrangement"
+        )
+        workflow |= execute_workflow.s().set(
+            girder_job_title="Execute SIVACOR Workflow"
+        )
+        workflow |= run_tro.s("add_arrangement").set(
+            girder_job_title="Record final arrangement"
+        )
+        workflow |= run_tro.s("add_performance").set(
+            girder_job_title="Record Performance Metrics"
+        )
+        workflow |= run_tro.s("sign").set(girder_job_title="Sign TRO")
+        workflow |= finalize_job.s().set(girder_job_title="Finalize Job Submission")
+        workflow.apply_async(queue="local")
+        UserModel().collection.update_one(
+            {"_id": user["_id"]}, {"$set": {"lastJobId": job["_id"]}}
+        )
+        job = JobModel().updateJob(
+            job, "Preparing SIVACOR submission\n", status=JobStatus.RUNNING
+        )
+        return job
+
+    @access.public
+    @autoDescribeRoute(Description("Get available Docker image tags for SIVACOR."))
+    def get_image_tags(self):
+        tags = SettingModel().get(PluginSettings.IMAGE_TAGS)
+        return {"image_tags": tags}

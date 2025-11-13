@@ -10,6 +10,7 @@ from girder_oauth.providers import addProvider
 from girder_oauth.settings import PluginSettings as OAuthSettings
 
 from .auth.orcid import ORCID
+from .rest import SIVACOR
 from .settings import PluginSettings
 
 
@@ -17,6 +18,37 @@ from .settings import PluginSettings
 def _validate_uploads_folder_name(value):
     if not isinstance(value, str) or not value:
         raise ValidationException("Uploads folder name must be a non-empty string.")
+    return value
+
+
+@setting_utilities.validator(
+    {
+        PluginSettings.SUBMISSION_COLLECTION_NAME,
+        PluginSettings.EDITORS_GROUP_NAME,
+        PluginSettings.TRO_GPG_FINGERPRINT,
+        PluginSettings.TRO_GPG_PASSPHRASE,
+    }
+)
+def _validate_string_settings(doc):
+    value = doc.get("value")
+    if not isinstance(value, str) or not value:
+        raise ValidationException("This setting must be a non-empty string.")
+    return value
+
+
+@setting_utilities.validator(PluginSettings.TRO_PROFILE)
+def _validate_tro_profile(doc):
+    value = doc.get("value")
+    if not isinstance(value, dict):
+        raise ValidationException("TRO profile must be a dictionary.")
+    return value
+
+
+@setting_utilities.validator(PluginSettings.IMAGE_TAGS)
+def _validate_image_tags(doc):
+    value = doc.get("value")
+    if not isinstance(value, list) or not all(isinstance(tag, str) for tag in value):
+        raise ValidationException("Image tags must be a list of strings.")
     return value
 
 
@@ -60,6 +92,8 @@ class SIVACORPlugin(GirderPlugin):
         OAuthSettings.ORCID_CLIENT_ID = "oauth.orcid_client_id"
         OAuthSettings.ORCID_CLIENT_SECRET = "oauth.orcid_client_secret"
         addProvider(ORCID)
+
+        info["apiRoot"].sivacor = SIVACOR()
 
         registerPluginStaticContent(
             plugin="sivacor",
