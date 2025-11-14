@@ -1,8 +1,12 @@
-include LICENSE
-include README.rst
-include setup.py
-
-graft girder_sivacor
-graft docs
-prune test
 global-exclude *.py[co] *.cmake __pycache__ node_modules
+global-prune *.py[co] *.cmake __pycache__ node_modules
+prune girder_sivacor/web_client
+include girder_sivacor/web_client/dist/girder-plugin-sivacor.umd.cjs
+include girder_sivacor/web_client/dist/style.css
+include girder_sivacor/schemas/*.json
+prune girder_sivacor/tests
+exclude girder_sivacort/tests
+prune scripts
+exclude scripts
+exclude codecov.yml MANIFEST.in requirements-dev.txt tox.ini .coveragerc
+prune codecov.yml MANIFEST.in requirements-dev.txt tox.ini .coveragerc

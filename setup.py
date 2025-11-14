@@ -18,7 +18,6 @@ setup(
     author_email="xarthisius.kk@gmail.com",
     classifiers=[
         "Development Status :: 2 - Pre-Alpha",
-        "License :: OSI Approved :: Apache Software License",
         "Natural Language :: English",
         "Programming Language :: Python :: 3",
     ],
