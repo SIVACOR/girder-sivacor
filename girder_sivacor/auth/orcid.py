@@ -116,7 +116,7 @@ class ORCID(ProviderBase):
         )
 
         try:
-            email = resp["emails"]["email"][0]
+            email = resp["emails"]["email"][0]["email"]
         except (KeyError, TypeError, IndexError):
             email = "{orcid}@orcid.org".format(**token)
 
