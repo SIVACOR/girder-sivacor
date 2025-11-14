@@ -23,6 +23,7 @@ from girder_worker.app import app
 from tro_utils.tro_utils import TRO
 
 from ..settings import PluginSettings
+from .lib import recorded_run
 
 
 def _create_submission_directory(user):
@@ -94,11 +95,6 @@ def prepare_submission(userId, fileId, image_tag, job_id):
             submission_folder,
             {"image_tag": image_tag, "status": "submitted", "job_id": job_id},
         )
-        Job().updateJob(
-            job,
-            "Submission prepared successfully.\n",
-            status=JobStatus.RUNNING,
-        )
         return {
             "folder_id": str(submission_folder["_id"]),
             "file_id": str(fobj["_id"]),
@@ -151,11 +147,6 @@ def create_workspace(submission):
         )
         raise exc
 
-    job = Job().updateJob(
-        job,
-        "Workspace created successfully.\n",
-        status=JobStatus.RUNNING,
-    )
     return submission
 
 
@@ -164,7 +155,7 @@ def run_tro(submission, action):
     job = Job().load(submission["job_id"], force=True)
     job = Job().updateJob(
         job,
-        f"Running TRO utilities on workspace. ({action})\n",
+        f"Running TRO utilities in the workspace. ({action})\n",
         status=JobStatus.RUNNING,
     )
     try:
@@ -259,16 +250,11 @@ def run_tro(submission, action):
         )
         raise exc
 
-    job = Job().updateJob(
-        job,
-        f"TRO utilities completed successfully. ({action})\n",
-        status=JobStatus.RUNNING,
-    )
     return submission
 
 
-@app.task(queue="local")
-def execute_workflow(submission):
+@app.task(queue="local", bind=True)
+def execute_workflow(task, submission):
     job = Job().load(submission["job_id"], force=True)
     job = Job().updateJob(
         job,
@@ -277,10 +263,13 @@ def execute_workflow(submission):
     )
     try:
         # Placeholder for actual workflow execution logic
-        import time
 
         start_time = datetime.datetime.now()
-        time.sleep(5)  # Simulate workflow execution time
+        ret = recorded_run(submission, task)
+        if ret["StatusCode"] != 0:
+            raise RuntimeError(
+                f"Workflow execution failed with code {ret['StatusCode']}"
+            )
         end_time = datetime.datetime.now()
 
         submission["run_start_time"] = start_time.isoformat()
@@ -294,11 +283,6 @@ def execute_workflow(submission):
         )
         raise exc
 
-    job = Job().updateJob(
-        job,
-        "Workflow executed successfully.\n",
-        status=JobStatus.RUNNING,
-    )
     return submission
 
 
