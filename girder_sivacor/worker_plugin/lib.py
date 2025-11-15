@@ -161,6 +161,7 @@ def _infer_run_command(submission):
         command = os.path.join("/workspace", sub_dir, "code", "run.sh")
     else:
         raise ValueError("Cannot infer run command for submission")
+    os.chmod(os.path.join(temp_dir, sub_dir, "run.sh"), 0o755)
     return entrypoint, command
 
 
