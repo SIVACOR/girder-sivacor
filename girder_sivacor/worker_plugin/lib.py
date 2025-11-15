@@ -261,6 +261,8 @@ def recorded_run(submission, task=None):
         pass
 
     if not task.canceled and ret["StatusCode"] != 0:
-        raise ValueError("Error executing recorded run")
+        raise ValueError(
+            "Error executing recorded run. Check stdout/stderr for details."
+        )
 
     return ret
