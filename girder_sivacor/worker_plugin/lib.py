@@ -147,11 +147,18 @@ def stop_container(container: docker.models.containers.Container):
 def _infer_run_command(submission):
     temp_dir = submission["temp_dir"]
     entrypoint = ["/bin/sh", "-c"]
+
+    # check if temp_dir contains a single folder
+    items = os.listdir(temp_dir)
+    sub_dir = ""
+    if len(items) == 1 and os.path.isdir(os.path.join(temp_dir, items[0])):
+        sub_dir = items[0]
+
     command = None
-    if os.path.exists(os.path.join(temp_dir, "run.sh")):
-        command = "/workspace/run.sh"
-    elif os.path.exists(os.path.join(temp_dir, "code", "run.sh")):
-        command = "/workspace/code/run.sh"
+    if os.path.exists(os.path.join(temp_dir, sub_dir, "run.sh")):
+        command = os.path.join("/workspace", sub_dir, "run.sh")
+    elif os.path.exists(os.path.join(temp_dir, sub_dir, "code", "run.sh")):
+        command = os.path.join("/workspace", sub_dir, "code", "run.sh")
     else:
         raise ValueError("Cannot infer run command for submission")
     return entrypoint, command
