@@ -238,8 +238,8 @@ def run_tro(submission, action):
                 parent=submission_folder,
                 user=admin,
             )
-            os.remove(tro.tro_filename)
             submission["troId"] = str(tro_obj["_id"])
+        os.remove(tro.tro_filename)
         meta["tro_file_id"] = str(tro_obj["_id"])
         Folder().setMetadata(submission_folder, meta)
     except Exception as exc:
@@ -279,6 +279,54 @@ def execute_workflow(task, submission):
         Job().updateJob(
             job,
             "Failed to execute workflow: \n\t" + str(exc) + "\n",
+            status=JobStatus.ERROR,
+        )
+        raise exc
+
+    return submission
+
+
+@app.task(queue="local")
+def upload_workspace(submission):
+    # Upload the modified workspace back to Girder as a zip file
+    # called 'executed_replication_package.zip'
+    job = Job().load(submission["job_id"], force=True)
+    job = Job().updateJob(
+        job,
+        "Uploading executed replication package to Girder.\n",
+        status=JobStatus.RUNNING,
+    )
+    try:
+        admin = User().findOne({"admin": True})
+        submission_folder = Folder().load(submission["folder_id"], force=True)
+        zip_path = os.path.join(
+            submission["temp_dir"], "executed_replication_package.zip"
+        )
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+            for root, dirs, files in os.walk(submission["temp_dir"]):
+                for file in files:
+                    if file == "executed_replication_package.zip":
+                        continue
+                    file_path = os.path.join(root, file)
+                    arcname = os.path.relpath(file_path, submission["temp_dir"])
+                    zipf.write(file_path, arcname)
+
+        with open(zip_path, "rb") as f:
+            fobj = Upload().uploadFromFile(
+                f,
+                os.path.getsize(zip_path),
+                "executed_replication_package.zip",
+                parentType="folder",
+                parent=submission_folder,
+                user=admin,
+            )
+        os.remove(zip_path)
+        Folder().setMetadata(submission_folder, {"replpack_file_id": str(fobj["_id"])})
+        submission["replpack_file_id"] = str(fobj["_id"])
+    except Exception as exc:
+        Job().updateJob(
+            job,
+            "Failed to upload executed replication package: \n\t" + str(exc) + "\n",
             status=JobStatus.ERROR,
         )
         raise exc

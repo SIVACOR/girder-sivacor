@@ -15,6 +15,7 @@ from .worker_plugin.run_submission import (
     execute_workflow,
     finalize_job,
     prepare_submission,
+    upload_workspace,
     run_tro,
 )
 
@@ -76,6 +77,7 @@ class SIVACOR(Resource):
             girder_job_title="Record Performance Metrics"
         )
         workflow |= run_tro.s("sign").set(girder_job_title="Sign TRO")
+        workflow |= upload_workspace.s().set(girder_job_title="Upload Replicated Package")
         workflow |= finalize_job.s().set(girder_job_title="Finalize Job Submission")
         workflow.apply_async(queue="local")
         UserModel().collection.update_one(
