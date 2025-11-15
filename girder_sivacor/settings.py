@@ -16,7 +16,11 @@ SettingDefault.defaults.update(
         PluginSettings.UPLOADS_FOLDER_NAME: "Uploads",
         PluginSettings.SUBMISSION_COLLECTION_NAME: "Submissions",
         PluginSettings.EDITORS_GROUP_NAME: "Editors",
-        PluginSettings.IMAGE_TAGS: ["rocker/r-ver:4.3.1", "dataeditors/stata18_5-mp:2025-02-26"],
+        PluginSettings.IMAGE_TAGS: [
+            "rocker/r-ver:4.3.1",
+            "rocker/tidyverse:4.3.1",
+            "dataeditors/stata18_5-mp:2025-02-26",
+        ],
         PluginSettings.TRO_GPG_FINGERPRINT: "fingerprint",
         PluginSettings.TRO_GPG_PASSPHRASE: "passphrase",
         PluginSettings.TRO_PROFILE: {
