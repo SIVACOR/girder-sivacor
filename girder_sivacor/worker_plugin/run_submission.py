@@ -5,6 +5,7 @@ import os
 import tarfile
 import tempfile
 import zipfile
+import shutil
 
 import randomname
 from girder.constants import AccessType
@@ -187,8 +188,6 @@ def run_tro(submission, action):
                 tro_description="SIVACOR Run",
             )
 
-        files_to_upload = []
-
         meta = {}
 
         if action == "add_arrangement":
@@ -225,6 +224,7 @@ def run_tro(submission, action):
                         user=admin,
                     )
                     meta[meta_key] = str(fobj["_id"])
+                os.remove(filename)
 
         tro.save()
         if tro_obj:
@@ -238,10 +238,10 @@ def run_tro(submission, action):
                 parent=submission_folder,
                 user=admin,
             )
+            os.remove(tro.tro_filename)
             submission["troId"] = str(tro_obj["_id"])
         meta["tro_file_id"] = str(tro_obj["_id"])
         Folder().setMetadata(submission_folder, meta)
-        files_to_upload.append(tro.tro_filename)
     except Exception as exc:
         Job().updateJob(
             job,
@@ -288,6 +288,7 @@ def execute_workflow(task, submission):
 
 @app.task(queue="local")
 def finalize_job(submission):
+    shutil.rmtree(submission["temp_dir"], ignore_errors=True)
     job = Job().load(submission["job_id"], force=True)
     job = Job().updateJob(
         job,

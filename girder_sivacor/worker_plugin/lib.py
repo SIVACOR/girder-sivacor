@@ -2,6 +2,7 @@ import logging
 import math
 import os
 import queue
+import tempfile
 import time
 from threading import Thread
 
@@ -162,7 +163,7 @@ def _infer_run_command(submission):
     else:
         raise ValueError("Cannot infer run command for submission")
     os.chmod(os.path.join(temp_dir, sub_dir, "run.sh"), 0o755)
-    return entrypoint, command
+    return entrypoint, command, sub_dir
 
 
 def recorded_run(submission, task=None):
@@ -187,11 +188,11 @@ def recorded_run(submission, task=None):
         }
     }
 
-    entrypoint, command = _infer_run_command(submission)
-
-    print("Running Tale with command: " + " ".join(entrypoint + [command]))
-
     cli.images.pull(image_tag)
+
+    entrypoint, command, sub_dir = _infer_run_command(submission)
+    print("Setting working directory to: " + os.path.join("/workspace", sub_dir))
+    print("Running Tale with command: " + " ".join(entrypoint + [command]))
 
     container = cli.containers.create(
         image=image_tag,
@@ -199,67 +200,66 @@ def recorded_run(submission, task=None):
         command=command,
         detach=True,
         volumes=volumes,
-        working_dir="/workspace",
+        working_dir=os.path.join("/workspace", sub_dir),
     )
 
     logging_thread = Thread(target=logging_worker, args=(log_queue, container))
-    container_temp_path = os.path.join("/tmp", container.name)
-    os.makedirs(container_temp_path, exist_ok=False)
-    dstats_tmppath = os.path.join(container_temp_path, "docker_stats")
-    stats_thread = DockerStatsCollectorThread(container, dstats_tmppath)
+    with tempfile.TemporaryDirectory() as container_temp_path:
+        dstats_tmppath = os.path.join(container_temp_path, "docker_stats")
+        stats_thread = DockerStatsCollectorThread(container, dstats_tmppath)
 
-    # Job output must come from stdout/stderr
-    container.start()
-    stats_thread.start()
-    logging_thread.start()
+        # Job output must come from stdout/stderr
+        container.start()
+        stats_thread.start()
+        logging_thread.start()
 
-    try:
-        container = cli.containers.get(container.id)
-        while container.status == "running":
-            while not log_queue.empty():
-                print(log_queue.get_nowait(), flush=True)
-            if task.canceled:
-                stop_container(container)
-                break
-            time.sleep(1)
+        try:
             container = cli.containers.get(container.id)
-    except docker.errors.NotFound:
-        pass
+            while container.status == "running":
+                while not log_queue.empty():
+                    print(log_queue.get_nowait(), flush=True)
+                if task.canceled:
+                    stop_container(container)
+                    break
+                time.sleep(1)
+                container = cli.containers.get(container.id)
+        except docker.errors.NotFound:
+            pass
 
-    stats_thread.join()
-    while not log_queue.empty():
-        print(log_queue.get_nowait())
-    logging_thread.join()
+        stats_thread.join()
+        while not log_queue.empty():
+            print(log_queue.get_nowait())
+        logging_thread.join()
 
-    if task.canceled:
-        ret = {"StatusCode": -123}
-    else:
-        ret = container.wait()
+        if task.canceled:
+            ret = {"StatusCode": -123}
+        else:
+            ret = container.wait()
 
-    # Dump run std{out,err} and entrypoint used.
-    meta = {}
-    for stdout, stderr, key in [
-        (True, False, "stdout"),
-        (False, True, "stderr"),
-    ]:
-        with open(os.path.join(container_temp_path, key), "wb") as fp:
-            fp.write(container.logs(stdout=stdout, stderr=stderr))
+        # Dump run std{out,err} and entrypoint used.
+        meta = {}
+        for stdout, stderr, key in [
+            (True, False, "stdout"),
+            (False, True, "stderr"),
+        ]:
+            with open(os.path.join(container_temp_path, key), "wb") as fp:
+                fp.write(container.logs(stdout=stdout, stderr=stderr))
 
-        with open(os.path.join(container_temp_path, key), "rb") as fp:
-            fobj = Upload().uploadFromFile(
-                fp,
-                os.path.getsize(fp.name),
-                os.path.basename(fp.name),
-                parentType="folder",
-                parent=submission_folder,
-                user=admin,
-            )
-            meta[key + "_file_id"] = str(fobj["_id"])
-    Folder().setMetadata(submission_folder, meta)
-    try:
-        container.remove()
-    except docker.errors.NotFound:
-        pass
+            with open(os.path.join(container_temp_path, key), "rb") as fp:
+                fobj = Upload().uploadFromFile(
+                    fp,
+                    os.path.getsize(fp.name),
+                    os.path.basename(fp.name),
+                    parentType="folder",
+                    parent=submission_folder,
+                    user=admin,
+                )
+                meta[key + "_file_id"] = str(fobj["_id"])
+        Folder().setMetadata(submission_folder, meta)
+        try:
+            container.remove()
+        except docker.errors.NotFound:
+            pass
 
     if not task.canceled and ret["StatusCode"] != 0:
         raise ValueError(
