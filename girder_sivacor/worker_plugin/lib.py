@@ -201,6 +201,7 @@ def recorded_run(submission, task=None):
         detach=True,
         volumes=volumes,
         working_dir=os.path.join("/workspace", sub_dir),
+        user=f"{os.getuid()}:{os.getgid()}",   # Run as current user
     )
 
     logging_thread = Thread(target=logging_worker, args=(log_queue, container))
