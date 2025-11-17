@@ -26,6 +26,8 @@ from tro_utils.tro_utils import TRO
 from ..settings import PluginSettings
 from .lib import recorded_run
 
+IGNORE_DIRS = [".git", "renv", "__pycache__"]
+
 
 def _create_submission_directory(user):
     # Logic to create submission directory based on fileId and image_tag
@@ -193,11 +195,16 @@ def run_tro(submission, action):
         if action == "add_arrangement":
             arrangements = tro.list_arrangements()
             if not arrangements:
-                tro.add_arrangement(temp_dir, comment="Before executing workflow")
+                tro.add_arrangement(
+                    temp_dir,
+                    comment="Before executing workflow",
+                    ignore_dirs=IGNORE_DIRS,
+                )
             else:
                 tro.add_arrangement(
                     temp_dir,
                     comment="After executing workflow",
+                    ignore_dirs=IGNORE_DIRS,
                 )
         elif action == "add_performance":
             tro.add_performance(
@@ -304,6 +311,8 @@ def upload_workspace(submission):
         )
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
             for root, dirs, files in os.walk(submission["temp_dir"]):
+                # ignore contents of dirs from IGNORE_DIRS
+                dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
                 for file in files:
                     if file == "executed_replication_package.zip":
                         continue

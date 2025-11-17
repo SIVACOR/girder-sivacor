@@ -201,7 +201,8 @@ def recorded_run(submission, task=None):
         detach=True,
         volumes=volumes,
         working_dir=os.path.join("/workspace", sub_dir),
-        #  user=f"{os.getuid()}:{os.getgid()}",   # Run as current user  # TODO Fix images
+        user=f"{os.getuid()}:{os.getgid()}",
+        environment={"HOME": "/tmp/home"},
     )
 
     logging_thread = Thread(target=logging_worker, args=(log_queue, container))
@@ -246,7 +247,18 @@ def recorded_run(submission, task=None):
             with open(os.path.join(container_temp_path, key), "wb") as fp:
                 fp.write(container.logs(stdout=stdout, stderr=stderr))
 
-            with open(os.path.join(container_temp_path, key), "rb") as fp:
+            target_file = os.path.join(container_temp_path, key)
+            if key == "stdout" and os.path.getsize(target_file) == 0:
+                # find .Rout files if stdout is empty
+                for root, dirs, files in os.walk(
+                    os.path.join(submission["temp_dir"], sub_dir)
+                ):
+                    for file in files:
+                        if file.endswith(".Rout"):
+                            target_file = os.path.join(root, file)
+                            break
+
+            with open(target_file, "rb") as fp:
                 fobj = Upload().uploadFromFile(
                     fp,
                     os.path.getsize(fp.name),
