@@ -41,9 +41,14 @@ class SIVACOR(Resource):
         .param(
             "image_tag", "The Docker image tag to use for processing.", required=True
         )
+        .param(
+            "main_file",
+            "The main file to process within the uploaded package.",
+            required=True,
+        )
     )
     @filtermodel(model=JobModel)
-    def submit_job(self, file, image_tag):
+    def submit_job(self, file, image_tag, main_file):
         if image_tag not in SettingModel().get(PluginSettings.IMAGE_TAGS):
             raise ValidationException(f"Invalid image tag: {image_tag}")
         # Job submission logic goes here
@@ -59,6 +64,7 @@ class SIVACOR(Resource):
             str(user["_id"]),
             str(file["_id"]),
             image_tag,
+            main_file,
             str(job["_id"]),
         ).set(
             girder_job_title=f"Moving {file['name']} to submission collection",
@@ -77,7 +83,9 @@ class SIVACOR(Resource):
             girder_job_title="Record Performance Metrics"
         )
         workflow |= run_tro.s("sign").set(girder_job_title="Sign TRO")
-        workflow |= upload_workspace.s().set(girder_job_title="Upload Replicated Package")
+        workflow |= upload_workspace.s().set(
+            girder_job_title="Upload Replicated Package"
+        )
         workflow |= finalize_job.s().set(girder_job_title="Finalize Job Submission")
         workflow.apply_async(queue="local")
         UserModel().collection.update_one(

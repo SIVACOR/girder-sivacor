@@ -84,7 +84,7 @@ def _update_file_from_path(file, path, user):
 
 
 @app.task(queue="local")
-def prepare_submission(userId, fileId, image_tag, job_id):
+def prepare_submission(userId, fileId, image_tag, main_file, job_id):
     # Create a submission directory
     job = Job().load(job_id, force=True)
     try:
@@ -102,6 +102,7 @@ def prepare_submission(userId, fileId, image_tag, job_id):
             "folder_id": str(submission_folder["_id"]),
             "file_id": str(fobj["_id"]),
             "job_id": str(job_id),
+            "main_file": main_file,
         }
     except Exception as exc:
         Job().updateJob(
@@ -110,7 +111,12 @@ def prepare_submission(userId, fileId, image_tag, job_id):
             status=JobStatus.ERROR,
         )
         raise exc
-    return {"folder_id": None, "file_id": None, "job_id": str(job_id)}
+    return {
+        "folder_id": None,
+        "file_id": None,
+        "main_file": main_file,
+        "job_id": str(job_id),
+    }
 
 
 @app.task(queue="local")
@@ -205,13 +211,13 @@ def run_tro(submission, action):
                     temp_dir,
                     comment="After executing workflow",
                     ignore_dirs=IGNORE_DIRS,
-                    resolve_symlinks=False
+                    resolve_symlinks=False,
                 )
         elif action == "add_performance":
             tro.add_performance(
                 datetime.datetime.fromisoformat(submission["run_start_time"]),
                 datetime.datetime.fromisoformat(submission["run_end_time"]),
-                comment="SIVACOR workflow execution",
+                comment=f"SIVACOR workflow execution ({submission['main_file']})",
                 accessed_arrangement="arrangement/0",
                 modified_arrangement="arrangement/1",
                 caps=submission.get("run_caps", ["trov:InternetIsolation"]),

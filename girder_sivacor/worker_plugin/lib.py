@@ -147,7 +147,7 @@ def stop_container(container: docker.models.containers.Container):
         raise
 
 
-def _infer_run_command(submission):
+def _infer_run_command(submission, image_tag):
     temp_dir = submission["temp_dir"]
     entrypoint = ["/bin/sh", "-c"]
 
@@ -158,13 +158,22 @@ def _infer_run_command(submission):
         sub_dir = items[0]
 
     command = None
-    if os.path.exists(os.path.join(temp_dir, sub_dir, "run.sh")):
-        command = os.path.join(submission["temp_dir"], sub_dir, "run.sh")
-    elif os.path.exists(os.path.join(temp_dir, sub_dir, "code", "run.sh")):
-        command = os.path.join(submission["temp_dir"], sub_dir, "code", "run.sh")
+    if image_tag.startswith("rocker"):
+        entrypoint = ["/usr/local/bin/R", "CMD", "BATCH"]
+    elif image_tag.startswith("dataeditors/stata"):
+        entrypoint = ["/usr/local/stata/stata-mp", "-b", "do"]
+    else:
+        raise ValueError("Cannot infer the entrypoint for submission")
+
+    main_file = submission.get("main_file", "run.sh")
+    if os.path.exists(os.path.join(temp_dir, sub_dir, main_file)):
+        command = os.path.join(submission["temp_dir"], sub_dir, main_file)
+    elif os.path.exists(os.path.join(temp_dir, sub_dir, "code", main_file)):
+        command = os.path.join(submission["temp_dir"], sub_dir, "code", main_file)
     else:
         raise ValueError("Cannot infer run command for submission")
-    os.chmod(os.path.join(temp_dir, sub_dir, "run.sh"), 0o755)
+
+    os.chmod(os.path.join(temp_dir, sub_dir, main_file), 0o755)
     return entrypoint, command, sub_dir
 
 
@@ -197,7 +206,7 @@ def recorded_run(submission, task=None):
 
     cli.images.pull(image_tag)
 
-    entrypoint, command, sub_dir = _infer_run_command(submission)
+    entrypoint, command, sub_dir = _infer_run_command(submission, image_tag)
     print(
         "Setting working directory to: " + os.path.join(submission["temp_dir"], sub_dir)
     )
@@ -258,12 +267,19 @@ def recorded_run(submission, task=None):
 
             target_file = os.path.join(container_temp_path, key)
             if key == "stdout" and os.path.getsize(target_file) == 0:
-                # find .Rout files if stdout is empty
+                if command.endswith(".R"):
+                    ext = ".Rout"
+                elif command.endswith(".do"):
+                    ext = ".log"
+                else:
+                    break
+
+                # find .Rout files if stdout is empty and R
                 for root, dirs, files in os.walk(
                     os.path.join(submission["temp_dir"], sub_dir)
                 ):
                     for file in files:
-                        if file.endswith(".Rout"):
+                        if file.endswith(ext):
                             target_file = os.path.join(root, file)
                             break
 
