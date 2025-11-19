@@ -2,10 +2,10 @@ import datetime
 import io
 import json
 import os
+import shutil
 import tarfile
 import tempfile
 import zipfile
-import shutil
 
 import randomname
 from girder.constants import AccessType
@@ -24,9 +24,9 @@ from girder_worker.app import app
 from tro_utils.tro_utils import TRO
 
 from ..settings import PluginSettings
-from .lib import recorded_run
+from .lib import recorded_run, zip_symlink
 
-IGNORE_DIRS = [".git", "renv", "__pycache__"]
+IGNORE_DIRS = [".git", "__pycache__"]
 
 
 def _create_submission_directory(user):
@@ -205,6 +205,7 @@ def run_tro(submission, action):
                     temp_dir,
                     comment="After executing workflow",
                     ignore_dirs=IGNORE_DIRS,
+                    resolve_symlinks=False
                 )
         elif action == "add_performance":
             tro.add_performance(
@@ -318,7 +319,10 @@ def upload_workspace(submission):
                         continue
                     file_path = os.path.join(root, file)
                     arcname = os.path.relpath(file_path, submission["temp_dir"])
-                    zipf.write(file_path, arcname)
+                    if os.path.islink(file_path):
+                        zip_symlink(zipf, file_path, arcname=arcname)
+                    else:
+                        zipf.write(file_path, arcname)
 
         with open(zip_path, "rb") as f:
             fobj = Upload().uploadFromFile(

@@ -9,7 +9,7 @@ requirements = [
     "girder-jobs>=5.0.0a1",
     "girder-plugin-worker>=5.0.0a1",
     "randomname",
-    "tro-utils",
+    "tro-utils>=0.1.1",
     "watchfiles"
 ]
 

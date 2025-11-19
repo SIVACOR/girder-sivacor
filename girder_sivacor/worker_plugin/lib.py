@@ -2,8 +2,10 @@ import logging
 import math
 import os
 import queue
+import stat
 import tempfile
 import time
+import zipfile
 from threading import Thread
 
 import docker
@@ -157,9 +159,9 @@ def _infer_run_command(submission):
 
     command = None
     if os.path.exists(os.path.join(temp_dir, sub_dir, "run.sh")):
-        command = os.path.join("/workspace", sub_dir, "run.sh")
+        command = os.path.join(submission["temp_dir"], sub_dir, "run.sh")
     elif os.path.exists(os.path.join(temp_dir, sub_dir, "code", "run.sh")):
-        command = os.path.join("/workspace", sub_dir, "code", "run.sh")
+        command = os.path.join(submission["temp_dir"], sub_dir, "code", "run.sh")
     else:
         raise ValueError("Cannot infer run command for submission")
     os.chmod(os.path.join(temp_dir, sub_dir, "run.sh"), 0o755)
@@ -183,7 +185,7 @@ def recorded_run(submission, task=None):
     image_tag = submission_folder["meta"]["image_tag"]
     volumes = {
         submission["temp_dir"]: {
-            "bind": "/workspace",
+            "bind": submission["temp_dir"],
             "mode": "rw",
         }
     }
@@ -191,7 +193,9 @@ def recorded_run(submission, task=None):
     cli.images.pull(image_tag)
 
     entrypoint, command, sub_dir = _infer_run_command(submission)
-    print("Setting working directory to: " + os.path.join("/workspace", sub_dir))
+    print(
+        "Setting working directory to: " + os.path.join(submission["temp_dir"], sub_dir)
+    )
     print("Running Tale with command: " + " ".join(entrypoint + [command]))
 
     container = cli.containers.create(
@@ -200,9 +204,9 @@ def recorded_run(submission, task=None):
         command=command,
         detach=True,
         volumes=volumes,
-        working_dir=os.path.join("/workspace", sub_dir),
+        working_dir=os.path.join(submission["temp_dir"], sub_dir),
         user=f"{os.getuid()}:{os.getgid()}",
-        environment={"HOME": "/tmp/home"},
+        environment={"HOME": submission["temp_dir"]},
     )
 
     logging_thread = Thread(target=logging_worker, args=(log_queue, container))
@@ -280,3 +284,43 @@ def recorded_run(submission, task=None):
         )
 
     return ret
+
+
+def zip_symlink(zip_file, symlink_path, arcname=None):
+    """
+    Add a symlink to a zip file, preserving the link instead of its target.
+
+    Args:
+        zip_file (zipfile.ZipFile): Open zip file object (in write mode).
+        symlink_path (str): Path to the symlink on disk.
+        arcname (str, optional): Name/path to use for the symlink in the zip.
+            Defaults to symlink_path.
+    """
+    # Validate the path is a symlink
+    if not os.path.islink(symlink_path):
+        raise ValueError(f"{symlink_path} is not a symlink")
+
+    # Get the symlink target (relative or absolute path)
+    target = os.readlink(symlink_path)
+
+    # Define the name/path for the symlink in the zip
+    arcname = arcname or symlink_path
+
+    # Create a ZipInfo object for the symlink
+    zinfo = zipfile.ZipInfo(arcname)
+
+    # Get original symlink permissions (Unix)
+    link_stat = os.lstat(symlink_path)
+    link_mode = stat.S_IFLNK | (link_stat.st_mode & 0o777)  # Preserve original perms
+    zinfo.external_attr = link_mode << 16
+
+    # Set other metadata (optional but recommended)
+    # zinfo.date_time = zipfile.ZipInfo(
+    #    date_time=os.path.getmtime(symlink_path)
+    # ).date_time
+    zinfo.compress_type = (
+        zipfile.ZIP_STORED
+    )  # Symlinks are small; no compression needed
+
+    # Write the symlink to the zip: content is the target path
+    zip_file.writestr(zinfo, target)
