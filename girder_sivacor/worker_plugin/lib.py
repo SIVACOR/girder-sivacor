@@ -189,6 +189,11 @@ def recorded_run(submission, task=None):
             "mode": "rw",
         }
     }
+    if stata_license_hostpath := os.environ.get("STATA_LICENSE_HOSTPATH"):
+        volumes[stata_license_hostpath] = {
+            "bind": "/usr/local/stata/stata.lic",
+            "mode": "ro",
+        }
 
     cli.images.pull(image_tag)
 
