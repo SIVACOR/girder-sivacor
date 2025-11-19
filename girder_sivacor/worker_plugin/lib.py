@@ -287,10 +287,11 @@ def recorded_run(submission, task=None):
                 fobj = Upload().uploadFromFile(
                     fp,
                     os.path.getsize(fp.name),
-                    os.path.basename(fp.name),
+                    f"{key}-{submission['job_id']}",
                     parentType="folder",
                     parent=submission_folder,
                     user=admin,
+                    mimeType="text/plain",
                 )
                 meta[key + "_file_id"] = str(fobj["_id"])
         Folder().setMetadata(submission_folder, meta)

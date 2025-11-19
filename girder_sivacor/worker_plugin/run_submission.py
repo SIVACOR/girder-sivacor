@@ -6,6 +6,7 @@ import shutil
 import tarfile
 import tempfile
 import zipfile
+import pathlib
 
 import randomname
 from girder.constants import AccessType
@@ -170,7 +171,7 @@ def run_tro(submission, action):
     try:
         admin = User().findOne({"admin": True})
         submission_folder = Folder().load(submission["folder_id"], force=True)
-        tro_file = f"/tmp/{submission_folder['name']}.tro"
+        tro_file = f"/tmp/tro-{submission['job_id']}.jsonld"
         tro_obj = None
         if submission.get("troId") is not None:
             tro_obj = File().load(submission["troId"], force=True)
@@ -236,6 +237,7 @@ def run_tro(submission, action):
                         parentType="folder",
                         parent=submission_folder,
                         user=admin,
+                        mimeType="text/plain",
                     )
                     meta[meta_key] = str(fobj["_id"])
                 os.remove(filename)
@@ -251,6 +253,7 @@ def run_tro(submission, action):
                 parentType="folder",
                 parent=submission_folder,
                 user=admin,
+                mimeType="application/ld+json",
             )
             submission["troId"] = str(tro_obj["_id"])
         os.remove(tro.tro_filename)
@@ -313,15 +316,19 @@ def upload_workspace(submission):
     try:
         admin = User().findOne({"admin": True})
         submission_folder = Folder().load(submission["folder_id"], force=True)
-        zip_path = os.path.join(
-            submission["temp_dir"], "executed_replication_package.zip"
+
+        submission_fobj = File().load(submission["file_id"], force=True)
+        zip_basename = (
+            pathlib.Path(submission_fobj["name"]).stem + f"-{submission['job_id']}.zip"
         )
+
+        zip_path = os.path.join(submission["temp_dir"], zip_basename)
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
             for root, dirs, files in os.walk(submission["temp_dir"]):
                 # ignore contents of dirs from IGNORE_DIRS
                 dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
                 for file in files:
-                    if file == "executed_replication_package.zip":
+                    if file == zip_basename:
                         continue
                     file_path = os.path.join(root, file)
                     arcname = os.path.relpath(file_path, submission["temp_dir"])
@@ -330,14 +337,30 @@ def upload_workspace(submission):
                     else:
                         zipf.write(file_path, arcname)
 
+            # Store TRO files in a separate 'tro/' directory within the zip
+            for key in ("tro_file_id", "sig_file_id", "tsr_file_id"):
+                if fobj := File().load(
+                    submission_folder.get("meta", {}).get(key), force=True
+                ):
+                    with File().open(fobj) as fp:
+                        zipf.writestr("tro/" + fobj["name"], fp.read())
+
+            for ext in (".jsonld", ".sig", ".tsr"):
+                basename = f"tro-{submission['job_id']}.{ext}"
+                tro_file_path = os.path.join("/tmp", basename)
+                arcname = "tro/" + basename
+                if os.path.exists(tro_file_path):
+                    zipf.write(tro_file_path, arcname)
+
         with open(zip_path, "rb") as f:
             fobj = Upload().uploadFromFile(
                 f,
                 os.path.getsize(zip_path),
-                "executed_replication_package.zip",
+                zip_basename,
                 parentType="folder",
                 parent=submission_folder,
                 user=admin,
+                mimeType="application/zip",
             )
         os.remove(zip_path)
         Folder().setMetadata(submission_folder, {"replpack_file_id": str(fobj["_id"])})
