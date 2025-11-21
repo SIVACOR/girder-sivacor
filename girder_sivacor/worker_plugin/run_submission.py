@@ -56,6 +56,10 @@ def _create_submission_directory(user):
         creator=admin,
         reuseExisting=False,
     )
+    submission_folder = Folder().setMetadata(
+        submission_folder,
+        {"creator_id": str(user["_id"])},
+    )
     return Folder().setUserAccess(
         submission_folder,
         user,
