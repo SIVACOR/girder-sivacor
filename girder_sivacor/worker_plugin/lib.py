@@ -157,9 +157,8 @@ def _infer_run_command(submission, image_tag):
     if len(items) == 1 and os.path.isdir(os.path.join(temp_dir, items[0])):
         sub_dir = items[0]
 
-    command = None
     if image_tag.startswith("rocker"):
-        entrypoint = ["/usr/local/bin/R", "CMD", "BATCH"]
+        entrypoint = ["/usr/local/bin/Rscript"]
     elif image_tag.startswith("dataeditors/stata"):
         entrypoint = ["/usr/local/stata/stata-mp", "-b", "do"]
     else:
@@ -167,11 +166,16 @@ def _infer_run_command(submission, image_tag):
 
     main_file = submission.get("main_file", "run.sh")
     if os.path.exists(os.path.join(temp_dir, sub_dir, main_file)):
-        command = os.path.join(submission["temp_dir"], sub_dir, main_file)
+        command = main_file
     elif os.path.exists(os.path.join(temp_dir, sub_dir, "code", main_file)):
-        command = os.path.join(submission["temp_dir"], sub_dir, "code", main_file)
+        command = main_file
+        sub_dir = os.path.join(sub_dir, "code")
     else:
         raise ValueError("Cannot infer run command for submission")
+
+    # sanitize command, it may contain spaces
+    if " " in command:
+        command = f"\"{command}\""
 
     os.chmod(os.path.join(temp_dir, sub_dir, main_file), 0o755)
     return entrypoint, command, sub_dir
@@ -258,6 +262,7 @@ def recorded_run(submission, task=None):
 
         # Dump run std{out,err} and entrypoint used.
         meta = {}
+        main_file = submission.get("main_file", "run.sh")
         for stdout, stderr, key in [
             (True, False, "stdout"),
             (False, True, "stderr"),
@@ -267,9 +272,9 @@ def recorded_run(submission, task=None):
 
             target_file = os.path.join(container_temp_path, key)
             if key == "stdout" and os.path.getsize(target_file) == 0:
-                if command.endswith(".R"):
+                if main_file.endswith(".R"):
                     ext = ".Rout"
-                elif command.endswith(".do"):
+                elif main_file.endswith(".do"):
                     ext = ".log"
                 else:
                     break
