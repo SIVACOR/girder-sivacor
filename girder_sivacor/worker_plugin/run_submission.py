@@ -18,6 +18,7 @@ from girder.models.item import Item
 from girder.models.setting import Setting
 from girder.models.upload import Upload
 from girder.models.user import User
+from girder.settings import SettingKey
 from girder.utility import RequestBodyStream
 from girder_jobs.constants import JobStatus
 from girder_jobs.models.job import Job
@@ -28,6 +29,15 @@ from ..settings import PluginSettings
 from .lib import recorded_run, zip_symlink
 
 IGNORE_DIRS = [".git", "__pycache__"]
+
+
+def _dump_from_fileobj(in_f, out_f):
+    chunk_size = Setting().get(SettingKey.FILEHANDLE_MAX_SIZE)
+    while True:
+        chunk = in_f.read(chunk_size)
+        if not chunk:
+            break
+        out_f.write(chunk)
 
 
 def _create_submission_directory(user):
@@ -140,7 +150,7 @@ def create_workspace(submission):
         fobj = File().load(submission["file_id"], force=True)
         with File().open(fobj) as f:
             with open(os.path.join(temp_dir, fobj["name"]), "wb") as out_f:
-                out_f.write(f.read())
+                _dump_from_fileobj(f, out_f)
         # File is either a zip or tar archive; extract accordingly
         if fobj["name"].endswith(".zip"):
             with zipfile.ZipFile(os.path.join(temp_dir, fobj["name"]), "r") as zip_ref:
@@ -179,9 +189,9 @@ def run_tro(submission, action):
         tro_obj = None
         if submission.get("troId") is not None:
             tro_obj = File().load(submission["troId"], force=True)
-            with open(f"/tmp/{tro_obj['name']}", "wb") as out_f:
-                with File().open(tro_obj) as f:
-                    out_f.write(f.read())
+            with File().open(tro_obj) as f:
+                with open(f"/tmp/{tro_obj['name']}", "wb") as out_f:
+                    _dump_from_fileobj(f, out_f)
             tro_file = f"/tmp/{tro_obj['name']}"
 
         temp_dir = submission["temp_dir"]
@@ -346,7 +356,7 @@ def upload_workspace(submission):
                 if fobj := File().load(
                     submission_folder.get("meta", {}).get(key), force=True
                 ):
-                    with File().open(fobj) as fp:
+                    with File().open(fobj) as fp:  # TODO: use _dump_from_fileobj?
                         zipf.writestr("tro/" + fobj["name"], fp.read())
 
             for ext in (".jsonld", ".sig", ".tsr"):
