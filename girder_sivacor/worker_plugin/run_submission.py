@@ -31,13 +31,19 @@ from .lib import recorded_run, zip_symlink
 IGNORE_DIRS = [".git", "__pycache__"]
 
 
-def _dump_from_fileobj(in_f, out_f):
+def _dump_from_fileobj(in_f, out_f, is_zip=False, arcname=None):
     chunk_size = Setting().get(SettingKey.FILEHANDLE_MAX_SIZE)
     while True:
         chunk = in_f.read(chunk_size)
         if not chunk:
             break
-        out_f.write(chunk)
+        if is_zip:
+            if arcname:
+                out_f.writestr(arcname, chunk)
+            else:
+                out_f.writestr(in_f._file["name"], chunk)
+        else:
+            out_f.write(chunk)
 
 
 def _create_submission_directory(user):
@@ -362,7 +368,9 @@ def upload_workspace(submission):
                     submission_folder.get("meta", {}).get(key), force=True
                 ):
                     with File().open(fobj) as fp:  # TODO: use _dump_from_fileobj?
-                        zipf.writestr("tro/" + fobj["name"], fp.read())
+                        _dump_from_fileobj(
+                            fp, zipf, is_zip=True, arcname="tro/" + fobj["name"]
+                        )
 
             for ext in (".jsonld", ".sig", ".tsr"):
                 basename = f"tro-{submission['job_id']}.{ext}"
@@ -370,6 +378,14 @@ def upload_workspace(submission):
                 arcname = "tro/" + basename
                 if os.path.exists(tro_file_path):
                     zipf.write(tro_file_path, arcname)
+
+            # Store stdout and stderr logs
+            for key in ("stderr_file_id", "stdout_file_id"):
+                if fobj := File().load(
+                    submission_folder.get("meta", {}).get(key), force=True
+                ):
+                    with File().open(fobj) as fp:
+                        _dump_from_fileobj(fp, zipf, is_zip=True)
 
         with open(zip_path, "rb") as f:
             fobj = Upload().uploadFromFile(
