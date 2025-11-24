@@ -113,6 +113,11 @@ def prepare_submission(userId, fileId, image_tag, main_file, job_id):
             submission_folder,
             {"image_tag": image_tag, "status": "submitted", "job_id": job_id},
         )
+        Job().updateJob(
+            job,
+            "New submission: '" + submission_folder["name"] + "' created.\n",
+            status=JobStatus.RUNNING,
+        )
         return {
             "folder_id": str(submission_folder["_id"]),
             "file_id": str(fobj["_id"]),
