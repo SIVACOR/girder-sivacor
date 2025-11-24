@@ -158,7 +158,7 @@ def _infer_run_command(submission, image_tag):
         sub_dir = items[0]
 
     if image_tag.startswith("rocker"):
-        entrypoint = ["/usr/local/bin/Rscript"]
+        entrypoint = ["/usr/local/bin/R", "--quiet", "--no-save", "--no-restore", "-f"]
     elif image_tag.startswith("dataeditors/stata"):
         entrypoint = ["/usr/local/stata/stata-mp", "-b", "do"]
     else:
@@ -175,7 +175,7 @@ def _infer_run_command(submission, image_tag):
 
     # sanitize command, it may contain spaces
     if " " in command:
-        command = f"\"{command}\""
+        command = f'"{command}"'
 
     os.chmod(os.path.join(temp_dir, sub_dir, main_file), 0o755)
     return entrypoint, command, sub_dir
