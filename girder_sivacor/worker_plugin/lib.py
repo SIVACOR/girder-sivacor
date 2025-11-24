@@ -158,7 +158,7 @@ def _infer_run_command(submission, image_tag):
         sub_dir = items[0]
 
     if image_tag.startswith("rocker"):
-        entrypoint = ["/usr/local/bin/R", "--quiet", "--no-save", "--no-restore", "-f"]
+        entrypoint = ["/usr/local/bin/R", "--no-save", "--no-restore", "-f"]
     elif image_tag.startswith("dataeditors/stata"):
         entrypoint = ["/usr/local/stata/stata-mp", "-b", "do"]
     else:
