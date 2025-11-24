@@ -64,7 +64,8 @@ RUN apt-get update -qy \
 
 RUN python3 -m pip install \
   'celery>=5.5.2' \
-  'girder>=5.0.0a8.dev39'
+  'girder>=5.0.0a8.dev39' \
+  'girder-user-quota>=5.0.0a8.dev39'
 
 # Copy the virtual environment from the compiler stage
 COPY --from=compiler /src/dist /src/dist
