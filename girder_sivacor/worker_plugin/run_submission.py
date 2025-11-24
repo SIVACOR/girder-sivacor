@@ -46,6 +46,19 @@ def _dump_from_fileobj(in_f, out_f, is_zip=False, arcname=None):
             out_f.write(chunk)
 
 
+def safe_tar_extract(tar, path):
+    root = os.path.abspath(path)
+    for member in tar.getmembers():
+        target = os.path.abspath(os.path.join(root, member.name))
+        if not target.startswith(root + os.sep):
+            raise Exception("Attempted Path Traversal in Tar File: " + member.name)
+
+        if member.issym() or member.islnk():
+            raise Exception("Tar File contains unsafe links: " + member.name)
+
+    tar.extractall(root, members=tar.getmembers())
+
+
 def _create_submission_directory(user):
     # Logic to create submission directory based on fileId and image_tag
     admin = User().findOne({"admin": True})
@@ -159,22 +172,33 @@ def create_workspace(submission):
         submission["temp_dir"] = temp_dir
         os.makedirs(temp_dir, exist_ok=False)
         fobj = File().load(submission["file_id"], force=True)
+        temp_filename = os.path.join(temp_dir, fobj["name"])
         with File().open(fobj) as f:
-            with open(os.path.join(temp_dir, fobj["name"]), "wb") as out_f:
+            with open(temp_filename, "wb") as out_f:
                 _dump_from_fileobj(f, out_f)
         # File is either a zip or tar archive; extract accordingly
-        if fobj["name"].endswith(".zip"):
-            with zipfile.ZipFile(os.path.join(temp_dir, fobj["name"]), "r") as zip_ref:
-                zip_ref.extractall(temp_dir)
-        elif fobj["name"].endswith((".tar.gz", ".tgz")):
-            with tarfile.open(os.path.join(temp_dir, fobj["name"]), "r:gz") as tar_ref:
-                tar_ref.extractall(temp_dir)
-        else:
+        extracted = False
+        try:
+            if zipfile.is_zipfile(temp_filename):
+                with zipfile.ZipFile(temp_filename, "r") as zip_ref:
+                    zip_ref.extractall(temp_dir)
+                extracted = True
+                print("Extracted as a zip file.")
+        except zipfile.BadZipFile:
+            print("Not a zip file, trying tar...")
+
+        try:
+            if tarfile.is_tarfile(temp_filename) and not extracted:
+                with tarfile.open(temp_filename, "r:*") as tar_ref:
+                    safe_tar_extract(tar_ref, temp_dir)
+                extracted = True
+                print("Extracted as a tar file.")
+        except tarfile.TarError as e:
+            print(f"Not a tar file either... Reason: {e}")
             raise ValueError("Unsupported file format for workspace creation.")
-        os.remove(
-            os.path.join(temp_dir, fobj["name"])
-        )  # remove the archive file after extraction
+
     except Exception as exc:
+        os.remove(temp_filename)
         Job().updateJob(
             job,
             "Failed to create workspace: \n\t" + str(exc) + "\n",
@@ -182,6 +206,7 @@ def create_workspace(submission):
         )
         raise exc
 
+    os.remove(temp_filename)
     return submission
 
 
