@@ -77,7 +77,7 @@ RUN python3 -m pip install \
   python3 -m pip check || true
 
 RUN python3 -m pip install --no-cache-dir gunicorn uvicorn[standard] uvicorn-worker
-RUN groupadd -g 1000 girder && groupadd -g 988 docker && useradd -g 1000 -G 988 -u 1000 -m -s /bin/bash girder
+RUN groupadd -g 1000 girder && groupadd -g 112 docker && useradd -g 1000 -G 112 -u 1000 -m -s /bin/bash girder
 
 EXPOSE 8080
 
