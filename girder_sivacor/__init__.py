@@ -47,8 +47,8 @@ def _validate_tro_profile(doc):
 @setting_utilities.validator(PluginSettings.IMAGE_TAGS)
 def _validate_image_tags(doc):
     value = doc.get("value")
-    if not isinstance(value, list) or not all(isinstance(tag, str) for tag in value):
-        raise ValidationException("Image tags must be a list of strings.")
+    if not isinstance(value, dict):
+        raise ValidationException("Image tags must be a dictionary.")
     return value
 
 
