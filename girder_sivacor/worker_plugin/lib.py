@@ -196,8 +196,10 @@ def recorded_run(submission, task=None):
     admin = User().findOne({"admin": True})
 
     image_tag = submission_folder["meta"]["image_tag"]
+    host_tmp_root = os.environ.get("DOCKER_HOST_TMP_ROOT", "/")
+    target_tmp_dir = os.path.join(host_tmp_root, submission["temp_dir"].lstrip("/"))
     volumes = {
-        submission["temp_dir"]: {
+        target_tmp_dir: {
             "bind": submission["temp_dir"],
             "mode": "rw",
         }
