@@ -2,6 +2,7 @@ import logging
 import math
 import os
 import queue
+import re
 import stat
 import tempfile
 import time
@@ -127,6 +128,17 @@ class DockerStatsCollectorThread(Thread):
 
 class DummyTask:
     canceled = False
+
+
+def is_stata(image_tag: str) -> bool:
+    return image_tag.startswith("dataeditors/stata")
+
+
+def stata_error(log_content: str) -> str | None:
+    # if any of the lines contains r([0-9]+); return True
+    regex = r"r\(\d+\);"
+    if result := re.search(regex, log_content):
+        return result.group(0)
 
 
 def stop_container(container: docker.models.containers.Container):
@@ -265,6 +277,7 @@ def recorded_run(submission, task=None):
         # Dump run std{out,err} and entrypoint used.
         meta = {}
         main_file = submission.get("main_file", "run.sh")
+        log_files = {}
         for stdout, stderr, key in [
             (True, False, "stdout"),
             (False, True, "stderr"),
@@ -291,6 +304,7 @@ def recorded_run(submission, task=None):
                             break
 
             with open(target_file, "rb") as fp:
+                log_files[key] = target_file
                 fobj = Upload().uploadFromFile(
                     fp,
                     os.path.getsize(fp.name),
@@ -307,10 +321,18 @@ def recorded_run(submission, task=None):
         except docker.errors.NotFound:
             pass
 
-    if not task.canceled and ret["StatusCode"] != 0:
-        raise ValueError(
-            "Error executing recorded run. Check stdout/stderr for details."
-        )
+    if not task.canceled:
+        if ret["StatusCode"] != 0:
+            raise ValueError(
+                "Error executing recorded run. Check stdout/stderr for details."
+            )
+        elif is_stata(image_tag):
+            with open(log_files["stdout"], "r") as fp:
+                log_content = fp.read()
+                if stata_err := stata_error(log_content):
+                    raise ValueError(
+                        f"Stata returned an error ({stata_err}). Check stdout/stderr for details."
+                    )
 
     return ret
 
