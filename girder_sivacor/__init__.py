@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 
 from girder import events
@@ -12,6 +13,9 @@ from girder_oauth.settings import PluginSettings as OAuthSettings
 from .auth.orcid import ORCID
 from .rest import SIVACOR
 from .settings import PluginSettings
+
+
+logger = logging.getLogger(__name__)
 
 
 @setting_utilities.validator(PluginSettings.UPLOADS_FOLDER_NAME)
