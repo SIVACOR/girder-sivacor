@@ -295,10 +295,11 @@ def recorded_run(submission, task=None):
 
             target_file = os.path.join(container_temp_path, key)
             if key == "stdout" and os.path.getsize(target_file) == 0:
+                main_file_noext = os.path.splitext(main_file)[0]
                 if main_file.endswith(".R"):
-                    ext = ".Rout"
+                    logfile = main_file_noext + ".Rout"
                 elif main_file.endswith(".do"):
-                    ext = ".log"
+                    logfile = main_file_noext + ".log"
                 else:
                     break
 
@@ -307,7 +308,7 @@ def recorded_run(submission, task=None):
                     os.path.join(submission["temp_dir"], sub_dir)
                 ):
                     for file in files:
-                        if file.endswith(ext):
+                        if file == logfile:
                             target_file = os.path.join(root, file)
                             break
 
