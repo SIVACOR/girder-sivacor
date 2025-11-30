@@ -196,6 +196,8 @@ def create_workspace(submission):
         except tarfile.TarError as e:
             print(f"Not a tar file either... Reason: {e}")
             raise ValueError("Unsupported file format for workspace creation.")
+        # Ensure R library directory for user install.packages exists
+        os.makedirs(os.path.join(temp_dir, "R", "library"), exist_ok=True)
 
     except Exception as exc:
         os.remove(temp_filename)
