@@ -130,7 +130,12 @@ def prepare_submission(userId, fileId, image_tag, main_file, job_id):
         Item().move(item, submission_folder)
         Folder().setMetadata(
             submission_folder,
-            {"image_tag": image_tag, "status": "submitted", "job_id": job_id},
+            {
+                "image_tag": image_tag,
+                "status": "submitted",
+                "job_id": job_id,
+                "main_file": main_file,
+            },
         )
         Job().updateJob(
             job,
