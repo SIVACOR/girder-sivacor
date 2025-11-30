@@ -159,6 +159,7 @@ def prepare_submission(userId, fileId, image_tag, main_file, job_id):
         "folder_id": None,
         "file_id": None,
         "main_file": main_file,
+        "image_tag": image_tag,
         "job_id": str(job_id),
     }
 
@@ -202,7 +203,8 @@ def create_workspace(submission):
             print(f"Not a tar file either... Reason: {e}")
             raise ValueError("Unsupported file format for workspace creation.")
         # Ensure R library directory for user install.packages exists
-        os.makedirs(os.path.join(temp_dir, "R", "library"), exist_ok=True)
+        if submission.get("image_tag", "").startswith("rocker/"):
+            os.makedirs(os.path.join(temp_dir, "R", "library"), exist_ok=True)
 
     except Exception as exc:
         os.remove(temp_filename)

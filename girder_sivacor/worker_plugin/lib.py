@@ -165,6 +165,10 @@ def _infer_run_command(submission, image_tag):
 
     # check if temp_dir contains a single folder
     items = os.listdir(temp_dir)
+    try:
+        items.remove("R")  # We now inject it...
+    except ValueError:
+        pass
     sub_dir = ""
     if len(items) == 1 and os.path.isdir(os.path.join(temp_dir, items[0])):
         sub_dir = items[0]
