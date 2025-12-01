@@ -1,0 +1,88 @@
+name: Test and Coverage
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      mongodb:
+        image: mongo:4.4
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongo --eval 'db.adminCommand(\"ping\")'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 18
+
+    - name: Build web components
+      run: |
+        cd girder_sivacor/web_client
+        npm ci
+        npm run build
+
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt', '**/setup.py') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install tox
+
+    - name: Setup Stata license
+      run: |
+        # Create license directory and decode base64 license
+        mkdir -p /tmp/licenses
+        echo "${{ secrets.STATA_LIC }}" | base64 -d > /tmp/licenses/stata.lic.19
+        # Ensure docker socket access
+        sudo chmod 666 /var/run/docker.sock
+
+    - name: Run tests with coverage
+      env:
+        DOCKER_HOST: unix:///var/run/docker.sock
+        GIRDER_MONGO_URI: mongodb://localhost:27017/girder
+        GIRDER_HOST: 0.0.0.0
+        GIRDER_WORKER_BROKER: redis://locahost/
+        GIRDER_WORKER_BACKEND: redis://locahost/
+        GIRDER_NOTIFICATION_REDIS_URL: redis://localhost:6379/
+        STATA_LICENSE_HOSTPATH: /tmp/licenses/stata.lic.19
+      run: |
+        # Run tests with coverage
+        tox -e test
+
+    - name: Upload Coverage to Codecov
+      uses: codecov/codecov-action@v5
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        name: coverage-report

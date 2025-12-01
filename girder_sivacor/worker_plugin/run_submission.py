@@ -50,7 +50,7 @@ def safe_tar_extract(tar, path):
     root = os.path.abspath(path)
     for member in tar.getmembers():
         target = os.path.abspath(os.path.join(root, member.name))
-        if not target.startswith(root + os.sep):
+        if not target.startswith(root):
             raise Exception("Attempted Path Traversal in Tar File: " + member.name)
 
         if member.issym() or member.islnk():

@@ -139,6 +139,10 @@ def stata_error(log_content: str) -> str | None:
     regex = r"r\(\d+\);"
     if result := re.search(regex, log_content):
         return result.group(0)
+    elif log_content == "License is invalid\n":
+        return "License is invalid"
+    elif log_content.startswith("Cannot find license file"):
+        return "Cannot find license file"
 
 
 def stop_container(container: docker.models.containers.Container):

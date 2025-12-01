@@ -67,6 +67,12 @@ class SIVACOR(Resource):
             public=False,
             user=user,
         )
+        UserModel().collection.update_one(
+            {"_id": user["_id"]}, {"$set": {"lastJobId": job["_id"]}}
+        )
+        job = JobModel().updateJob(
+            job, "Preparing SIVACOR submission\n", status=JobStatus.RUNNING
+        )
 
         workflow = prepare_submission.s(
             str(user["_id"]),
@@ -95,13 +101,10 @@ class SIVACOR(Resource):
             girder_job_title="Upload Replicated Package"
         )
         workflow |= finalize_job.s().set(girder_job_title="Finalize Job Submission")
-        workflow.apply_async(queue="local")
-        UserModel().collection.update_one(
-            {"_id": user["_id"]}, {"$set": {"lastJobId": job["_id"]}}
-        )
-        job = JobModel().updateJob(
-            job, "Preparing SIVACOR submission\n", status=JobStatus.RUNNING
-        )
+        try:
+            workflow.apply_async(queue="local")
+        except Exception:
+            pass   # Exceptions are handled in the job steps
         return job
 
     @access.public
@@ -112,7 +115,7 @@ class SIVACOR(Resource):
 
     @staticmethod
     def _get_tags():
-        now = datetime.datetime.utcnow()
+        now = datetime.datetime.now(datetime.UTC)
         cutoff = now - datetime.timedelta(hours=4)
 
         fetch = not os.path.exists("/tmp/sivacor_image_tags.json") or (
