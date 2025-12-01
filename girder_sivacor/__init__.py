@@ -1,9 +1,13 @@
 import logging
 from pathlib import Path
 
+from bson import ObjectId
 from girder import events
-from girder.constants import AccessType
+from girder.api import access
+from girder.api.rest import boundHandler, filtermodel
+from girder.constants import AccessType, TokenScope
 from girder.exceptions import ValidationException
+from girder.models.folder import Folder
 from girder.plugin import GirderPlugin, getPlugin, registerPluginStaticContent
 from girder.utility import setting_utilities
 from girder.utility.model_importer import ModelImporter
@@ -13,7 +17,6 @@ from girder_oauth.settings import PluginSettings as OAuthSettings
 from .auth.orcid import ORCID
 from .rest import SIVACOR
 from .settings import PluginSettings
-
 
 logger = logging.getLogger(__name__)
 
@@ -83,11 +86,48 @@ def create_uploads_folder(event: events.Event) -> None:
     folderModel.setUserAccess(uploads_folder, user, level=AccessType.ADMIN, save=True)
 
 
+@access.public(scope=TokenScope.DATA_READ)
+@filtermodel(model=Folder)
+@boundHandler
+def search_with_job_id(self, event):
+    params = event.info["params"]
+    jobId = params.get("jobId")
+    if jobId:
+        parentType = params.get("parentType")
+        parentId = params.get("parentId")
+        if not parentType or not parentId:
+            raise ValidationException(
+                "Both parentType and parentId must be provided when "
+                "filtering by jobId."
+            )
+        query = {
+            "parentCollection": parentType,
+            "parentId": ObjectId(parentId),
+            "meta.job_id": jobId,
+        }
+        user = self.getCurrentUser()
+        folders = [
+            Folder().filter(obj, user)
+            for obj in Folder().findWithPermissions(
+                query,
+                sort=[("created", -1)],
+                user=self.getCurrentUser(),
+                level=AccessType.READ,
+                limit=1,
+                offset=0,
+            )
+        ]
+        event.preventDefault().addResponse(folders)
+
+
 class SIVACORPlugin(GirderPlugin):
     DISPLAY_NAME = "SIVACOR"
 
     def load(self, info):
+        from girder.api.v1.folder import Folder as FolderResource
+
         events.bind("model.user.save.created", "sivacor", create_uploads_folder)
+        events.bind("rest.get.folder.before", "sivacor", search_with_job_id)
         ModelImporter.model("user").exposeFields(
             level=AccessType.READ, fields=("lastJobId", "lastProjectId")
         )
@@ -98,6 +138,16 @@ class SIVACORPlugin(GirderPlugin):
         addProvider(ORCID)
 
         info["apiRoot"].sivacor = SIVACOR()
+
+        FolderResource.find.description.param(
+            "jobId",
+            (
+                "Optional job ID to filter folders by those associated with "
+                "the given job."
+            ),
+            required=False,
+            dataType="string",
+        )
 
         registerPluginStaticContent(
             plugin="sivacor",
