@@ -302,15 +302,13 @@ def recorded_run(submission, task=None):
                 main_file_noext = os.path.splitext(main_file)[0]
                 if main_file.endswith(".R"):
                     logfile = main_file_noext + ".Rout"
-                elif main_file.endswith(".do"):
+                elif main_file.endswith(".do") or is_stata(image_tag):
                     logfile = main_file_noext + ".log"
                 else:
                     break
 
                 # find .Rout files if stdout is empty and R
-                for root, dirs, files in os.walk(
-                    os.path.join(submission["temp_dir"], sub_dir)
-                ):
+                for root, dirs, files in os.walk(submission["temp_dir"]):
                     for file in files:
                         if file == logfile:
                             target_file = os.path.join(root, file)
