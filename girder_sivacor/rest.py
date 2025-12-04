@@ -25,6 +25,24 @@ from .worker_plugin.run_submission import (
     upload_workspace,
 )
 
+stage_schema = {
+    "$schema": "http://json-schema.org/draft-04/schema#",
+    "title": "Workflow",
+    "description": "A SIVACOR replication workflow.",
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "image_name": {"type": "string"},
+            "main_file": {"type": "string"},
+            "image_tag": {"type": "string"},
+        },
+        "required": ["image_name", "main_file", "image_tag"],
+        "additionalProperties": False,
+    },
+    "minItems": 1,
+}
+
 
 class SIVACOR(Resource):
     def __init__(self):
@@ -44,21 +62,24 @@ class SIVACOR(Resource):
             required=True,
             paramType="query",
         )
-        .param(
-            "image_tag", "The Docker image tag to use for processing.", required=True
-        )
-        .param(
-            "main_file",
-            "The main file to process within the uploaded package.",
+        .jsonParam(
+            "stages",
+            "The defintion of replication workflow stages to execute.",
+            requireArray=True,
             required=True,
+            schema=stage_schema,
         )
     )
     @filtermodel(model=JobModel)
-    def submit_job(self, file, image_tag, main_file):
-        image_name, tag = image_tag.split(":")
+    def submit_job(self, file, stages):
         tags = self._get_tags()
-        if image_name not in tags or tag not in tags.get(image_name, []):
-            raise ValidationException(f"Invalid image tag: {image_tag}")
+        for stage in stages:
+            image_name = stage.get("image_name")
+            tag = stage.get("image_tag")
+            image_reference = f"{image_name}:{tag}"
+            if image_name not in tags or tag not in tags.get(image_name, []):
+                raise ValidationException(f"Invalid image: {image_reference}")
+
         # Job submission logic goes here
         user = self.getCurrentUser()
         job = JobModel().createJob(
@@ -77,26 +98,26 @@ class SIVACOR(Resource):
         workflow = prepare_submission.s(
             str(user["_id"]),
             str(file["_id"]),
-            image_tag,
-            main_file,
+            stages,
             str(job["_id"]),
         ).set(
             girder_job_title=f"Moving {file['name']} to submission collection",
         )
         workflow |= create_workspace.s().set(girder_job_title="Create Workspace")
-        workflow |= run_tro.s("add_arrangement").set(
+        workflow |= run_tro.s("add_arrangement", 0).set(
             girder_job_title="Record initial arrangement"
         )
-        workflow |= execute_workflow.s().set(
-            girder_job_title="Execute SIVACOR Workflow"
-        )
-        workflow |= run_tro.s("add_arrangement").set(
-            girder_job_title="Record final arrangement"
-        )
-        workflow |= run_tro.s("add_performance").set(
-            girder_job_title="Record Performance Metrics"
-        )
-        workflow |= run_tro.s("sign").set(girder_job_title="Sign TRO")
+        for i, stage in enumerate(stages):
+            workflow |= execute_workflow.s(stage).set(
+                girder_job_title="Execute SIVACOR Workflow"
+            )
+            workflow |= run_tro.s("add_arrangement", i + 1).set(
+                girder_job_title="Record final arrangement"
+            )
+            workflow |= run_tro.s("add_performance", i).set(
+                girder_job_title="Record Performance Metrics"
+            )
+        workflow |= run_tro.s("sign", 0).set(girder_job_title="Sign TRO")
         workflow |= upload_workspace.s().set(
             girder_job_title="Upload Replicated Package"
         )
@@ -104,7 +125,7 @@ class SIVACOR(Resource):
         try:
             workflow.apply_async(queue="local")
         except Exception:
-            pass   # Exceptions are handled in the job steps
+            pass  # Exceptions are handled in the job steps
         return job
 
     @access.public

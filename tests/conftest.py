@@ -1,3 +1,4 @@
+import json
 from typing import Any, Generator
 import os
 import mock
@@ -129,7 +130,7 @@ def upload_test_file(uploads_folder, user, filename):
         )
 
 
-def submit_sivacor_job(server, user, file_obj, image_tag, main_file):
+def submit_sivacor_job(server, user, file_obj, stages):
     """
     Helper function to submit a SIVACOR job.
 
@@ -149,8 +150,7 @@ def submit_sivacor_job(server, user, file_obj, image_tag, main_file):
         user=user,
         params={
             "id": str(file_obj["_id"]),
-            "image_tag": image_tag,
-            "main_file": main_file,
+            "stages": json.dumps(stages),
         },
     )
 
@@ -181,7 +181,7 @@ def get_submission_folder(server, user, job_id, submission_collection):
 
 
 def assert_submission_metadata(
-    metadata, user, job_id, image_tag, main_file, status, expected_files
+    metadata, user, job_id, stages, status, expected_files
 ):
     """
     Helper function to assert submission folder metadata.
@@ -197,9 +197,7 @@ def assert_submission_metadata(
     """
     assert metadata["creator_id"] == str(user["_id"])
     assert metadata["job_id"] == str(job_id)
-    assert metadata["image_tag"] == image_tag
-    assert metadata["main_file"] == main_file
-    assert metadata["status"] == status
+    assert metadata["stages"] == stages
 
     for key in expected_files:
         assert key in metadata

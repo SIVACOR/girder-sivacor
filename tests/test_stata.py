@@ -1,3 +1,4 @@
+import json
 import pytest
 from girder.models.file import File
 from girder_jobs.constants import JobStatus
@@ -23,15 +24,17 @@ def test_simple_run(
     submission_collection,
 ):
     """Test a successful Stata submission workflow."""
-    image_tag = "dataeditors/stata18_5-mp:2025-02-26"
+    image_name = "dataeditors/stata18_5-mp"
+    image_tag = "2025-02-26"
     main_file = "main.do"
+    stages = [{"image_name": image_name, "image_tag": image_tag, "main_file": main_file}]
 
     # Upload test file
     assert uploads_folder is not None
     fobj = upload_test_file(uploads_folder, user, "test_stata.tar.gz")
 
     # Submit SIVACOR Stata job
-    resp = submit_sivacor_job(server, user, fobj, image_tag, main_file)
+    resp = submit_sivacor_job(server, user, fobj, stages)
     assertStatusOk(resp)
     job = resp.json
 
@@ -56,8 +59,7 @@ def test_simple_run(
         submission_folder["meta"],
         user,
         job["_id"],
-        image_tag,
-        main_file,
+        stages,
         "completed",
         expected_files,
     )
@@ -81,8 +83,10 @@ def test_error_detection(
     submission_collection,
 ):
     """Test error detection in Stata submission workflow."""
-    image_tag = "dataeditors/stata18_5-mp:2025-02-26"
+    image_name = "dataeditors/stata18_5-mp"
+    image_tag = "2025-02-26"
     main_file = "fail.do"
+    stages = [{"image_name": image_name, "image_tag": image_tag, "main_file": main_file}]
 
     # Upload test file
     assert uploads_folder is not None
@@ -95,8 +99,7 @@ def test_error_detection(
         user=user,
         params={
             "id": str(fobj["_id"]),
-            "image_tag": image_tag,
-            "main_file": main_file,
+            "stages": json.dumps(stages),
         },
         exception=True,
     )
@@ -120,8 +123,7 @@ def test_error_detection(
         metadata,
         user,
         job["_id"],
-        image_tag,
-        main_file,
+        stages,
         "failed",
         ["stdout_file_id", "stderr_file_id", "tro_file_id"],
     )
