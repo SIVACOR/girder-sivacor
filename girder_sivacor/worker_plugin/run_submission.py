@@ -1,12 +1,11 @@
 import datetime
-import io
 import json
 import os
+import pathlib
 import shutil
 import tarfile
 import tempfile
 import zipfile
-import pathlib
 
 import randomname
 from girder.constants import AccessType
@@ -18,32 +17,15 @@ from girder.models.item import Item
 from girder.models.setting import Setting
 from girder.models.upload import Upload
 from girder.models.user import User
-from girder.settings import SettingKey
-from girder.utility import RequestBodyStream
 from girder_jobs.constants import JobStatus
 from girder_jobs.models.job import Job
 from girder_worker.app import app
 from tro_utils.tro_utils import TRO
 
 from ..settings import PluginSettings
-from .lib import recorded_run, zip_symlink
+from .lib import _dump_from_fileobj, _update_file_from_path, recorded_run, zip_symlink
 
 IGNORE_DIRS = [".git", "__pycache__"]
-
-
-def _dump_from_fileobj(in_f, out_f, is_zip=False, arcname=None):
-    chunk_size = Setting().get(SettingKey.FILEHANDLE_MAX_SIZE)
-    while True:
-        chunk = in_f.read(chunk_size)
-        if not chunk:
-            break
-        if is_zip:
-            if arcname:
-                out_f.writestr(arcname, chunk)
-            else:
-                out_f.writestr(in_f._file["name"], chunk)
-        else:
-            out_f.write(chunk)
 
 
 def safe_tar_extract(tar, path):
@@ -97,28 +79,8 @@ def _create_submission_directory(user):
     )
 
 
-def _update_file_from_path(file, path, user):
-    size = os.path.getsize(path)
-    upload = Upload().createUploadToFile(
-        file=file, user=user, size=size, reference=None, assetstore=None
-    )
-    if size == 0:
-        return Upload().finalizeUpload(upload)
-
-    chunkSize = Upload()._getChunkSize()
-    with open(path, "rb") as f:
-        while True:
-            data = f.read(chunkSize)
-            if not data:
-                break
-            upload = Upload().handleChunk(
-                upload, RequestBodyStream(io.BytesIO(data), len(data))
-            )
-    return upload
-
-
 @app.task(queue="local")
-def prepare_submission(userId, fileId, image_tag, main_file, job_id):
+def prepare_submission(userId, fileId, stages, job_id):
     # Create a submission directory
     job = Job().load(job_id, force=True)
     try:
@@ -131,10 +93,9 @@ def prepare_submission(userId, fileId, image_tag, main_file, job_id):
         Folder().setMetadata(
             submission_folder,
             {
-                "image_tag": image_tag,
+                "stages": stages,
                 "status": "submitted",
                 "job_id": job_id,
-                "main_file": main_file,
             },
         )
         Job().updateJob(
@@ -146,7 +107,7 @@ def prepare_submission(userId, fileId, image_tag, main_file, job_id):
             "folder_id": str(submission_folder["_id"]),
             "file_id": str(fobj["_id"]),
             "job_id": str(job_id),
-            "main_file": main_file,
+            "stages": stages,
         }
     except Exception as exc:
         Job().updateJob(
@@ -158,8 +119,7 @@ def prepare_submission(userId, fileId, image_tag, main_file, job_id):
     return {
         "folder_id": None,
         "file_id": None,
-        "main_file": main_file,
-        "image_tag": image_tag,
+        "stages": None,
         "job_id": str(job_id),
     }
 
@@ -203,8 +163,9 @@ def create_workspace(submission):
             print(f"Not a tar file either... Reason: {e}")
             raise ValueError("Unsupported file format for workspace creation.")
         # Ensure R library directory for user install.packages exists
-        if submission.get("image_tag", "").startswith("rocker/"):
-            os.makedirs(os.path.join(temp_dir, "R", "library"), exist_ok=True)
+        for stage in submission.get("stages", []):
+            if stage["image_name"].startswith("rocker/"):
+                os.makedirs(os.path.join(temp_dir, "R", "library"), exist_ok=True)
 
     except Exception as exc:
         os.remove(temp_filename)
@@ -220,7 +181,7 @@ def create_workspace(submission):
 
 
 @app.task(queue="local")
-def run_tro(submission, action):
+def run_tro(submission, action, inumber):
     job = Job().load(submission["job_id"], force=True)
     job = Job().updateJob(
         job,
@@ -269,18 +230,22 @@ def run_tro(submission, action):
             else:
                 tro.add_arrangement(
                     temp_dir,
-                    comment="After executing workflow",
+                    comment=f"After executing workflow step {inumber}",
                     ignore_dirs=IGNORE_DIRS,
                     resolve_symlinks=False,
                 )
         elif action == "add_performance":
+            stages = submission.get("stages", [])
+            main_file = stages[inumber].get("main_file", "unknown")
+            runs = submission.get("runs", [])
+            run = runs[-1] if runs else {}
             tro.add_performance(
-                datetime.datetime.fromisoformat(submission["run_start_time"]),
-                datetime.datetime.fromisoformat(submission["run_end_time"]),
-                comment=f"SIVACOR workflow execution ({submission['main_file']})",
-                accessed_arrangement="arrangement/0",
-                modified_arrangement="arrangement/1",
-                caps=submission.get("run_caps", ["trov:InternetIsolation"]),
+                datetime.datetime.fromisoformat(run["run_start_time"]),
+                datetime.datetime.fromisoformat(run["run_end_time"]),
+                comment=f"SIVACOR workflow execution ({main_file}) step {inumber + 1}",
+                accessed_arrangement=f"arrangement/{inumber}",
+                modified_arrangement=f"arrangement/{inumber + 1}",
+                caps=run.get("run_caps", ["trov:InternetIsolation"]),
             )
         elif action == "sign":
             tro.request_timestamp()
@@ -330,7 +295,7 @@ def run_tro(submission, action):
 
 
 @app.task(queue="local", bind=True)
-def execute_workflow(task, submission):
+def execute_workflow(task, submission, stage):
     job = Job().load(submission["job_id"], force=True)
     job = Job().updateJob(
         job,
@@ -341,16 +306,22 @@ def execute_workflow(task, submission):
         # Placeholder for actual workflow execution logic
 
         start_time = datetime.datetime.now()
-        ret = recorded_run(submission, task)
+        ret = recorded_run(submission, stage, task=task)
         if ret["StatusCode"] != 0:
             raise RuntimeError(
                 f"Workflow execution failed with code {ret['StatusCode']}"
             )
         end_time = datetime.datetime.now()
 
-        submission["run_start_time"] = start_time.isoformat()
-        submission["run_end_time"] = end_time.isoformat()
-        submission["run_caps"] = ["trov:InternetIsolation"]
+        if submission.get("runs") is None:
+            submission["runs"] = []
+        submission["runs"].append(
+            {
+                "run_start_time": start_time.isoformat(),
+                "run_end_time": end_time.isoformat(),
+                "run_caps": ["trov:InternetIsolation"],
+            }
+        )
     except Exception as exc:
         Job().updateJob(
             job,

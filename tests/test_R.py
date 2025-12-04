@@ -35,7 +35,8 @@ def test_simple_run(
     fobj = upload_test_file(uploads_folder, user, "with_space_R.zip")
 
     # Submit SIVACOR R job
-    resp = submit_sivacor_job(server, user, fobj, "rocker/r-ver:4.3.1", "main.R")
+    stages = [{"image_name": "rocker/r-ver", "image_tag": "4.3.1", "main_file": "main.R"}]
+    resp = submit_sivacor_job(server, user, fobj, stages)
     assertStatusOk(resp)
     job = resp.json
 
@@ -58,8 +59,7 @@ def test_simple_run(
         submission_folder["meta"],
         user,
         job["_id"],
-        "rocker/r-ver:4.3.1",
-        "main.R",
+        stages,
         "completed",
         expected_files,
     )

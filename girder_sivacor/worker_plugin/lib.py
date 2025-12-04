@@ -1,3 +1,4 @@
+import io
 import logging
 import math
 import os
@@ -11,9 +12,48 @@ from threading import Thread
 
 import docker
 import requests
+from girder.models.file import File
 from girder.models.folder import Folder
 from girder.models.upload import Upload
+from girder.models.setting import Setting
 from girder.models.user import User
+from girder.settings import SettingKey
+from girder.utility import RequestBodyStream
+
+
+def _update_file_from_path(file, path, user):
+    size = os.path.getsize(path)
+    upload = Upload().createUploadToFile(
+        file=file, user=user, size=size, reference=None, assetstore=None
+    )
+    if size == 0:
+        return Upload().finalizeUpload(upload)
+
+    chunkSize = Upload()._getChunkSize()
+    with open(path, "rb") as f:
+        while True:
+            data = f.read(chunkSize)
+            if not data:
+                break
+            upload = Upload().handleChunk(
+                upload, RequestBodyStream(io.BytesIO(data), len(data))
+            )
+    return upload
+
+
+def _dump_from_fileobj(in_f, out_f, is_zip=False, arcname=None):
+    chunk_size = Setting().get(SettingKey.FILEHANDLE_MAX_SIZE)
+    while True:
+        chunk = in_f.read(chunk_size)
+        if not chunk:
+            break
+        if is_zip:
+            if arcname:
+                out_f.writestr(arcname, chunk)
+            else:
+                out_f.writestr(in_f._file["name"], chunk)
+        else:
+            out_f.write(chunk)
 
 
 class DockerStatsCollectorThread(Thread):
@@ -130,8 +170,8 @@ class DummyTask:
     canceled = False
 
 
-def is_stata(image_tag: str) -> bool:
-    return image_tag.startswith("dataeditors/stata")
+def is_stata(image_reference: str) -> bool:
+    return image_reference.startswith("dataeditors/stata")
 
 
 def stata_error(log_content: str) -> str | None:
@@ -163,7 +203,7 @@ def stop_container(container: docker.models.containers.Container):
         raise
 
 
-def _infer_run_command(submission, image_tag):
+def _infer_run_command(submission, stage):
     temp_dir = submission["temp_dir"]
     entrypoint = ["/bin/sh", "-c"]
 
@@ -173,24 +213,25 @@ def _infer_run_command(submission, image_tag):
         items.remove("R")  # We now inject it...
     except ValueError:
         pass
-    sub_dir = ""
-    if len(items) == 1 and os.path.isdir(os.path.join(temp_dir, items[0])):
-        sub_dir = items[0]
 
-    if image_tag.startswith("rocker"):
+    image_name = stage["image_name"]
+    if image_name.startswith("rocker"):
         entrypoint = ["/usr/local/bin/R", "--no-save", "--no-restore", "-f"]
-    elif image_tag.startswith("dataeditors/stata"):
+    elif image_name.startswith("dataeditors/stata"):
         entrypoint = ["/usr/local/stata/stata-mp", "-b", "do"]
     else:
         raise ValueError("Cannot infer the entrypoint for submission")
 
-    main_file = submission.get("main_file", "run.sh")
-    if os.path.exists(os.path.join(temp_dir, sub_dir, main_file)):
-        command = main_file
-    elif os.path.exists(os.path.join(temp_dir, sub_dir, "code", main_file)):
-        command = main_file
-        sub_dir = os.path.join(sub_dir, "code")
-    else:
+    command = None
+    main_file = stage["main_file"]
+    for sub_dir in [""] + items:
+        if os.path.exists(os.path.join(temp_dir, sub_dir, main_file)):
+            command = main_file
+        elif os.path.exists(os.path.join(temp_dir, sub_dir, "code", main_file)):
+            command = main_file
+            sub_dir = os.path.join(sub_dir, "code")
+
+    if command is None:
         raise ValueError("Cannot infer run command for submission")
 
     # sanitize command, it may contain spaces
@@ -201,7 +242,7 @@ def _infer_run_command(submission, image_tag):
     return entrypoint, command, sub_dir
 
 
-def recorded_run(submission, task=None):
+def recorded_run(submission, stage, task=None):
     cli = docker.from_env()
 
     def logging_worker(log_queue, container):
@@ -213,9 +254,10 @@ def recorded_run(submission, task=None):
     print("Starting recorded run")
 
     submission_folder = Folder().load(submission["folder_id"], force=True)
+    stage_num = submission_folder["meta"]["stages"].index(stage) + 1
     admin = User().findOne({"admin": True})
 
-    image_tag = submission_folder["meta"]["image_tag"]
+    image_reference = stage["image_name"] + ":" + stage["image_tag"]
     host_tmp_root = os.environ.get("DOCKER_HOST_TMP_ROOT", "/")
     target_tmp_dir = os.path.join(host_tmp_root, submission["temp_dir"].lstrip("/"))
     volumes = {
@@ -230,16 +272,16 @@ def recorded_run(submission, task=None):
             "mode": "ro",
         }
 
-    cli.images.pull(image_tag)
+    cli.images.pull(image_reference)
 
-    entrypoint, command, sub_dir = _infer_run_command(submission, image_tag)
+    entrypoint, command, sub_dir = _infer_run_command(submission, stage)
     print(
         "Setting working directory to: " + os.path.join(submission["temp_dir"], sub_dir)
     )
     print("Running Tale with command: " + " ".join(entrypoint + [command]))
 
     container = cli.containers.create(
-        image=image_tag,
+        image=image_reference,
         entrypoint=entrypoint,
         command=command,
         detach=True,
@@ -287,13 +329,21 @@ def recorded_run(submission, task=None):
             ret = container.wait()
 
         # Dump run std{out,err} and entrypoint used.
-        meta = {}
-        main_file = submission.get("main_file", "run.sh")
+        main_file = stage["main_file"]
         log_files = {}
         for stdout, stderr, key in [
             (True, False, "stdout"),
             (False, True, "stderr"),
         ]:
+            log_file = f"/tmp/{key}-{submission['job_id']}"
+            log_obj = None
+            meta_key = f"{key}_file_id"
+            if submission_folder["meta"].get(meta_key) is not None:
+                log_obj = File().load(submission_folder["meta"][meta_key], force=True)
+                with File().open(log_obj) as f:
+                    with open(log_file, "wb") as out_f:
+                        _dump_from_fileobj(f, out_f)
+
             with open(os.path.join(container_temp_path, key), "wb") as fp:
                 fp.write(container.logs(stdout=stdout, stderr=stderr))
 
@@ -302,7 +352,7 @@ def recorded_run(submission, task=None):
                 main_file_noext = os.path.splitext(main_file)[0]
                 if main_file.endswith(".R"):
                     logfile = main_file_noext + ".Rout"
-                elif main_file.endswith(".do") or is_stata(image_tag):
+                elif main_file.endswith(".do") or is_stata(image_reference):
                     logfile = main_file_noext + ".log"
                 else:
                     break
@@ -313,20 +363,31 @@ def recorded_run(submission, task=None):
                         if file == logfile:
                             target_file = os.path.join(root, file)
                             break
-
+            stage_stamp = f"\n\n===== Stage {stage_num} Output =====\n\n"
             with open(target_file, "rb") as fp:
+                with open(log_file, "ab") as out_f:
+                    out_f.write(stage_stamp.encode("utf-8"))
+                    _dump_from_fileobj(fp, out_f)
+
+            with open(log_file, "rb") as fp:
                 log_files[key] = target_file
-                fobj = Upload().uploadFromFile(
-                    fp,
-                    os.path.getsize(fp.name),
-                    f"{key}-{submission['job_id']}",
-                    parentType="folder",
-                    parent=submission_folder,
-                    user=admin,
-                    mimeType="text/plain",
-                )
-                meta[key + "_file_id"] = str(fobj["_id"])
-        Folder().setMetadata(submission_folder, meta)
+                if not log_obj:
+                    fobj = Upload().uploadFromFile(
+                        fp,
+                        os.path.getsize(fp.name),
+                        os.path.basename(fp.name),
+                        parentType="folder",
+                        parent=submission_folder,
+                        user=admin,
+                        mimeType="text/plain",
+                    )
+                    Folder().setMetadata(
+                        submission_folder, {key + "_file_id": str(fobj["_id"])}
+                    )
+                else:
+                    _update_file_from_path(log_obj, log_file, admin)
+            os.remove(log_file)
+
         try:
             container.remove()
         except docker.errors.NotFound:
@@ -337,7 +398,7 @@ def recorded_run(submission, task=None):
             raise ValueError(
                 "Error executing recorded run. Check stdout/stderr for details."
             )
-        elif is_stata(image_tag):
+        elif is_stata(image_reference):
             with open(log_files["stdout"], "r") as fp:
                 log_content = fp.read()
                 if stata_err := stata_error(log_content):
