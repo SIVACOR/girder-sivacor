@@ -8,6 +8,7 @@ from girder.api.rest import boundHandler, filtermodel
 from girder.constants import AccessType, TokenScope
 from girder.exceptions import ValidationException
 from girder.models.folder import Folder
+from girder.models.user import User
 from girder.plugin import GirderPlugin, getPlugin, registerPluginStaticContent
 from girder.utility import setting_utilities
 from girder.utility.model_importer import ModelImporter
@@ -136,6 +137,7 @@ class SIVACORPlugin(GirderPlugin):
         OAuthSettings.ORCID_CLIENT_ID = "oauth.orcid_client_id"
         OAuthSettings.ORCID_CLIENT_SECRET = "oauth.orcid_client_secret"
         addProvider(ORCID)
+        User().exposeFields(level=AccessType.ADMIN, fields=("oauth"))
 
         info["apiRoot"].sivacor = SIVACOR()
 
