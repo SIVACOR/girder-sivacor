@@ -244,7 +244,6 @@ def _infer_run_command(submission, stage):
     if " " in command:
         command = f'"{command}"'
 
-    os.chmod(os.path.join(project_dir, sub_dir, main_file), 0o755)
     return entrypoint, command, sub_dir
 
 
