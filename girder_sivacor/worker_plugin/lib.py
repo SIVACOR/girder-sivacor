@@ -235,8 +235,7 @@ def _infer_run_command(submission, stage):
             command = main_file
             break
         elif os.path.exists(os.path.join(project_dir, sub_dir, "code", main_file)):
-            command = main_file
-            sub_dir = os.path.join(sub_dir, "code")
+            command = os.path.join("code", main_file)
             break
     else:
         raise ValueError("Cannot infer run command for submission")
