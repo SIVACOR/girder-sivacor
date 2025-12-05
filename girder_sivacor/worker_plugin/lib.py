@@ -292,7 +292,7 @@ def recorded_run(submission, stage, task=None):
         working_dir=os.path.join(submission["temp_dir"], sub_dir),
         user=f"{os.getuid()}:{os.getgid()}",
         environment={
-            "HOME": submission["temp_dir"],
+            "HOME": submission["temp_dir"] + "-home",
             "R_LIBS": os.path.join(submission["temp_dir"], "R", "library"),
             "R_LIBS_USER": os.path.join(submission["temp_dir"], "R", "library"),
         },
