@@ -23,7 +23,13 @@ from girder_worker.app import app
 from tro_utils.tro_utils import TRO
 
 from ..settings import PluginSettings
-from .lib import _dump_from_fileobj, _update_file_from_path, recorded_run, zip_symlink
+from .lib import (
+    _dump_from_fileobj,
+    _update_file_from_path,
+    recorded_run,
+    zip_symlink,
+    get_project_dir,
+)
 
 IGNORE_DIRS = [".git", "__pycache__"]
 
@@ -41,7 +47,7 @@ def safe_tar_extract(tar, path):
     tar.extractall(root, members=tar.getmembers())
 
 
-def _create_submission_directory(user):
+def _create_submission_folder(user):
     # Logic to create submission directory based on fileId and image_tag
     admin = User().findOne({"admin": True})
     root_collection = Collection().createCollection(
@@ -85,7 +91,7 @@ def prepare_submission(userId, fileId, stages, job_id):
     job = Job().load(job_id, force=True)
     try:
         user = User().load(userId, force=True)
-        submission_folder = _create_submission_directory(user)
+        submission_folder = _create_submission_folder(user)
         # Move file to the submission directory
         fobj = File().load(fileId, user=user, level=AccessType.READ)
         item = Item().load(fobj["itemId"], user=user, level=AccessType.READ)
@@ -136,7 +142,13 @@ def create_workspace(submission):
     try:
         temp_dir = f"/tmp/workspace-{submission['folder_id']}"
         submission["temp_dir"] = temp_dir
-        os.makedirs(temp_dir, exist_ok=False)
+        project_dir = get_project_dir(submission)
+        os.makedirs(project_dir, exist_ok=False)
+        # Ensure R library directory for user install.packages exists
+        for stage in submission.get("stages", []):
+            if stage["image_name"].startswith("rocker/"):
+                os.makedirs(os.path.join(temp_dir, "R", "library"), exist_ok=True)
+
         fobj = File().load(submission["file_id"], force=True)
         temp_filename = os.path.join(temp_dir, fobj["name"])
         with File().open(fobj) as f:
@@ -147,7 +159,7 @@ def create_workspace(submission):
         try:
             if zipfile.is_zipfile(temp_filename):
                 with zipfile.ZipFile(temp_filename, "r") as zip_ref:
-                    zip_ref.extractall(temp_dir)
+                    zip_ref.extractall(project_dir)
                 extracted = True
                 print("Extracted as a zip file.")
         except zipfile.BadZipFile:
@@ -156,16 +168,12 @@ def create_workspace(submission):
         try:
             if tarfile.is_tarfile(temp_filename) and not extracted:
                 with tarfile.open(temp_filename, "r:*") as tar_ref:
-                    safe_tar_extract(tar_ref, temp_dir)
+                    safe_tar_extract(tar_ref, project_dir)
                 extracted = True
                 print("Extracted as a tar file.")
         except tarfile.TarError as e:
             print(f"Not a tar file either... Reason: {e}")
             raise ValueError("Unsupported file format for workspace creation.")
-        # Ensure R library directory for user install.packages exists
-        for stage in submission.get("stages", []):
-            if stage["image_name"].startswith("rocker/"):
-                os.makedirs(os.path.join(temp_dir, "R", "library"), exist_ok=True)
 
     except Exception as exc:
         os.remove(temp_filename)
@@ -191,16 +199,14 @@ def run_tro(submission, action, inumber):
     try:
         admin = User().findOne({"admin": True})
         submission_folder = Folder().load(submission["folder_id"], force=True)
-        tro_file = f"/tmp/tro-{submission['job_id']}.jsonld"
+        temp_dir = submission["temp_dir"]
+        tro_file = os.path.join(temp_dir, f"tro-{submission['job_id']}.jsonld")
         tro_obj = None
         if submission.get("troId") is not None:
             tro_obj = File().load(submission["troId"], force=True)
             with File().open(tro_obj) as f:
-                with open(f"/tmp/{tro_obj['name']}", "wb") as out_f:
+                with open(tro_file, "wb") as out_f:
                     _dump_from_fileobj(f, out_f)
-            tro_file = f"/tmp/{tro_obj['name']}"
-
-        temp_dir = submission["temp_dir"]
 
         with tempfile.NamedTemporaryFile(delete=True) as profile:
             profile.write(
@@ -218,18 +224,18 @@ def run_tro(submission, action, inumber):
             )
 
         meta = {}
-
+        project_dir = get_project_dir(submission)
         if action == "add_arrangement":
             arrangements = tro.list_arrangements()
             if not arrangements:
                 tro.add_arrangement(
-                    temp_dir,
+                    project_dir,
                     comment="Before executing workflow",
                     ignore_dirs=IGNORE_DIRS,
                 )
             else:
                 tro.add_arrangement(
-                    temp_dir,
+                    project_dir,
                     comment=f"After executing workflow step {inumber}",
                     ignore_dirs=IGNORE_DIRS,
                     resolve_symlinks=False,
@@ -351,10 +357,11 @@ def upload_workspace(submission):
         zip_basename = (
             pathlib.Path(submission_fobj["name"]).stem + f"-{submission['job_id']}.zip"
         )
+        project_dir = get_project_dir(submission)
 
         zip_path = os.path.join(submission["temp_dir"], zip_basename)
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-            for root, dirs, files in os.walk(submission["temp_dir"]):
+            for root, dirs, files in os.walk(project_dir):
                 # ignore contents of dirs from IGNORE_DIRS
                 dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
                 for file in files:

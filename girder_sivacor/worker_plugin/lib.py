@@ -21,6 +21,10 @@ from girder.settings import SettingKey
 from girder.utility import RequestBodyStream
 
 
+def get_project_dir(submission):
+    return os.path.join(submission["temp_dir"], "project")
+
+
 def _update_file_from_path(file, path, user):
     size = os.path.getsize(path)
     upload = Upload().createUploadToFile(
@@ -204,11 +208,11 @@ def stop_container(container: docker.models.containers.Container):
 
 
 def _infer_run_command(submission, stage):
-    temp_dir = submission["temp_dir"]
+    project_dir = get_project_dir(submission)
     entrypoint = ["/bin/sh", "-c"]
 
-    # check if temp_dir contains a single folder
-    items = os.listdir(temp_dir)
+    # check if project_dir contains a single folder
+    items = os.listdir(project_dir)
     try:
         items.remove("R")  # We now inject it...
     except ValueError:
@@ -225,12 +229,12 @@ def _infer_run_command(submission, stage):
     command = None
     main_file = stage["main_file"]
     for sub_dir in [""] + items:
-        if not os.path.isdir(os.path.join(temp_dir, sub_dir)):
+        if not os.path.isdir(os.path.join(project_dir, sub_dir)):
             continue
-        if os.path.exists(os.path.join(temp_dir, sub_dir, main_file)):
+        if os.path.exists(os.path.join(project_dir, sub_dir, main_file)):
             command = main_file
             break
-        elif os.path.exists(os.path.join(temp_dir, sub_dir, "code", main_file)):
+        elif os.path.exists(os.path.join(project_dir, sub_dir, "code", main_file)):
             command = main_file
             sub_dir = os.path.join(sub_dir, "code")
             break
@@ -241,7 +245,7 @@ def _infer_run_command(submission, stage):
     if " " in command:
         command = f'"{command}"'
 
-    os.chmod(os.path.join(temp_dir, sub_dir, main_file), 0o755)
+    os.chmod(os.path.join(project_dir, sub_dir, main_file), 0o755)
     return entrypoint, command, sub_dir
 
 
@@ -278,8 +282,9 @@ def recorded_run(submission, stage, task=None):
     cli.images.pull(image_reference)
 
     entrypoint, command, sub_dir = _infer_run_command(submission, stage)
+    project_dir = get_project_dir(submission)
     print(
-        "Setting working directory to: " + os.path.join(submission["temp_dir"], sub_dir)
+        "Setting working directory to: " + os.path.join(project_dir, sub_dir)
     )
     print("Running Tale with command: " + " ".join(entrypoint + [command]))
 
@@ -289,10 +294,10 @@ def recorded_run(submission, stage, task=None):
         command=command,
         detach=True,
         volumes=volumes,
-        working_dir=os.path.join(submission["temp_dir"], sub_dir),
+        working_dir=os.path.join(project_dir, sub_dir),
         user=f"{os.getuid()}:{os.getgid()}",
         environment={
-            "HOME": submission["temp_dir"] + "-home",
+            "HOME": submission["temp_dir"],
             "R_LIBS": os.path.join(submission["temp_dir"], "R", "library"),
             "R_LIBS_USER": os.path.join(submission["temp_dir"], "R", "library"),
         },
@@ -361,7 +366,7 @@ def recorded_run(submission, stage, task=None):
                     break
 
                 # find .Rout files if stdout is empty and R
-                for root, dirs, files in os.walk(submission["temp_dir"]):
+                for root, dirs, files in os.walk(project_dir):
                     for file in files:
                         if file == logfile:
                             target_file = os.path.join(root, file)
