@@ -225,13 +225,16 @@ def _infer_run_command(submission, stage):
     command = None
     main_file = stage["main_file"]
     for sub_dir in [""] + items:
+        if not os.path.isdir(os.path.join(temp_dir, sub_dir)):
+            continue
         if os.path.exists(os.path.join(temp_dir, sub_dir, main_file)):
             command = main_file
+            break
         elif os.path.exists(os.path.join(temp_dir, sub_dir, "code", main_file)):
             command = main_file
             sub_dir = os.path.join(sub_dir, "code")
-
-    if command is None:
+            break
+    else:
         raise ValueError("Cannot infer run command for submission")
 
     # sanitize command, it may contain spaces
