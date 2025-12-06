@@ -339,6 +339,7 @@ def recorded_run(submission, stage, task=None):
             "HOME": submission["temp_dir"],
             "R_LIBS": os.path.join(submission["temp_dir"], "R", "library"),
             "R_LIBS_USER": os.path.join(submission["temp_dir"], "R", "library"),
+            "MLM_LICENSE_FILE": "27007@rtlicense1.uits.indiana.edu"
         },
     )
 
