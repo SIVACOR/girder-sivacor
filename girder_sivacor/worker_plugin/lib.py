@@ -265,6 +265,8 @@ def _infer_run_command(submission, stage):
         entrypoint = ["/usr/local/bin/R", "--no-save", "--no-restore", "-f"]
     elif image_name.startswith("dataeditors/stata"):
         entrypoint = ["/usr/local/stata/stata-mp", "-b", "do"]
+    elif image_name.startswith("dynare"):
+        entrypoint = ["/usr/local/bin/matlab", "-batch"]
     else:
         raise ValueError("Cannot infer the entrypoint for submission")
 
@@ -277,7 +279,10 @@ def _infer_run_command(submission, stage):
             command = main_file
             break
         elif os.path.exists(os.path.join(project_dir, sub_dir, "code", main_file)):
-            command = os.path.join("code", main_file)
+            if main_file.lower().endswith(".m"):
+                sub_dir = os.path.join(sub_dir, "code")
+            else:
+                command = os.path.join("code", main_file)
             break
     else:
         raise ValueError("Cannot infer run command for submission")
