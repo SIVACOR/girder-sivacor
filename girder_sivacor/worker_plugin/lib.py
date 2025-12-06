@@ -1,3 +1,4 @@
+import functools
 import io
 import logging
 import math
@@ -8,14 +9,15 @@ import stat
 import tempfile
 import time
 import zipfile
-from threading import Thread
+from threading import Event, Thread
 
 import docker
+import redis
 import requests
 from girder.models.file import File
 from girder.models.folder import Folder
-from girder.models.upload import Upload
 from girder.models.setting import Setting
+from girder.models.upload import Upload
 from girder.models.user import User
 from girder.settings import SettingKey
 from girder.utility import RequestBodyStream
@@ -58,6 +60,46 @@ def _dump_from_fileobj(in_f, out_f, is_zip=False, arcname=None):
                 out_f.writestr(in_f._file["name"], chunk)
         else:
             out_f.write(chunk)
+
+
+@functools.lru_cache
+def _redis_client_sync() -> redis.Redis:
+    url = os.environ.get("GIRDER_NOTIFICATION_REDIS_URL", "redis://localhost:6379")
+    return redis.Redis.from_url(url)
+
+
+class LogPublisher(Thread):
+    def __init__(self, container_name, channel):
+        super().__init__()
+        self.container_name = container_name
+        self.channel = channel
+        self.client = docker.from_env()
+        self._stop_event = Event()
+        self.daemon = True  # Allows Python to exit even if this thread is running
+
+    def run(self):
+        try:
+            container = self.client.containers.get(self.container_name)
+            log_stream = container.logs(
+                stream=True, follow=True, timestamps=True, tail=0
+            )
+            print(
+                f"Starting log publisher for {self.container_name} on Redis channel {self.channel}"
+            )
+
+            for log_line_bytes in log_stream:
+                if self._stop_event.is_set():
+                    break
+
+                log_line = log_line_bytes.decode("utf-8").strip()
+                # Use the synchronous client for publishing
+                _redis_client_sync().publish(self.channel, log_line)
+        except Exception as e:
+            print(f"Error in Log Publisher: {e}")
+            time.sleep(5)
+
+    def stop(self):
+        self._stop_event.set()
 
 
 class DockerStatsCollectorThread(Thread):
@@ -259,6 +301,7 @@ def recorded_run(submission, stage, task=None):
     print("Starting recorded run")
 
     submission_folder = Folder().load(submission["folder_id"], force=True)
+    creator_id = submission_folder["meta"]["creator_id"]
     stage_num = submission_folder["meta"]["stages"].index(stage) + 1
     admin = User().findOne({"admin": True})
 
@@ -281,9 +324,7 @@ def recorded_run(submission, stage, task=None):
 
     entrypoint, command, sub_dir = _infer_run_command(submission, stage)
     project_dir = get_project_dir(submission)
-    print(
-        "Setting working directory to: " + os.path.join(project_dir, sub_dir)
-    )
+    print("Setting working directory to: " + os.path.join(project_dir, sub_dir))
     print("Running Tale with command: " + " ".join(entrypoint + [command]))
 
     container = cli.containers.create(
@@ -305,11 +346,13 @@ def recorded_run(submission, stage, task=None):
     with tempfile.TemporaryDirectory() as container_temp_path:
         dstats_tmppath = os.path.join(container_temp_path, "docker_stats")
         stats_thread = DockerStatsCollectorThread(container, dstats_tmppath)
+        publisher = LogPublisher(container.name, f"docker:logs:{creator_id}")
 
         # Job output must come from stdout/stderr
         container.start()
         stats_thread.start()
         logging_thread.start()
+        publisher.start()
 
         try:
             container = cli.containers.get(container.id)
@@ -328,6 +371,8 @@ def recorded_run(submission, stage, task=None):
         while not log_queue.empty():
             print(log_queue.get_nowait())
         logging_thread.join()
+        publisher.stop()
+        publisher.join()
 
         if task.canceled:
             ret = {"StatusCode": -123}
