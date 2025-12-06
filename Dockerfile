@@ -82,4 +82,4 @@ RUN groupadd -g 1000 girder && groupadd -g 112 docker && useradd -g 1000 -G 112 
 EXPOSE 8080
 
 USER girder
-ENTRYPOINT ["/usr/bin/tini", "--", "gunicorn", "--workers", "4", "--worker-class", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8080", "--worker-connections", "1000", "girder.asgi:app"]
+ENTRYPOINT ["/usr/bin/tini", "--", "gunicorn", "--workers", "4", "--worker-class", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8080", "--worker-connections", "1000", "girder_sivacor.asgi:app"]
