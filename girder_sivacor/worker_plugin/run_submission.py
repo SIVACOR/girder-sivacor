@@ -44,7 +44,7 @@ def safe_tar_extract(tar, path):
         if member.issym() or member.islnk():
             raise Exception("Tar File contains unsafe links: " + member.name)
 
-    tar.extractall(root, members=tar.getmembers())
+    tar.extractall(root, members=tar.getmembers(), filter="data")
 
 
 def _create_submission_folder(user):
@@ -86,6 +86,16 @@ def _create_submission_folder(user):
 
 
 @app.task(queue="local")
+def cleanup_submission(submission_folder_id):
+    folder = Folder().load(submission_folder_id, force=True)
+    for item in Folder().childItems(
+        folder, filters={"size": {"$gt": Setting().get(PluginSettings.MAX_ITEM_SIZE)}}
+    ):
+        for fobj in Item().childFiles(item):
+            File().remove(fobj)
+
+
+@app.task(queue="local")
 def prepare_submission(userId, fileId, stages, job_id):
     # Create a submission directory
     job = Job().load(job_id, force=True)
@@ -103,6 +113,13 @@ def prepare_submission(userId, fileId, stages, job_id):
                 "status": "submitted",
                 "job_id": job_id,
             },
+        )
+        cleanup_submission.apply_async(
+            args=(str(submission_folder["_id"]),),
+            kwargs={
+                "girder_job_title": "Cleanup submission folder",
+            },
+            countdown=Setting().get(PluginSettings.RETENTION_DAYS) * 86400,
         )
         Job().updateJob(
             job,

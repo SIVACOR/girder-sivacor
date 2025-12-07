@@ -29,6 +29,22 @@ def _validate_uploads_folder_name(value):
     return value
 
 
+@setting_utilities.validator(PluginSettings.MAX_ITEM_SIZE)
+def _validate_max_item_size(doc):
+    value = doc.get("value")
+    if not isinstance(value, int) or value <= 0:
+        raise ValidationException("Max item size must be a positive integer.")
+    return value
+
+
+@setting_utilities.validator(PluginSettings.RETENTION_DAYS)
+def _validate_retention_days(doc):
+    value = doc.get("value")
+    if not isinstance(value, float) or value < 0.0:
+        raise ValidationException("Retention days must be a non-negative number.")
+    return value
+
+
 @setting_utilities.validator(
     {
         PluginSettings.SUBMISSION_COLLECTION_NAME,
