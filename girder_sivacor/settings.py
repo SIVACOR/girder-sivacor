@@ -9,6 +9,8 @@ class PluginSettings:
     TRO_GPG_FINGERPRINT = "sivacor.tro_gpg_fingerprint"
     TRO_GPG_PASSPHRASE = "sivacor.tro_gpg_passphrase"
     TRO_PROFILE = "sivacor.tro_profile"
+    MAX_ITEM_SIZE = "sivacor.max_item_size"   # in bytes
+    RETENTION_DAYS = "sivacor.retention_days"  # in days
 
 
 SettingDefault.defaults.update(
@@ -16,6 +18,8 @@ SettingDefault.defaults.update(
         PluginSettings.UPLOADS_FOLDER_NAME: "Uploads",
         PluginSettings.SUBMISSION_COLLECTION_NAME: "Submissions",
         PluginSettings.EDITORS_GROUP_NAME: "Editors",
+        PluginSettings.MAX_ITEM_SIZE: 104857600,  # 100 MB
+        PluginSettings.RETENTION_DAYS: 7,
         PluginSettings.IMAGE_TAGS: {
             "dataeditors/stata15": ["latest", "2023-01-27"],
             "dataeditors/stata16": ["latest", "2023-06-13", "2022-10-14"],
