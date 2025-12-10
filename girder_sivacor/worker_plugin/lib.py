@@ -16,11 +16,18 @@ import redis
 import requests
 from girder.models.file import File
 from girder.models.folder import Folder
+from girder.models.item import Item
 from girder.models.setting import Setting
 from girder.models.upload import Upload
 from girder.models.user import User
 from girder.settings import SettingKey
 from girder.utility import RequestBodyStream
+
+
+def annotate_item_type(file_obj: dict, item_type: str) -> None:
+    item = Item().load(file_obj["itemId"], force=True)
+    if "type" not in item["meta"]:
+        Item().setMetadata(item, {"type": item_type})
 
 
 def get_project_dir(submission):
@@ -344,7 +351,7 @@ def recorded_run(submission, stage, task=None):
             "HOME": submission["temp_dir"],
             "R_LIBS": os.path.join(submission["temp_dir"], "R", "library"),
             "R_LIBS_USER": os.path.join(submission["temp_dir"], "R", "library"),
-            "MLM_LICENSE_FILE": "27007@rtlicense1.uits.indiana.edu"
+            "MLM_LICENSE_FILE": "27007@rtlicense1.uits.indiana.edu",
         },
     )
 
@@ -441,8 +448,10 @@ def recorded_run(submission, stage, task=None):
                     Folder().setMetadata(
                         submission_folder, {key + "_file_id": str(fobj["_id"])}
                     )
+                    annotate_item_type(fobj, key)
                 else:
                     _update_file_from_path(log_obj, log_file, admin)
+                    annotate_item_type(log_obj, key)
             os.remove(log_file)
 
         try:

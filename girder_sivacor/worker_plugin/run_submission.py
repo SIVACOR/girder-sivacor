@@ -26,6 +26,7 @@ from ..settings import PluginSettings
 from .lib import (
     _dump_from_fileobj,
     _update_file_from_path,
+    annotate_item_type,
     recorded_run,
     zip_symlink,
     get_project_dir,
@@ -104,6 +105,7 @@ def prepare_submission(userId, fileId, stages, job_id):
         submission_folder = _create_submission_folder(user)
         # Move file to the submission directory
         fobj = File().load(fileId, user=user, level=AccessType.READ)
+        annotate_item_type(fobj, "submission_file")
         item = Item().load(fobj["itemId"], user=user, level=AccessType.READ)
         Item().move(item, submission_folder)
         Folder().setMetadata(
@@ -273,8 +275,10 @@ def run_tro(submission, action, inumber):
         elif action == "sign":
             tro.request_timestamp()
 
-            for meta_key, filename in zip(
-                ("sig_file_id", "tsr_file_id"), (tro.sig_filename, tro.tsr_filename)
+            for meta_key, filename, nice_name in zip(
+                ("sig_file_id", "tsr_file_id"),
+                (tro.sig_filename, tro.tsr_filename),
+                ("tro_signature", "tro_timestamp"),
             ):
                 with open(filename, "rb") as f:
                     fobj = Upload().uploadFromFile(
@@ -286,6 +290,7 @@ def run_tro(submission, action, inumber):
                         user=admin,
                         mimeType="text/plain",
                     )
+                    annotate_item_type(fobj, nice_name)
                     meta[meta_key] = str(fobj["_id"])
                 os.remove(filename)
 
@@ -302,6 +307,7 @@ def run_tro(submission, action, inumber):
                 user=admin,
                 mimeType="application/ld+json",
             )
+            annotate_item_type(tro_obj, "tro_declaration")
             submission["troId"] = str(tro_obj["_id"])
         os.remove(tro.tro_filename)
         meta["tro_file_id"] = str(tro_obj["_id"])
@@ -426,6 +432,7 @@ def upload_workspace(submission):
                 user=admin,
                 mimeType="application/zip",
             )
+            annotate_item_type(fobj, "replicated_package")
         os.remove(zip_path)
         Folder().setMetadata(submission_folder, {"replpack_file_id": str(fobj["_id"])})
         submission["replpack_file_id"] = str(fobj["_id"])
