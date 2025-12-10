@@ -124,8 +124,8 @@ class ORCID(ProviderBase):
         if not oauthId:
             raise RestException("ORCID did not return a user ID.", code=502)
 
-        login = ""
         lastName = resp["name"]["family-name"]["value"]
         firstName = resp["name"]["given-names"]["value"]
+        login = firstName.replace(" ", "") + "-" + lastName.replace(" ", "")
 
         return self._createOrReuseUser(oauthId, email, firstName, lastName, login)
