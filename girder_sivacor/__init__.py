@@ -16,7 +16,7 @@ from girder_oauth.providers import addProvider
 from girder_oauth.settings import PluginSettings as OAuthSettings
 
 from .auth.orcid import ORCID
-from .rest import SIVACOR
+from .rest import SIVACOR, get_submission_child_jobs
 from .settings import PluginSettings
 
 logger = logging.getLogger(__name__)
@@ -156,6 +156,8 @@ class SIVACORPlugin(GirderPlugin):
         User().exposeFields(level=AccessType.ADMIN, fields=("oauth"))
 
         info["apiRoot"].sivacor = SIVACOR()
+        getPlugin("jobs").load(info)
+        info["apiRoot"].job.route("GET", (":id", "children"), get_submission_child_jobs)
 
         FolderResource.find.description.param(
             "jobId",

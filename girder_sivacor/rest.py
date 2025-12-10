@@ -6,7 +6,7 @@ import requests
 import yaml
 from girder.api import access
 from girder.api.describe import Description, autoDescribeRoute
-from girder.api.rest import Resource, filtermodel
+from girder.api.rest import Resource, boundHandler, filtermodel
 from girder.constants import AccessType
 from girder.exceptions import ValidationException
 from girder.models.file import File as FileModel
@@ -162,3 +162,26 @@ class SIVACOR(Resource):
             return json.load(f)
 
         return tags
+
+
+@access.public
+@autoDescribeRoute(
+    Description("Get submission child jobs for a given job.").modelParam(
+        "id",
+        "The ID of the parent job.",
+        model=JobModel,
+        level=AccessType.READ,
+        required=True,
+    )
+)
+@filtermodel(model=JobModel)
+@boundHandler
+def get_submission_child_jobs(self, job):
+    child_jobs = []
+    workspace_job = JobModel().findOne({"type": "celery", "args.3": str(job["_id"])})
+    if workspace_job:
+        child_jobs.append(workspace_job)
+    child_jobs += list(
+        JobModel().find({"type": "celery", "args.0.job_id": str(job["_id"])})
+    )
+    return child_jobs
