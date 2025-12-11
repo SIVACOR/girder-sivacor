@@ -76,6 +76,7 @@ jobs:
         GIRDER_WORKER_BROKER: redis://locahost/
         GIRDER_WORKER_BACKEND: redis://locahost/
         GIRDER_NOTIFICATION_REDIS_URL: redis://localhost:6379/
+        GIRDER_MAX_CURSOR_TIMEOUT_MS: 60000
         STATA_LICENSE_HOSTPATH: /tmp/licenses/stata.lic.19
       run: |
         # Run tests with coverage
