@@ -6,7 +6,6 @@ import shutil
 import tarfile
 import tempfile
 import zipfile
-from functools import wraps
 
 import randomname
 from girder.constants import AccessType
@@ -28,26 +27,12 @@ from .lib import (
     _dump_from_fileobj,
     _update_file_from_path,
     annotate_item_type,
-    get_project_dir,
     recorded_run,
     zip_symlink,
+    get_project_dir,
 )
 
 IGNORE_DIRS = [".git", "__pycache__"]
-
-
-def job_check(task):
-    @wraps(task)
-    def inner(self, *args, **kwargs):
-        if len(args) > 0 and isinstance(args[0], dict) and args[0].get("job_id"):
-            job = Job().load(args[0]["job_id"], force=True)
-            if job["status"] != JobStatus.RUNNING:
-                if self.request.chain:
-                    self.request.chain = None
-                return {"job_id": str(args[0]["job_id"])}
-        return task(self, *args, **kwargs)
-
-    return inner
 
 
 def safe_tar_extract(tar, path):
@@ -111,9 +96,8 @@ def cleanup_submission(submission_folder_id):
             File().remove(fobj)
 
 
-@app.task(queue="local", bind=True)
-@job_check
-def prepare_submission(task, userId, fileId, stages, job_id):
+@app.task(queue="local")
+def prepare_submission(userId, fileId, stages, job_id):
     # Create a submission directory
     job = Job().load(job_id, force=True)
     try:
@@ -129,7 +113,7 @@ def prepare_submission(task, userId, fileId, stages, job_id):
             {
                 "stages": stages,
                 "status": "submitted",
-                "job_id": str(job["_id"]),
+                "job_id": job_id,
             },
         )
         cleanup_submission.apply_async(
@@ -165,9 +149,8 @@ def prepare_submission(task, userId, fileId, stages, job_id):
     }
 
 
-@app.task(queue="local", bind=True)
-@job_check
-def create_workspace(task, submission):
+@app.task(queue="local")
+def create_workspace(submission):
     job = Job().load(submission["job_id"], force=True)
     job = Job().updateJob(
         job,
@@ -224,9 +207,8 @@ def create_workspace(task, submission):
     return submission
 
 
-@app.task(queue="local", bind=True)
-@job_check
-def run_tro(task, submission, action, inumber):
+@app.task(queue="local")
+def run_tro(submission, action, inumber):
     job = Job().load(submission["job_id"], force=True)
     job = Job().updateJob(
         job,
@@ -342,7 +324,6 @@ def run_tro(task, submission, action, inumber):
 
 
 @app.task(queue="local", bind=True)
-@job_check
 def execute_workflow(task, submission, stage):
     job = Job().load(submission["job_id"], force=True)
     job = Job().updateJob(
@@ -355,12 +336,6 @@ def execute_workflow(task, submission, stage):
 
         start_time = datetime.datetime.now()
         ret = recorded_run(submission, stage, task=task)
-        if ret["StatusCode"] == -123:
-            print("Termination requested, stopping execution.")
-            if task.request.chain:
-                task.request.chain = None
-            return {"job_id": submission["job_id"]}
-
         if ret["StatusCode"] != 0:
             raise RuntimeError(
                 f"Workflow execution failed with code {ret['StatusCode']}"
@@ -387,9 +362,8 @@ def execute_workflow(task, submission, stage):
     return submission
 
 
-@app.task(queue="local", bind=True)
-@job_check
-def upload_workspace(task, submission):
+@app.task(queue="local")
+def upload_workspace(submission):
     # Upload the modified workspace back to Girder as a zip file
     # called 'executed_replication_package.zip'
     job = Job().load(submission["job_id"], force=True)
@@ -477,10 +451,9 @@ def upload_workspace(task, submission):
 def finalize_job(submission):
     shutil.rmtree(submission["temp_dir"], ignore_errors=True)
     job = Job().load(submission["job_id"], force=True)
-    if job["status"] == JobStatus.RUNNING:
-        job = Job().updateJob(
-            job,
-            "Submission job finalized successfully.\n",
-            status=JobStatus.SUCCESS,
-        )
+    job = Job().updateJob(
+        job,
+        "Submission job finalized successfully.\n",
+        status=JobStatus.SUCCESS,
+    )
     return submission

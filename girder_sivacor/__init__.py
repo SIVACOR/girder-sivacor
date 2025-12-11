@@ -12,8 +12,6 @@ from girder.models.user import User
 from girder.plugin import GirderPlugin, getPlugin, registerPluginStaticContent
 from girder.utility import setting_utilities
 from girder.utility.model_importer import ModelImporter
-from girder_jobs.constants import JobStatus
-from girder_jobs.models.job import Job as JobModel
 from girder_oauth.providers import addProvider
 from girder_oauth.settings import PluginSettings as OAuthSettings
 
@@ -139,29 +137,6 @@ def search_with_job_id(self, event):
         event.preventDefault().addResponse(folders)
 
 
-def cancel_jobs(event):
-    job = event.info
-    if job["type"] != "sivacor_submission":
-        return
-
-    q = {
-        "type": "celery",
-        "$or": [
-            {"args.0.job_id": str(job["_id"])},
-            {"args.3": str(job["_id"])},
-        ],
-        "status": {
-            "$in": [
-                JobStatus.INACTIVE,
-                JobStatus.QUEUED,
-                JobStatus.RUNNING,
-            ]
-        },
-    }
-    for child_job in JobModel().find(q):
-        JobModel().cancelJob(child_job)
-
-
 class SIVACORPlugin(GirderPlugin):
     DISPLAY_NAME = "SIVACOR"
 
@@ -182,7 +157,6 @@ class SIVACORPlugin(GirderPlugin):
 
         info["apiRoot"].sivacor = SIVACOR()
         getPlugin("jobs").load(info)
-        events.bind("jobs.cancel", "sivacor", cancel_jobs)
         info["apiRoot"].job.route("GET", (":id", "children"), get_submission_child_jobs)
 
         FolderResource.find.description.param(
