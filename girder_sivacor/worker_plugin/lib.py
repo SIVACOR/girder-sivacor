@@ -490,6 +490,9 @@ def recorded_run(submission, stage, task=None):
                     fp.write(container.logs(stdout=stdout, stderr=stderr))
 
             target_file = os.path.join(container_temp_path, key)
+            if not os.path.isfile(target_file):
+                print(f"{key} file not found, skipping...")
+                continue
             if key == "stdout" and os.path.getsize(target_file) == 0:
                 main_file_noext = os.path.splitext(main_file)[0]
                 if main_file.endswith(".R"):
