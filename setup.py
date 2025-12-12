@@ -8,9 +8,10 @@ requirements = [
     "girder-oauth>=5.0.0a1",
     "girder-jobs>=5.0.0a1",
     "girder-plugin-worker>=5.0.0a1",
+    "pandas",
     "randomname",
-    "tro-utils>=0.1.1",
-    "watchfiles"
+    "tro-utils>=0.1.2",
+    "watchfiles",
 ]
 
 setup(
