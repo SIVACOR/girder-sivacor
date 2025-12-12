@@ -1,5 +1,6 @@
 import functools
 import io
+import json
 import logging
 import math
 import os
@@ -12,6 +13,8 @@ import zipfile
 from threading import Event, Thread
 
 import docker
+import numpy as np
+import pandas as pd
 import redis
 import requests
 from girder.models.file import File
@@ -22,6 +25,17 @@ from girder.models.upload import Upload
 from girder.models.user import User
 from girder.settings import SettingKey
 from girder.utility import RequestBodyStream
+
+
+class NpEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super(NpEncoder, self).default(obj)
 
 
 def annotate_item_type(file_obj: dict, item_type: str) -> None:
@@ -125,6 +139,12 @@ class DockerStatsCollectorThread(Thread):
             return True
 
     def run(self):
+        with open(self.output_path + ".csv", mode="w") as fp:
+            header = (
+                "Timestamp,CPU %,Memory Usage,Memory Limit,Network RX,Network TX,"
+                "Block IO Read,Block IO Write,PIDs\n"
+            )
+            fp.write(header)
         while True:
             try:
                 d = self.container.stats(stream=False)
@@ -139,13 +159,24 @@ class DockerStatsCollectorThread(Thread):
                 mem_usage, mem_limit = self.calculate_memory(d)
                 bytes_in, bytes_out = self.calculate_network_bytes(d)
                 blkio_rd, blkio_wr = self.calculate_blkio_bytes(d)
+                cpu_percent = self.calculate_cpu_percent(d)
                 line = (
-                    f"{ts} - {self.calculate_cpu_percent(d):.2f}%, {mem_usage} / {mem_limit},"
+                    f"{ts} - {cpu_percent:.2f}%, {mem_usage} / {mem_limit},"
                     f" {bytes_in} / {bytes_out}, {blkio_rd} / {blkio_wr},"
                     f" {d.get('pids_stats', {}).get('current', 0)}\n"
                 )
                 with open(self.output_path, mode="a") as fp:
                     fp.write(line)
+                with open(self.output_path + ".csv", mode="a") as fp:
+                    mem_usage, mem_limit = self.calculate_memory(d, convert=False)
+                    bytes_in, bytes_out = self.calculate_network_bytes(d, convert=False)
+                    blkio_rd, blkio_wr = self.calculate_blkio_bytes(d, convert=False)
+                    csv_line = (
+                        f'"{ts}",{cpu_percent:.2f},{mem_usage},{mem_limit},'
+                        f'{bytes_in},{bytes_out},{blkio_rd},{blkio_wr},'
+                        f'{d.get("pids_stats", {}).get("current", 0)}\n'
+                    )
+                    fp.write(csv_line)
             time.sleep(5)
 
     @staticmethod
@@ -188,7 +219,7 @@ class DockerStatsCollectorThread(Thread):
             cpu_percent = cpu_delta / system_delta * 100.0 * cpu_count
         return cpu_percent
 
-    def calculate_blkio_bytes(self, d):
+    def calculate_blkio_bytes(self, d, convert=True):
         bytes_stats = d.get("blkio_stats", {}).get("io_service_bytes_recursive")
         if not bytes_stats:
             return 0, 0
@@ -198,9 +229,11 @@ class DockerStatsCollectorThread(Thread):
                 rd += s["value"]
             elif s["op"] == "Write":
                 wr += s["value"]
+        if not convert:
+            return rd, wr
         return self.convert_size(rd, binary=False), self.convert_size(wr, binary=False)
 
-    def calculate_network_bytes(self, d):
+    def calculate_network_bytes(self, d, convert=True):
         networks = d.get("networks")
         if not networks:
             return 0, 0
@@ -208,12 +241,16 @@ class DockerStatsCollectorThread(Thread):
         for data in networks.values():
             rx += data["rx_bytes"]
             tx += data["tx_bytes"]
+        if not convert:
+            return rx, tx
         return self.convert_size(rx, binary=False), self.convert_size(tx, binary=False)
 
-    def calculate_memory(self, d):
+    def calculate_memory(self, d, convert=True):
         memory = d.get("memory_stats")
         if not memory:
             return 0, 0
+        if not convert:
+            return memory.get("usage", 0), memory.get("limit", 0)
         return self.convert_size(
             memory.get("usage", 0), binary=True
         ), self.convert_size(memory.get("limit", 0), binary=True)
@@ -303,6 +340,16 @@ def _infer_run_command(submission, stage):
 
 def recorded_run(submission, stage, task=None):
     cli = docker.from_env()
+    info = cli.info()
+    performance_data = {
+        "Architecture": info.get("Architecture"),
+        "KernelVersion": info.get("KernelVersion"),
+        "OperatingSystem": info.get("OperatingSystem"),
+        "OSType": info.get("OSType"),
+        "OSVersion": info.get("OSVersion"),
+        "MemTotal": info.get("MemTotal"),
+        "NCPU": info.get("NCPU"),
+    }
 
     def logging_worker(log_queue, container):
         for line in container.logs(stream=True):
@@ -357,7 +404,7 @@ def recorded_run(submission, stage, task=None):
 
     logging_thread = Thread(target=logging_worker, args=(log_queue, container))
     with tempfile.TemporaryDirectory() as container_temp_path:
-        dstats_tmppath = os.path.join(container_temp_path, "docker_stats")
+        dstats_tmppath = os.path.join(container_temp_path, "dockerstats")
         stats_thread = DockerStatsCollectorThread(container, dstats_tmppath)
         publisher = LogPublisher(container.name, f"docker:logs:{creator_id}")
 
@@ -392,12 +439,42 @@ def recorded_run(submission, stage, task=None):
         else:
             ret = container.wait()
 
+        container.reload()
+        performance_data.update(
+            {
+                "ImageRepoTags": container.image.attrs.get("RepoTags", []),
+                "ImageRepoDigests": container.image.attrs.get("RepoDigests", []),
+                "StartedAt": container.attrs["State"]["StartedAt"],
+                "FinishedAt": container.attrs["State"]["FinishedAt"],
+            }
+        )
+        if os.path.isfile(dstats_tmppath + ".csv"):
+            df = pd.read_csv(dstats_tmppath + ".csv")
+            performance_data.update(
+                {
+                    "MaxCPUPercent": df["CPU %"].max(),
+                    "MaxMemoryUsage": df["Memory Usage"].max(),
+                }
+            )
+        pdata = io.BytesIO(json.dumps(performance_data, cls=NpEncoder).encode("utf-8"))
+        fobj = Upload().uploadFromFile(
+            pdata,
+            pdata.getbuffer().nbytes,
+            f"performance_data_stage_{stage_num}.json",
+            parentType="folder",
+            parent=submission_folder,
+            user=admin,
+            mimeType="text/plain",
+        )
+        annotate_item_type(fobj, "performance_data")
+
         # Dump run std{out,err} and entrypoint used.
         main_file = stage["main_file"]
         log_files = {}
         for stdout, stderr, key in [
             (True, False, "stdout"),
             (False, True, "stderr"),
+            (None, None, "dockerstats"),
         ]:
             log_file = f"/tmp/{key}-{submission['job_id']}"
             log_obj = None
@@ -408,10 +485,14 @@ def recorded_run(submission, stage, task=None):
                     with open(log_file, "wb") as out_f:
                         _dump_from_fileobj(f, out_f)
 
-            with open(os.path.join(container_temp_path, key), "wb") as fp:
-                fp.write(container.logs(stdout=stdout, stderr=stderr))
+            if key != "dockerstats":
+                with open(os.path.join(container_temp_path, key), "wb") as fp:
+                    fp.write(container.logs(stdout=stdout, stderr=stderr))
 
             target_file = os.path.join(container_temp_path, key)
+            if not os.path.isfile(target_file):
+                print(f"{key} file not found, skipping...")
+                continue
             if key == "stdout" and os.path.getsize(target_file) == 0:
                 main_file_noext = os.path.splitext(main_file)[0]
                 if main_file.endswith(".R"):

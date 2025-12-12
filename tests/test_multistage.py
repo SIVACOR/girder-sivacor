@@ -1,5 +1,8 @@
+import json
 import pytest
 from girder.models.file import File
+from girder.models.folder import Folder
+from girder.models.item import Item
 from girder_jobs.constants import JobStatus
 from girder_jobs.models.job import Job
 from pytest_girder.assertions import assertStatusOk
@@ -66,6 +69,52 @@ def test_multistage_run(
         "completed",
         expected_files,
     )
+
+    # Verify performance data files are created for each stage
+    folder_obj = Folder().load(submission_folder["_id"], force=True)
+    performance_files = {}
+    for stage_num in range(1, len(stages) + 1):
+        performance_filename = f"performance_data_stage_{stage_num}.json"
+        performance_items = list(
+            Folder().childItems(
+                folder_obj,
+                filters={"name": performance_filename},
+                limit=1,
+            )
+        )
+        assert (
+            len(performance_items) == 1
+        ), f"Performance data file {performance_filename} not found"
+
+        # Verify performance data content
+        with Item().childFiles(performance_items[0]) as files:
+            for fobj in files:
+                with File().open(fobj) as f:
+                    performance_data = json.load(f)
+                    performance_files[stage_num] = performance_data
+
+                    # Verify expected system information fields
+                    assert "Architecture" in performance_data
+                    assert "KernelVersion" in performance_data
+                    assert "OperatingSystem" in performance_data
+                    assert "OSType" in performance_data
+                    assert "MemTotal" in performance_data
+                    assert "NCPU" in performance_data
+
+                    # Verify container information fields
+                    assert "ImageRepoTags" in performance_data
+                    assert "StartedAt" in performance_data
+                    assert "FinishedAt" in performance_data
+
+                    # Verify performance metrics (if CSV was processed)
+                    if "MaxCPUPercent" in performance_data:
+                        assert isinstance(
+                            performance_data["MaxCPUPercent"], (int, float)
+                        )
+                    if "MaxMemoryUsage" in performance_data:
+                        assert isinstance(
+                            performance_data["MaxMemoryUsage"], (int, float)
+                        )
 
     # Verify stdout content
     stdout = File().load(submission_folder["meta"]["stdout_file_id"], force=True)

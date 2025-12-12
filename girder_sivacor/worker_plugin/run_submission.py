@@ -282,13 +282,24 @@ def run_tro(task, submission, action, inumber):
             main_file = stages[inumber].get("main_file", "unknown")
             runs = submission.get("runs", [])
             run = runs[-1] if runs else {}
+            extra_attributes = None
+            for item in Folder().childItems(
+                submission_folder,
+                filters={"name": f"performance_data_stage_{inumber + 1}.json"},
+                limit=1,
+            ):
+                with Item().childFiles(item) as files:
+                    for fobj in files:
+                        with File().open(fobj) as f:
+                            extra_attributes = json.load(f)
             tro.add_performance(
                 datetime.datetime.fromisoformat(run["run_start_time"]),
                 datetime.datetime.fromisoformat(run["run_end_time"]),
                 comment=f"SIVACOR workflow execution ({main_file}) step {inumber + 1}",
                 accessed_arrangement=f"arrangement/{inumber}",
                 modified_arrangement=f"arrangement/{inumber + 1}",
-                caps=run.get("run_caps", ["trov:InternetIsolation"]),
+                caps=run.get("run_caps", []),
+                extra_attributes=extra_attributes,
             )
         elif action == "sign":
             tro.request_timestamp()
