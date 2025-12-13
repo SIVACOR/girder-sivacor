@@ -109,7 +109,7 @@ SettingDefault.defaults.update(
             ],
             "trov:owner": "SIVACOR Team",
             "trov:description": "SIVACOR AEA Infrastructure",
-            "trov:contact": "email@goes.here",
+            "trov:contact": "admin@sivacor.org",
             "trov:url": "https://sivacor.org/",
             "trov:name": "sivacor",
         },
