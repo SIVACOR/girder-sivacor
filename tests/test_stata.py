@@ -13,6 +13,7 @@ from .conftest import (
 
 
 @pytest.mark.plugin("sivacor")
+@pytest.mark.parametrize("testFile", ["test_stata.tar.gz", "sivacor-test-stata-scenario-A.zip"])
 def test_simple_run(
     server,
     db,
@@ -22,6 +23,7 @@ def test_simple_run(
     patched_gpg,
     uploads_folder,
     submission_collection,
+    testFile,
 ):
     """Test a successful Stata submission workflow."""
     image_name = "dataeditors/stata18_5-mp"
@@ -31,7 +33,7 @@ def test_simple_run(
 
     # Upload test file
     assert uploads_folder is not None
-    fobj = upload_test_file(uploads_folder, user, "test_stata.tar.gz")
+    fobj = upload_test_file(uploads_folder, user, testFile)
 
     # Submit SIVACOR Stata job
     resp = submit_sivacor_job(server, user, fobj, stages)

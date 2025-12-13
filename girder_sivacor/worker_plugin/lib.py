@@ -10,6 +10,7 @@ import stat
 import tempfile
 import time
 import zipfile
+from pathlib import Path
 from threading import Event, Thread
 
 import docker
@@ -304,6 +305,7 @@ def _infer_run_command(submission, stage):
     except ValueError:
         pass
 
+    # Determine entrypoint based on image
     image_name = stage["image_name"]
     if image_name.startswith("rocker"):
         entrypoint = ["/usr/local/bin/R", "--no-save", "--no-restore", "-f"]
@@ -314,26 +316,57 @@ def _infer_run_command(submission, stage):
     else:
         raise ValueError("Cannot infer the entrypoint for submission")
 
-    command = None
-    main_file = stage["main_file"]
-    for sub_dir in [""] + items:
-        if not os.path.isdir(os.path.join(project_dir, sub_dir)):
-            continue
-        if os.path.exists(os.path.join(project_dir, sub_dir, main_file)):
-            command = main_file
-            break
-        elif os.path.exists(os.path.join(project_dir, sub_dir, "code", main_file)):
-            if main_file.lower().endswith(".m"):
-                sub_dir = os.path.join(sub_dir, "code")
-            else:
-                command = os.path.join("code", main_file)
-            break
-    else:
-        raise ValueError("Cannot infer run command for submission")
+    # Find the main file, by walking into subdirectories if needed
+    base_path = Path(project_dir).resolve()
+    relative_paths = []
+    renv_paths = []
+    for current_dir, _, filenames in os.walk(base_path):
+        if stage["main_file"] in filenames:
+            full_main_file_path = Path(current_dir) / stage["main_file"]
+            try:
+                relative_path = full_main_file_path.relative_to(base_path)
+                relative_paths.append(relative_path)
+            except ValueError:
+                print(
+                    f"Warning: Could not calculate relative path for {full_main_file_path}"
+                )
+        if "renv.lock" in filenames:
+            full_renv_path = Path(current_dir) / "renv.lock"
+            try:
+                relative_renv_path = full_renv_path.relative_to(base_path)
+                renv_paths.append(relative_renv_path)
+            except ValueError:
+                print(
+                    f"Warning: Could not calculate relative path for {full_renv_path}"
+                )
 
-    # sanitize command, it may contain spaces
+    if len(relative_paths) == 0:
+        raise ValueError(
+            f"Cannot infer run command for submission. No {stage['main_file']} found."
+        )
+    elif len(relative_paths) > 1:
+        raise ValueError(
+            f"Cannot infer run command for submission. Multiple {stage['main_file']} "
+            "files found: {relative_paths}"
+        )
+
+    sub_dir = ""
+    if len(relative_paths[0].parts) > 1:
+        sub_dir = str(relative_paths[0].parent)
+    command = str(relative_paths[0].name)
     if " " in command:
         command = f'"{command}"'
+
+    # If renv.lock is found override sub_dir and command to use it
+    if len(renv_paths) == 1:
+        print(
+            "Found renv.lock, adjusting command to use its location as working directory."
+        )
+        sub_dir = str(renv_paths[0].parent)
+        command = (
+            relative_paths[0].parent.relative_to(renv_paths[0].parent)
+            / relative_paths[0].name
+        )
 
     return entrypoint, command, sub_dir
 
