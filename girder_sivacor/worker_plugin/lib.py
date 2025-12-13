@@ -323,22 +323,13 @@ def _infer_run_command(submission, stage):
     for current_dir, _, filenames in os.walk(base_path):
         if stage["main_file"] in filenames:
             full_main_file_path = Path(current_dir) / stage["main_file"]
-            try:
-                relative_path = full_main_file_path.relative_to(base_path)
-                relative_paths.append(relative_path)
-            except ValueError:
-                print(
-                    f"Warning: Could not calculate relative path for {full_main_file_path}"
-                )
+            relative_path = full_main_file_path.relative_to(base_path)
+            relative_paths.append(relative_path)
+
         if "renv.lock" in filenames:
             full_renv_path = Path(current_dir) / "renv.lock"
-            try:
-                relative_renv_path = full_renv_path.relative_to(base_path)
-                renv_paths.append(relative_renv_path)
-            except ValueError:
-                print(
-                    f"Warning: Could not calculate relative path for {full_renv_path}"
-                )
+            relative_renv_path = full_renv_path.relative_to(base_path)
+            renv_paths.append(relative_renv_path)
 
     if len(relative_paths) == 0:
         raise ValueError(
