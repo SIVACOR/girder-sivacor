@@ -357,6 +357,10 @@ def _infer_run_command(submission, stage):
             sub_dir = str(relative_paths[0].parent)
         command = str(relative_paths[0].name)
 
+    if image_name.startswith("dynare"):
+        # For MATLAB, the command is just the main file name without extension
+        command = os.path.splitext(command)[0]
+
     if " " in command:
         command = f'"{command}"'
 
