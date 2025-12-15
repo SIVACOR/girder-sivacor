@@ -342,12 +342,6 @@ def _infer_run_command(submission, stage):
         )
 
     sub_dir = ""
-    if len(relative_paths[0].parts) > 1:
-        sub_dir = str(relative_paths[0].parent)
-    command = str(relative_paths[0].name)
-    if " " in command:
-        command = f'"{command}"'
-
     # If renv.lock is found override sub_dir and command to use it
     if len(renv_paths) == 1:
         print(
@@ -357,7 +351,14 @@ def _infer_run_command(submission, stage):
         command = (
             relative_paths[0].parent.relative_to(renv_paths[0].parent)
             / relative_paths[0].name
-        )
+        ).as_posix()
+    else:
+        if len(relative_paths[0].parts) > 1:
+            sub_dir = str(relative_paths[0].parent)
+        command = str(relative_paths[0].name)
+
+    if " " in command:
+        command = f'"{command}"'
 
     return entrypoint, command, sub_dir
 
