@@ -386,7 +386,7 @@ def recorded_run(submission, stage, task=None):
 
     task = task or DummyTask
     log_queue = queue.Queue()
-    print("Starting recorded run")
+    logging.info("Starting recorded run")
 
     submission_folder = Folder().load(submission["folder_id"], force=True)
     creator_id = submission_folder["meta"]["creator_id"]
@@ -412,8 +412,8 @@ def recorded_run(submission, stage, task=None):
 
     entrypoint, command, sub_dir = _infer_run_command(submission, stage)
     project_dir = get_project_dir(submission)
-    print("Setting working directory to: " + os.path.join(project_dir, sub_dir))
-    print("Running Tale with command: " + " ".join(entrypoint + [command]))
+    logging.info("Setting working directory to: " + os.path.join(project_dir, sub_dir))
+    logging.info("Running Tale with command: " + " ".join(entrypoint + [command]))
 
     container = cli.containers.create(
         image=image_reference,
@@ -469,6 +469,8 @@ def recorded_run(submission, stage, task=None):
             ret = container.wait()
 
         container.reload()
+        logging.info(f"Container exited with status: {ret['StatusCode']}")
+        logging.info("Collecting performance data...")
         performance_data.update(
             {
                 "ImageRepoTags": container.image.attrs.get("RepoTags", []),
@@ -496,6 +498,7 @@ def recorded_run(submission, stage, task=None):
             mimeType="text/plain",
         )
         annotate_item_type(fobj, "performance_data")
+        logging.info("Performance data collected and uploaded.")
 
         # Dump run std{out,err} and entrypoint used.
         main_file = stage["main_file"]
@@ -515,7 +518,8 @@ def recorded_run(submission, stage, task=None):
                         _dump_from_fileobj(f, out_f)
 
             if key != "dockerstats":
-                with open(os.path.join(container_temp_path, key), "wb") as fp:
+                container_log_path = os.path.join(container_temp_path, key)
+                with open(container_log_path, "wb") as fp:
                     fp.write(container.logs(stdout=stdout, stderr=stderr))
 
             target_file = os.path.join(container_temp_path, key)
@@ -524,19 +528,24 @@ def recorded_run(submission, stage, task=None):
                 continue
             if key == "stdout" and os.path.getsize(target_file) == 0:
                 main_file_noext = os.path.splitext(main_file)[0]
+                logfile = None
                 if main_file.endswith(".R"):
                     logfile = main_file_noext + ".Rout"
                 elif main_file.endswith(".do") or is_stata(image_reference):
                     logfile = main_file_noext + ".log"
                 else:
-                    break
+                    logging.info(
+                        f"Cannot infer log file for main file {main_file}, skipping..."
+                    )
 
-                # find .Rout files if stdout is empty and R
-                for root, dirs, files in os.walk(project_dir):
-                    for file in files:
-                        if file == logfile:
-                            target_file = os.path.join(root, file)
-                            break
+                if logfile:
+                    # find .Rout files if stdout is empty and R
+                    for root, dirs, files in os.walk(project_dir):
+                        for file in files:
+                            if file == logfile:
+                                target_file = os.path.join(root, file)
+                                break
+
             stage_stamp = f"\n\n===== Stage {stage_num} Output =====\n\n"
             with open(target_file, "rb") as fp:
                 with open(log_file, "ab") as out_f:
