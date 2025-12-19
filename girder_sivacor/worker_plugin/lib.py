@@ -307,12 +307,14 @@ def _infer_run_command(submission, stage):
 
     # Determine entrypoint based on image
     image_name = stage["image_name"]
+    home_dir = submission["temp_dir"]
     if image_name.startswith("rocker"):
         entrypoint = ["/usr/local/bin/R", "--no-save", "--no-restore", "-f"]
     elif image_name.startswith("dataeditors/stata"):
         entrypoint = ["/usr/local/stata/stata-mp", "-b", "do"]
     elif image_name.startswith("dynare"):
         entrypoint = ["/usr/local/bin/matlab", "-batch"]
+        home_dir = "/home/matlab"
     else:
         raise ValueError("Cannot infer the entrypoint for submission")
 
@@ -364,7 +366,7 @@ def _infer_run_command(submission, stage):
     if " " in command:
         command = f'"{command}"'
 
-    return entrypoint, command, sub_dir
+    return entrypoint, command, sub_dir, home_dir
 
 
 def recorded_run(submission, stage, task=None):
@@ -410,7 +412,7 @@ def recorded_run(submission, stage, task=None):
 
     cli.images.pull(image_reference)
 
-    entrypoint, command, sub_dir = _infer_run_command(submission, stage)
+    entrypoint, command, sub_dir, home_dir = _infer_run_command(submission, stage)
     project_dir = get_project_dir(submission)
     logging.info("Setting working directory to: " + os.path.join(project_dir, sub_dir))
     logging.info("Running Tale with command: " + " ".join(entrypoint + [command]))
@@ -424,9 +426,9 @@ def recorded_run(submission, stage, task=None):
         working_dir=os.path.join(project_dir, sub_dir),
         user=f"{os.getuid()}:{os.getgid()}",
         environment={
-            "HOME": submission["temp_dir"],
-            "R_LIBS": os.path.join(submission["temp_dir"], "R", "library"),
-            "R_LIBS_USER": os.path.join(submission["temp_dir"], "R", "library"),
+            "HOME": home_dir,
+            "R_LIBS": os.path.join(home_dir, "R", "library"),
+            "R_LIBS_USER": os.path.join(home_dir, "R", "library"),
             "MLM_LICENSE_FILE": "27007@rtlicense1.uits.indiana.edu",
         },
     )
