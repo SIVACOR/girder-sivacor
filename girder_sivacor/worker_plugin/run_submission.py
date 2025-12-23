@@ -7,6 +7,7 @@ import tarfile
 import tempfile
 import zipfile
 from functools import wraps
+from importlib.metadata import version
 
 import randomname
 from girder.constants import AccessType
@@ -246,9 +247,9 @@ def run_tro(task, submission, action, inumber):
                     _dump_from_fileobj(f, out_f)
 
         with tempfile.NamedTemporaryFile(delete=True) as profile:
-            profile.write(
-                json.dumps(Setting().get(PluginSettings.TRO_PROFILE)).encode()
-            )
+            trs_profile = Setting().get(PluginSettings.TRO_PROFILE)
+            trs_profile["sivacor_version"] = version("girder_sivacor")
+            profile.write(json.dumps(trs_profile).encode())
             profile.seek(0)
             tro = TRO(
                 filepath=tro_file,
