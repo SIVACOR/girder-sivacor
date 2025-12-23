@@ -9,6 +9,7 @@ requirements = [
     "girder-jobs>=5.0.0a1",
     "girder-plugin-worker>=5.0.0a1",
     "pandas",
+    "py-cpuinfo",
     "randomname",
     "tro-utils>=0.1.2",
     "watchfiles",
@@ -32,7 +33,7 @@ setup(
     name="girder-sivacor",
     packages=find_packages(exclude=["test", "test.*"]),
     url="https://github.com/SIVACOR/girder-sivacor",
-    version="0.1.0",
+    version="0.1.1",
     zip_safe=False,
     entry_points={
         "girder.plugin": ["sivacor = girder_sivacor:SIVACORPlugin"],

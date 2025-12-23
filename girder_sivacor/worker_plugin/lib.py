@@ -13,6 +13,7 @@ import zipfile
 from pathlib import Path
 from threading import Event, Thread
 
+import cpuinfo
 import docker
 import numpy as np
 import pandas as pd
@@ -372,6 +373,7 @@ def _infer_run_command(submission, stage):
 def recorded_run(submission, stage, task=None):
     cli = docker.from_env()
     info = cli.info()
+    cpu_info = cpuinfo.get_cpu_info()
     performance_data = {
         "Architecture": info.get("Architecture"),
         "KernelVersion": info.get("KernelVersion"),
@@ -380,6 +382,7 @@ def recorded_run(submission, stage, task=None):
         "OSVersion": info.get("OSVersion"),
         "MemTotal": info.get("MemTotal"),
         "NCPU": info.get("NCPU"),
+        "Processor": cpu_info.get("brand_raw"),
     }
 
     def logging_worker(log_queue, container):
