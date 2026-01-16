@@ -14,6 +14,7 @@ from girder.models.setting import Setting as SettingModel
 from girder.models.user import User as UserModel
 from girder_jobs.constants import JobStatus
 from girder_jobs.models.job import Job as JobModel
+from zoneinfo import ZoneInfo
 
 from .settings import PluginSettings
 from .worker_plugin.run_submission import (
@@ -91,8 +92,10 @@ class SIVACOR(Resource):
         UserModel().collection.update_one(
             {"_id": user["_id"]}, {"$set": {"lastJobId": job["_id"]}}
         )
+        zone = ZoneInfo("America/Chicago")
+        timestamp = f"[{datetime.datetime.now().astimezone(zone).replace(microsecond=0).isoformat()}]"
         job = JobModel().updateJob(
-            job, "Preparing SIVACOR submission\n", status=JobStatus.RUNNING
+            job, f"{timestamp} Preparing SIVACOR submission\n", status=JobStatus.RUNNING
         )
 
         workflow = prepare_submission.s(
