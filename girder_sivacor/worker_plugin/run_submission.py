@@ -8,6 +8,7 @@ import tempfile
 import zipfile
 from functools import wraps
 from importlib.metadata import version
+from zoneinfo import ZoneInfo
 
 import randomname
 from girder.constants import AccessType
@@ -35,6 +36,11 @@ from .lib import (
 )
 
 IGNORE_DIRS = [".git", "__pycache__"]
+
+
+def timestamp():
+    zone = ZoneInfo("America/Chicago")
+    return f"[{datetime.datetime.now().astimezone(zone).replace(microsecond=0).isoformat()}]"
 
 
 def job_check(task):
@@ -142,7 +148,7 @@ def prepare_submission(task, userId, fileId, stages, job_id):
         )
         Job().updateJob(
             job,
-            "New submission: '" + submission_folder["name"] + "' created.\n",
+            f"{timestamp()} New submission: '" + submission_folder["name"] + "' created.\n",
             status=JobStatus.RUNNING,
         )
         return {
@@ -154,7 +160,7 @@ def prepare_submission(task, userId, fileId, stages, job_id):
     except Exception as exc:
         Job().updateJob(
             job,
-            "Failed to prepare submission: \n\t" + str(exc) + "\n",
+            f"{timestamp()} Failed to prepare submission: \n\t" + str(exc) + "\n",
             status=JobStatus.ERROR,
         )
         raise exc
@@ -172,7 +178,7 @@ def create_workspace(task, submission):
     job = Job().load(submission["job_id"], force=True)
     job = Job().updateJob(
         job,
-        "Creating workspace from source folder.\n",
+        f"{timestamp()} Creating workspace from source folder.\n",
         status=JobStatus.RUNNING,
     )
 
@@ -216,7 +222,7 @@ def create_workspace(task, submission):
         os.remove(temp_filename)
         Job().updateJob(
             job,
-            "Failed to create workspace: \n\t" + str(exc) + "\n",
+            f"{timestamp()} Failed to create workspace: \n\t" + str(exc) + "\n",
             status=JobStatus.ERROR,
         )
         raise exc
@@ -231,7 +237,7 @@ def run_tro(task, submission, action, inumber):
     job = Job().load(submission["job_id"], force=True)
     job = Job().updateJob(
         job,
-        f"Running TRO utilities in the workspace. ({action})\n",
+        f"{timestamp()} Running TRO utilities in the workspace. ({action})\n",
         status=JobStatus.RUNNING,
     )
     try:
@@ -345,7 +351,7 @@ def run_tro(task, submission, action, inumber):
     except Exception as exc:
         Job().updateJob(
             job,
-            "Failed to run TRO utilities: \n\t" + str(exc) + "\n",
+            f"{timestamp()} Failed to run TRO utilities: \n\t" + str(exc) + "\n",
             status=JobStatus.ERROR,
         )
         raise exc
@@ -359,7 +365,7 @@ def execute_workflow(task, submission, stage):
     job = Job().load(submission["job_id"], force=True)
     job = Job().updateJob(
         job,
-        "Executing workflow on workspace.\n",
+        f"{timestamp()} Executing workflow on workspace.\n",
         status=JobStatus.RUNNING,
     )
     try:
@@ -391,7 +397,7 @@ def execute_workflow(task, submission, stage):
     except Exception as exc:
         Job().updateJob(
             job,
-            "Failed to execute workflow: \n\t" + str(exc) + "\n",
+            f"{timestamp()} Failed to execute workflow: \n\t" + str(exc) + "\n",
             status=JobStatus.ERROR,
         )
         raise exc
@@ -407,7 +413,7 @@ def upload_workspace(task, submission):
     job = Job().load(submission["job_id"], force=True)
     job = Job().updateJob(
         job,
-        "Uploading executed replication package to Girder.\n",
+        f"{timestamp()} Uploading executed replication package to Girder.\n",
         status=JobStatus.RUNNING,
     )
     try:
@@ -477,7 +483,7 @@ def upload_workspace(task, submission):
     except Exception as exc:
         Job().updateJob(
             job,
-            "Failed to upload executed replication package: \n\t" + str(exc) + "\n",
+            f"{timestamp()} Failed to upload executed replication package: \n\t" + str(exc) + "\n",
             status=JobStatus.ERROR,
         )
         raise exc
@@ -492,7 +498,7 @@ def finalize_job(submission):
     if job["status"] == JobStatus.RUNNING:
         job = Job().updateJob(
             job,
-            "Submission job finalized successfully.\n",
+            f"{timestamp()} Submission job finalized successfully.\n",
             status=JobStatus.SUCCESS,
         )
     return submission
