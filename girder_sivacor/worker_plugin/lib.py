@@ -206,7 +206,7 @@ class DockerStatsCollectorThread(Thread):
 
     @staticmethod
     def calculate_cpu_percent(d):
-        cpu_count = len(d["cpu_stats"]["cpu_usage"].get("percpu_usage", [1]))
+        cpu_count = d.get("cpu_stats", {}).get("online_cpus", 1)
         cpu_percent = 0.0
         cpu_delta = float(d["cpu_stats"]["cpu_usage"]["total_usage"]) - float(
             d["precpu_stats"]["cpu_usage"]["total_usage"]
