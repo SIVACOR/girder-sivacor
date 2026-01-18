@@ -1,12 +1,84 @@
+import datetime
 import logging
+from pathlib import Path
 from girder import events
 from girder.models.collection import Collection
 from girder.models.folder import Folder
 from girder.models.setting import Setting
+from girder.models.user import User
 from girder_jobs.constants import JobStatus
 from girder_worker import GirderWorkerPluginABC
+from girder.utility import mail_utils
 
 logger = logging.getLogger(__name__)
+_HERE = Path(__file__).parent
+
+
+def format_timestamp(timestamp):
+    """Format timestamp for display"""
+    # Implement based on your timestamp format
+    return timestamp.strftime("%Y-%m-%d %H:%M:%S EST")
+
+
+def calculate_duration(start, end):
+    """Calculate human-readable duration"""
+    duration = end - start
+    hours, remainder = divmod(int(duration.total_seconds()), 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    parts = []
+    if hours > 0:
+        parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+    if minutes > 0:
+        parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+    if seconds > 0 or not parts:
+        parts.append(f"{seconds} second{'s' if seconds != 1 else ''}")
+
+    return " ".join(parts)
+
+
+def notify_user(job, submission_folder, success: bool) -> None:
+    meta = submission_folder.get("meta", {})
+    if not meta.get("creator_id"):
+        logger.error(
+            "Submission folder %s has no creator_id in metadata.",
+            str(submission_folder["_id"]),
+        )
+        return
+    user = User().load(meta["creator_id"], force=True)
+    if not user:
+        logger.error("User with ID %s not found.", str(meta["creator_id"]))
+        return
+
+    context = {
+        "base_url": "https://submit.sivacor.org",
+        "docs_url": "https://docs.sivacor.org",
+        "current_year": datetime.datetime.now().year,
+        "logo_url": "https://submit.sivacor.org/sivacor_logo_notext_trans.png",
+        "user_name": f"{user['firstName']} {user['lastName']}",
+        "job_id": str(job["_id"]),
+        "is_success": success,
+        "status_text": "SUCCESS" if success else "FAILED",
+        "submission_time": format_timestamp(job["created"]),
+        "completion_time": format_timestamp(job["updated"]),
+        "execution_time": calculate_duration(job["created"], job["updated"]),
+        "stages": meta.get("stages", []),
+        "submission_url": "https://submit.sivacor.org/",
+    }
+
+    if not success:
+        context["error_message"] = "".join(
+            job.get("log", ["No error message available."])
+        )
+
+    subject = (
+        "Your SIVACOR submission has completed successfully"
+        if success
+        else "Your SIVACOR submission has failed"
+    )
+
+    text = mail_utils.renderTemplate("submission_notification.mako", context)
+    mail_utils.sendMail(subject, text, [user["email"]])
 
 
 def set_submission_status(event: events.Event) -> None:
@@ -40,8 +112,24 @@ def set_submission_status(event: events.Event) -> None:
     status = job.get("status")
     if status == JobStatus.SUCCESS:
         submission_status = "completed"
+        try:
+            notify_user(job, submission_folder, success=True)
+        except Exception as e:
+            logger.exception(
+                "Failed to send success notification for job %s: %s",
+                str(job["_id"]),
+                str(e),
+            )
     elif status in (JobStatus.ERROR, JobStatus.CANCELED):
         submission_status = "failed"
+        try:
+            notify_user(job, submission_folder, success=False)
+        except Exception as e:
+            logger.exception(
+                "Failed to send failure notification for job %s: %s",
+                str(job["_id"]),
+                str(e),
+            )
     else:
         submission_status = "processing"
     Folder().collection.update_one(
@@ -53,6 +141,7 @@ def set_submission_status(event: events.Event) -> None:
 class SIVACORWorkerPlugin(GirderWorkerPluginABC):
     def __init__(self, app, *args, **kwargs):
         self.app = app
+        mail_utils.addTemplateDirectory((_HERE.parent / "mail_templates").as_posix())
         events.bind("jobs.job.update.after", "sivacor", set_submission_status)
 
     def task_imports(self):
