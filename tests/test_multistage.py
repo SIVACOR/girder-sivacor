@@ -24,6 +24,7 @@ def test_multistage_run(
     patched_gpg,
     uploads_folder,
     submission_collection,
+    email_stdout
 ):
     """Test a successful Stata submission workflow."""
     stages = [
