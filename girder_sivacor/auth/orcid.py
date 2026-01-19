@@ -4,6 +4,8 @@ import requests
 from girder.api.rest import getApiUrl
 from girder.exceptions import RestException
 from girder.models.setting import Setting
+from girder.models.user import User
+from girder.settings import SettingKey
 from girder_oauth.providers.base import ProviderBase
 from girder_oauth.settings import PluginSettings
 
@@ -123,9 +125,54 @@ class ORCID(ProviderBase):
         oauthId = token["orcid"]
         if not oauthId:
             raise RestException("ORCID did not return a user ID.", code=502)
+        try:
+            lastName = resp["name"]["family-name"]["value"]
+        except (KeyError, TypeError):
+            lastName = "N/A"
+        try:
+            firstName = resp["name"]["given-names"]["value"]
+        except (KeyError, TypeError):
+            firstName = "N/A"
 
-        lastName = resp["name"]["family-name"]["value"]
-        firstName = resp["name"]["given-names"]["value"]
-        login = firstName.replace(" ", "") + "-" + lastName.replace(" ", "")
+        if lastName == "" and firstName == "":
+            raise RestException("ORCID did not return a user name.", code=502)
 
-        return self._createOrReuseUser(oauthId, email, firstName, lastName, login)
+        userName = firstName.replace(" ", "") + "-" + lastName.replace(" ", "")
+        user = User().findOne({"oauth.provider": "orcid", "oauth.id": oauthId})
+        setId = not user
+        if not user:
+            user = User().findOne({"email": email})
+
+        dirty = False
+        if not user:
+            if Setting().get(SettingKey.REGISTRATION_POLICY) == "closed":
+                if not Setting().get(PluginSettings.IGNORE_REGISTRATION_POLICY):
+                    raise RestException(
+                        "Registration is closed. Contact an administrator to create an account "
+                        "for you."
+                    )
+            login = self._deriveLogin(email, firstName, lastName, userName)
+            user = User().createUser(
+                login=login,
+                password=None,
+                firstName=firstName,
+                lastName=lastName,
+                email=email,
+            )
+        else:
+            if firstName != user["firstName"] and firstName:
+                user["firstName"] = firstName
+                dirty = True
+            if lastName != user["lastName"] and lastName:
+                user["lastName"] = lastName
+                dirty = True
+            if email != user["email"] and not email == f"{oauthId}@orcid.org":
+                user["email"] = email
+                dirty = True
+        if setId:
+            user.setdefault("oauth", []).append({"provider": "orcid", "id": oauthId})
+            dirty = True
+        if dirty:
+            user = User().save(user)
+
+        return user
