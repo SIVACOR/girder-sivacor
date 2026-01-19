@@ -12,7 +12,6 @@ requirements = [
     "py-cpuinfo",
     "randomname",
     "tro-utils>=0.1.2",
-    "watchfiles",
 ]
 
 setup(
