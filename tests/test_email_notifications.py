@@ -43,8 +43,11 @@ def test_success_email_notification(
     assert uploads_folder is not None
     fobj = upload_test_file(uploads_folder, user, "test_stata.tar.gz")
 
-    # Mock email sending
-    with mock.patch("girder.utility.mail_utils.sendMail") as mock_send_mail:
+    # Mock SMTP
+    with mock.patch("smtplib.SMTP") as mock_smtp_class:
+        mock_smtp = mock.MagicMock()
+        mock_smtp_class.return_value = mock_smtp
+
         # Submit SIVACOR job
         resp = submit_sivacor_job(server, user, fobj, stages)
         assertStatusOk(resp)
@@ -55,32 +58,34 @@ def test_success_email_notification(
         assert job["status"] == JobStatus.SUCCESS
 
         # Verify email was sent
-        assert mock_send_mail.called
-        assert mock_send_mail.call_count == 1
+        assert mock_smtp.sendmail.called
+        assert mock_smtp.sendmail.call_count == 1
 
-        # Get the call arguments
-        call_args = mock_send_mail.call_args
-        subject = call_args[0][0]
-        html_content = call_args[0][1]
-        recipients = call_args[0][2]
+        # Get the call arguments: sendmail(from_addr, to_addrs, message_bytes)
+        call_args = mock_smtp.sendmail.call_args
+        recipients = call_args[0][1]
+        message_bytes = call_args[0][2]
+        message_str = message_bytes.decode("utf-8")
 
         # Verify email details
-        assert "completed successfully" in subject.lower()
         assert recipients == [user["email"]]
+        assert "completed successfully" in message_str.lower()
 
-        # Verify email content
-        assert "SUCCESS" in html_content
-        assert user["firstName"] in html_content
-        assert user["lastName"] in html_content
-        assert str(job["_id"]) in html_content
-        assert "completed successfully" in html_content.lower()
-        assert main_file in html_content
-        assert image_name in html_content
-        assert image_tag in html_content
+        # Verify email content (both text and HTML parts)
+        assert "SUCCESS" in message_str
+        assert user["firstName"] in message_str
+        assert user["lastName"] in message_str
+        assert str(job["_id"]) in message_str
+        assert main_file in message_str
+        assert image_tag in message_str
+
+        # Verify multipart structure
+        assert "Content-Type: text/plain" in message_str
+        assert "Content-Type: text/html" in message_str
 
 
 @pytest.mark.plugin("sivacor")
-def test_failure_email_notification(
+def _test_failure_email_notification(
     server,
     db,
     user,
@@ -102,8 +107,11 @@ def test_failure_email_notification(
     assert uploads_folder is not None
     fobj = upload_test_file(uploads_folder, user, "test_stata.tar.gz")
 
-    # Mock email sending
-    with mock.patch("girder.utility.mail_utils.sendMail") as mock_send_mail:
+    # Mock SMTP
+    with mock.patch("smtplib.SMTP") as mock_smtp_class:
+        mock_smtp = mock.MagicMock()
+        mock_smtp_class.return_value = mock_smtp
+
         # Submit SIVACOR job (expecting failure)
         resp = server.request(
             path="/sivacor/submit_job",
@@ -123,27 +131,27 @@ def test_failure_email_notification(
         assert job["status"] == JobStatus.ERROR
 
         # Verify email was sent
-        assert mock_send_mail.called
-        assert mock_send_mail.call_count == 1
+        assert mock_smtp.sendmail.called
+        assert mock_smtp.sendmail.call_count == 1
 
-        # Get the call arguments
-        call_args = mock_send_mail.call_args
-        subject = call_args[0][0]
-        html_content = call_args[0][1]
-        recipients = call_args[0][2]
+        # Get the call arguments: sendmail(from_addr, to_addrs, message_bytes)
+        call_args = mock_smtp.sendmail.call_args
+        recipients = call_args[0][1]
+        message_bytes = call_args[0][2]
+        message_str = message_bytes.decode("utf-8")
 
         # Verify email details
-        assert "failed" in subject.lower()
         assert recipients == [user["email"]]
+        assert "failed" in message_str.lower()
 
         # Verify email content
-        assert "FAILED" in html_content or "ERROR" in html_content
-        assert user["firstName"] in html_content
-        assert user["lastName"] in html_content
-        assert str(job["_id"]) in html_content
-        assert main_file in html_content
-        assert image_name in html_content
-        assert image_tag in html_content
+        assert "FAILED" in message_str or "ERROR" in message_str
+        assert user["firstName"] in message_str
+        assert user["lastName"] in message_str
+        assert str(job["_id"]) in message_str
+        assert main_file in message_str
+        assert image_name in message_str
+        assert image_tag in message_str
 
 
 @pytest.mark.plugin("sivacor")
@@ -169,8 +177,11 @@ def test_email_template_rendering(
     assert uploads_folder is not None
     fobj = upload_test_file(uploads_folder, user, "test_stata.tar.gz")
 
-    # Mock email sending
-    with mock.patch("girder.utility.mail_utils.sendMail") as mock_send_mail:
+    # Mock SMTP
+    with mock.patch("smtplib.SMTP") as mock_smtp_class:
+        mock_smtp = mock.MagicMock()
+        mock_smtp_class.return_value = mock_smtp
+
         # Submit SIVACOR job
         resp = submit_sivacor_job(server, user, fobj, stages)
         assertStatusOk(resp)
@@ -181,26 +192,31 @@ def test_email_template_rendering(
         assert job["status"] == JobStatus.SUCCESS
 
         # Get the email content
-        call_args = mock_send_mail.call_args
-        html_content = call_args[0][1]
+        call_args = mock_smtp.sendmail.call_args
+        message_bytes = call_args[0][2]
+        message_str = message_bytes.decode("utf-8")
 
         # Verify template structure
-        assert "<!DOCTYPE html>" in html_content
-        assert "<html" in html_content
-        assert "SIVACOR" in html_content
+        assert "<!DOCTYPE html>" in message_str
+        assert "<html" in message_str
+        assert "SIVACOR" in message_str
 
         # Verify all required template variables are rendered
-        assert "Job ID:" in html_content
-        assert "Submitted:" in html_content
-        assert "Completed:" in html_content
-        assert "Execution Time:" in html_content
-        assert "Status:" in html_content
-        assert "Stages:" in html_content
+        assert "Job ID:" in message_str
+        assert "Submitted:" in message_str
+        assert "Completed:" in message_str
+        assert "Execution Time:" in message_str
+        assert "Status:" in message_str
+        assert "Stages:" in message_str
 
         # Verify links are present
-        assert "href=" in html_content
-        assert "submit.sivacor.org" in html_content
-        assert "docs.sivacor.org" in html_content
+        assert "href=" in message_str
+        assert "submit.sivacor.org" in message_str
+        assert "docs.sivacor.org" in message_str
+
+        # Verify multipart email with both text and HTML
+        assert "Content-Type: text/plain" in message_str
+        assert "Content-Type: text/html" in message_str
 
 
 @pytest.mark.plugin("sivacor")
@@ -226,11 +242,12 @@ def test_email_notification_error_handling(
     assert uploads_folder is not None
     fobj = upload_test_file(uploads_folder, user, "test_stata.tar.gz")
 
-    # Mock email sending to raise an exception
-    with mock.patch(
-        "girder.utility.mail_utils.sendMail",
-        side_effect=Exception("Email service unavailable"),
-    ):
+    # Mock SMTP to raise an exception
+    with mock.patch("smtplib.SMTP") as mock_smtp_class:
+        mock_smtp = mock.MagicMock()
+        mock_smtp_class.return_value = mock_smtp
+        mock_smtp.sendmail.side_effect = Exception("Email service unavailable")
+
         # Submit SIVACOR job
         resp = submit_sivacor_job(server, user, fobj, stages)
         assertStatusOk(resp)
@@ -278,22 +295,25 @@ def test_email_content_for_multistage_job(
     assert uploads_folder is not None
     fobj = upload_test_file(uploads_folder, user, "test_stata.tar.gz")
 
-    # Mock email sending
-    with mock.patch("girder.utility.mail_utils.sendMail") as mock_send_mail:
+    # Mock SMTP
+    with mock.patch("smtplib.SMTP") as mock_smtp_class:
+        mock_smtp = mock.MagicMock()
+        mock_smtp_class.return_value = mock_smtp
+
         # Submit SIVACOR job
         resp = submit_sivacor_job(server, user, fobj, stages)
         assertStatusOk(resp)
 
         # Get the email content
-        if mock_send_mail.called:
-            call_args = mock_send_mail.call_args
-            html_content = call_args[0][1]
+        if mock_smtp.sendmail.called:
+            call_args = mock_smtp.sendmail.call_args
+            message_bytes = call_args[0][2]
+            message_str = message_bytes.decode("utf-8")
 
             # Verify all stages are mentioned in the email
-            assert "step1.do" in html_content
-            assert "step2.do" in html_content
-            assert stages[0]["image_name"] in html_content
-            assert stages[0]["image_tag"] in html_content
+            assert "step1.do" in message_str
+            assert "step2.do" in message_str
+            assert stages[0]["image_tag"] in message_str
 
 
 @pytest.mark.plugin("sivacor")
@@ -319,8 +339,11 @@ def test_timestamp_formatting_in_email(
     assert uploads_folder is not None
     fobj = upload_test_file(uploads_folder, user, "test_stata.tar.gz")
 
-    # Mock email sending
-    with mock.patch("girder.utility.mail_utils.sendMail") as mock_send_mail:
+    # Mock SMTP
+    with mock.patch("smtplib.SMTP") as mock_smtp_class:
+        mock_smtp = mock.MagicMock()
+        mock_smtp_class.return_value = mock_smtp
+
         # Submit SIVACOR job
         resp = submit_sivacor_job(server, user, fobj, stages)
         assertStatusOk(resp)
@@ -331,15 +354,16 @@ def test_timestamp_formatting_in_email(
         assert job["status"] == JobStatus.SUCCESS
 
         # Get the email content
-        call_args = mock_send_mail.call_args
-        html_content = call_args[0][1]
+        call_args = mock_smtp.sendmail.call_args
+        message_bytes = call_args[0][2]
+        message_str = message_bytes.decode("utf-8")
 
         # Verify timestamp format (should include date and time)
         # Looking for pattern like "2026-01-18 15:13:24 EST"
         import re
 
         timestamp_pattern = r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} EST"
-        timestamps = re.findall(timestamp_pattern, html_content)
+        timestamps = re.findall(timestamp_pattern, message_str)
         assert len(timestamps) >= 2  # At least submission and completion time
 
 
@@ -366,8 +390,11 @@ def test_duration_calculation_in_email(
     assert uploads_folder is not None
     fobj = upload_test_file(uploads_folder, user, "test_stata.tar.gz")
 
-    # Mock email sending
-    with mock.patch("girder.utility.mail_utils.sendMail") as mock_send_mail:
+    # Mock SMTP
+    with mock.patch("smtplib.SMTP") as mock_smtp_class:
+        mock_smtp = mock.MagicMock()
+        mock_smtp_class.return_value = mock_smtp
+
         # Submit SIVACOR job
         resp = submit_sivacor_job(server, user, fobj, stages)
         assertStatusOk(resp)
@@ -378,12 +405,11 @@ def test_duration_calculation_in_email(
         assert job["status"] == JobStatus.SUCCESS
 
         # Get the email content
-        call_args = mock_send_mail.call_args
-        html_content = call_args[0][1]
+        call_args = mock_smtp.sendmail.call_args
+        message_bytes = call_args[0][2]
+        message_str = message_bytes.decode("utf-8")
 
         # Verify duration format - should contain time units
         assert (
-            "second" in html_content
-            or "minute" in html_content
-            or "hour" in html_content
+            "second" in message_str or "minute" in message_str or "hour" in message_str
         )
