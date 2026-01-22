@@ -4,6 +4,7 @@ prune girder_sivacor/web_client
 include girder_sivacor/web_client/dist/girder-plugin-sivacor.umd.cjs
 include girder_sivacor/web_client/dist/style.css
 include girder_sivacor/schemas/*.json
+include girder_sivacor/mail_templates/*.mako
 prune girder_sivacor/tests
 exclude girder_sivacort/tests
 prune scripts
