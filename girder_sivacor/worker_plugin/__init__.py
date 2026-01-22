@@ -1,3 +1,6 @@
+import os
+from email.message import EmailMessage
+from email.policy import SMTP
 import datetime
 import logging
 from pathlib import Path
@@ -8,6 +11,7 @@ from girder.models.setting import Setting
 from girder.models.user import User
 from girder_jobs.constants import JobStatus
 from girder_worker import GirderWorkerPluginABC
+from girder.settings import SettingKey
 from girder.utility import mail_utils
 
 logger = logging.getLogger(__name__)
@@ -35,6 +39,42 @@ def calculate_duration(start, end):
         parts.append(f"{seconds} second{'s' if seconds != 1 else ''}")
 
     return " ".join(parts)
+
+
+def _createMessage(subject: str, text_content: str, rendered_html: str, to, bcc):
+    # Normalize recipients
+    if isinstance(to, str):
+        to = [to]
+    if isinstance(bcc, str):
+        bcc = [bcc]
+    elif bcc is None:
+        bcc = []
+
+    if not to and not bcc:
+        raise ValueError("At least one recipient (to or bcc) must be specified.")
+    if not subject:
+        raise ValueError("Email subject cannot be empty.")
+
+    # 1. Create the modern EmailMessage object with SMTP policy
+    # The SMTP policy automatically uses Quoted-Printable for UTF-8/long lines
+    msg = EmailMessage(policy=SMTP)
+
+    msg["Subject"] = subject
+    msg["From"] = Setting().get(SettingKey.EMAIL_FROM_ADDRESS)
+    if to:
+        msg["To"] = ", ".join(to)
+    if bcc:
+        msg["Bcc"] = ", ".join(bcc)
+
+    # 2. Set the plain text as the main content
+    msg.set_content(text_content)
+
+    # 3. Add the HTML version as an alternative
+    # EmailMessage handles the 'alternative' container creation for you
+    msg.add_alternative(rendered_html, subtype="html")
+
+    recipients = list(set(to) | set(bcc))
+    return msg, recipients
 
 
 def notify_user(job, submission_folder, success: bool) -> None:
@@ -66,6 +106,14 @@ def notify_user(job, submission_folder, success: bool) -> None:
         "submission_url": "https://submit.sivacor.org/",
     }
 
+    # 2. Create the Plain Text version (Very important for spam scores)
+    text_content = (
+        f"Hello {context['user_name']},\n\n"
+        f"Your SIVACOR job {context['job_id']} has finished with "
+        f"status {context['status_text']}.\n"
+        f"View details here: {context['submission_url']}"
+    )
+
     if not success:
         context["error_message"] = "".join(
             job.get("log", ["No error message available."])
@@ -77,8 +125,29 @@ def notify_user(job, submission_folder, success: bool) -> None:
         else "Your SIVACOR submission has failed"
     )
 
-    text = mail_utils.renderTemplate("submission_notification.mako", context)
-    mail_utils.sendMail(subject, text, [user["email"]])
+    rendered_html = mail_utils.renderTemplate("submission_notification.mako", context)
+    msg, recipients = _createMessage(
+        subject, text_content, rendered_html, [user["email"]], None
+    )
+
+    if os.environ.get("GIRDER_EMAIL_TO_CONSOLE"):
+        print("Redirecting email to console:")
+        print(msg.as_string())
+        return
+
+    setting = Setting()
+    smtp = mail_utils._SMTPConnection(
+        host=setting.get(SettingKey.SMTP_HOST),
+        port=setting.get(SettingKey.SMTP_PORT),
+        encryption=setting.get(SettingKey.SMTP_ENCRYPTION),
+        username=setting.get(SettingKey.SMTP_USERNAME),
+        password=setting.get(SettingKey.SMTP_PASSWORD),
+    )
+
+    logger.info("Sending email to %s through %s", ", ".join(recipients), smtp.host)
+
+    with smtp:
+        smtp.send(msg["From"], recipients, msg.as_bytes())
 
 
 def set_submission_status(event: events.Event) -> None:
