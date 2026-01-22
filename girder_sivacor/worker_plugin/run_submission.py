@@ -116,6 +116,7 @@ def cleanup_submission(submission_folder_id):
     ):
         for fobj in Item().childFiles(item):
             File().remove(fobj)
+        Item().remove(item)
 
 
 @app.task(queue="local", bind=True)
