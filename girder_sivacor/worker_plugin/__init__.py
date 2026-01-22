@@ -10,6 +10,7 @@ from girder.models.folder import Folder
 from girder.models.setting import Setting
 from girder.models.user import User
 from girder_jobs.constants import JobStatus
+from girder_jobs.models.job import Job
 from girder_worker import GirderWorkerPluginABC
 from girder.settings import SettingKey
 from girder.utility import mail_utils
@@ -78,6 +79,7 @@ def _createMessage(subject: str, text_content: str, rendered_html: str, to, bcc)
 
 
 def notify_user(job, submission_folder, success: bool) -> None:
+    job = Job().load(job["_id"], force=True)
     meta = submission_folder.get("meta", {})
     if not meta.get("creator_id"):
         logger.error(
