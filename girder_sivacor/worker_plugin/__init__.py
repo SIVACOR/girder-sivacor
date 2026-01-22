@@ -79,7 +79,7 @@ def _createMessage(subject: str, text_content: str, rendered_html: str, to, bcc)
 
 
 def notify_user(job, submission_folder, success: bool) -> None:
-    job = Job().load(job["_id"], force=True)
+    job = Job().load(job["_id"], includeLog=True, force=True)
     meta = submission_folder.get("meta", {})
     if not meta.get("creator_id"):
         logger.error(
