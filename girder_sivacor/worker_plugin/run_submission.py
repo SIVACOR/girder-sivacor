@@ -114,8 +114,6 @@ def cleanup_submission(submission_folder_id):
     for item in Folder().childItems(
         folder, filters={"size": {"$gt": Setting().get(PluginSettings.MAX_ITEM_SIZE)}}
     ):
-        for fobj in Item().childFiles(item):
-            File().remove(fobj)
         Item().remove(item)
 
 
