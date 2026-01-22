@@ -589,8 +589,9 @@ def recorded_run(submission, stage, task=None):
                 "Error executing recorded run. Check stdout/stderr for details."
             )
         elif is_stata(image_reference):
-            with open(log_files["stdout"], "r") as fp:
+            with open(log_files["stdout"], "rb") as fp:
                 log_content = fp.read()
+                log_content = log_content.decode("utf-8", errors="ignore")
                 if stata_err := stata_error(log_content):
                     raise ValueError(
                         f"Stata returned an error ({stata_err}). Check stdout/stderr for details."
