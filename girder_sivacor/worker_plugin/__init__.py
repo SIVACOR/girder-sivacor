@@ -95,6 +95,7 @@ def notify_user(job, submission_folder, success: bool) -> None:
     context = {
         "base_url": "https://submit.sivacor.org",
         "docs_url": "https://docs.sivacor.org",
+        "feedback_url": "https://feedback.sivacor.org",
         "current_year": datetime.datetime.now().year,
         "logo_url": "https://submit.sivacor.org/sivacor_logo_notext_trans.png",
         "user_name": f"{user['firstName']} {user['lastName']}",

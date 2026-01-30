@@ -224,6 +224,9 @@
                                     Need help? Check out our <a href="${docs_url}" style="color: #1976d2; text-decoration: none;">documentation</a> or
                                     <a href="mailto:support@sivacor.org" style="color: #1976d2; text-decoration: none;">contact support</a>.
                                 </p>
+                                <p style="margin: 0; color: #757575; font-size: 14px; line-height: 1.6;">
+                                    You can also provide feedback about your experience through our <a href="${feedback_url}" style="color: #1976d2; text-decoration: none;">feedback form</a>.
+                                </p>
                             </div>
                         </td>
                     </tr>
