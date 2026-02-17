@@ -14,7 +14,6 @@ from girder.models.file import File
 from girder.models.folder import Folder
 from girder.models.setting import Setting
 from girder.models.user import User
-from girder.tasks import deleteFolderTask
 from girder_jobs.constants import JobStatus
 from girder_jobs.models.job import Job
 from zoneinfo import ZoneInfo
@@ -189,6 +188,7 @@ class SIVACOR(Resource):
         )
     )
     def delete_submission(self, folder, progress):
+        from girder.tasks import deleteFolderTask
         # ensure that user has read access to the folder, but meta confirms he was creator
         user = self.getCurrentUser()
         meta = folder.get("meta", {})
