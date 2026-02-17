@@ -1,19 +1,21 @@
-import os
-from email.message import EmailMessage
-from email.policy import SMTP
 import datetime
 import logging
+import os
+import shutil
+from email.message import EmailMessage
+from email.policy import SMTP
 from pathlib import Path
+
 from girder import events
 from girder.models.collection import Collection
 from girder.models.folder import Folder
 from girder.models.setting import Setting
 from girder.models.user import User
+from girder.settings import SettingKey
+from girder.utility import mail_utils
 from girder_jobs.constants import JobStatus
 from girder_jobs.models.job import Job
 from girder_worker import GirderWorkerPluginABC
-from girder.settings import SettingKey
-from girder.utility import mail_utils
 
 logger = logging.getLogger(__name__)
 _HERE = Path(__file__).parent
@@ -202,6 +204,7 @@ def set_submission_status(event: events.Event) -> None:
                 str(job["_id"]),
                 str(e),
             )
+        shutil.rmtree(f"/tmp/workspace-{submission_folder['_id']}", ignore_errors=True)
     else:
         submission_status = "processing"
     Folder().collection.update_one(
