@@ -182,17 +182,17 @@ def create_workspace(task, submission):
     )
 
     try:
-        temp_dir = f"/tmp/workspace-{submission['folder_id']}"
-        submission["temp_dir"] = temp_dir
+        workspace_dir = f"/tmp/workspace-{submission['folder_id']}"
+        submission["workspace_dir"] = workspace_dir
         project_dir = get_project_dir(submission)
         os.makedirs(project_dir, exist_ok=False)
         # Ensure R library directory for user install.packages exists
         for stage in submission.get("stages", []):
             if stage["image_name"].startswith("rocker/"):
-                os.makedirs(os.path.join(temp_dir, "R", "library"), exist_ok=True)
+                os.makedirs(os.path.join(workspace_dir, "R", "library"), exist_ok=True)
 
         fobj = File().load(submission["file_id"], force=True)
-        temp_filename = os.path.join(temp_dir, fobj["name"])
+        temp_filename = os.path.join(workspace_dir, fobj["name"])
         with File().open(fobj) as f:
             with open(temp_filename, "wb") as out_f:
                 _dump_from_fileobj(f, out_f)
@@ -242,8 +242,7 @@ def run_tro(task, submission, action, inumber):
     try:
         admin = User().findOne({"admin": True})
         submission_folder = Folder().load(submission["folder_id"], force=True)
-        temp_dir = submission["temp_dir"]
-        tro_file = os.path.join(temp_dir, f"tro-{submission['job_id']}.jsonld")
+        tro_file = f"/tmp/tro-{submission['job_id']}.jsonld"
         tro_obj = None
         if submission.get("troId") is not None:
             tro_obj = File().load(submission["troId"], force=True)
@@ -425,7 +424,7 @@ def upload_workspace(task, submission):
         )
         project_dir = get_project_dir(submission)
 
-        zip_path = os.path.join(submission["temp_dir"], zip_basename)
+        zip_path = os.path.join(submission["workspace_dir"], zip_basename)
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
             for root, dirs, files in os.walk(project_dir):
                 # ignore contents of dirs from IGNORE_DIRS
@@ -434,7 +433,7 @@ def upload_workspace(task, submission):
                     if file == zip_basename:
                         continue
                     file_path = os.path.join(root, file)
-                    arcname = os.path.relpath(file_path, submission["temp_dir"])
+                    arcname = os.path.relpath(file_path, submission["workspace_dir"])
                     if os.path.islink(file_path):
                         zip_symlink(zipf, file_path, arcname=arcname)
                     else:
@@ -492,7 +491,7 @@ def upload_workspace(task, submission):
 
 @app.task(queue="local")
 def finalize_job(submission):
-    shutil.rmtree(submission["temp_dir"], ignore_errors=True)
+    shutil.rmtree(submission["workspace_dir"], ignore_errors=True)
     job = Job().load(submission["job_id"], force=True)
     if job["status"] == JobStatus.RUNNING:
         job = Job().updateJob(

@@ -47,7 +47,7 @@ def annotate_item_type(file_obj: dict, item_type: str) -> None:
 
 
 def get_project_dir(submission):
-    return os.path.join(submission["temp_dir"], "project")
+    return os.path.join(submission["workspace_dir"], "project")
 
 
 def _update_file_from_path(file, path, user):
@@ -308,7 +308,7 @@ def _infer_run_command(submission, stage):
 
     # Determine entrypoint based on image
     image_name = stage["image_name"]
-    home_dir = submission["temp_dir"]
+    home_dir = "/workspace"
     if image_name.startswith("rocker"):
         entrypoint = ["/usr/local/bin/R", "--no-save", "--no-restore", "-f"]
     elif image_name.startswith("dataeditors/stata"):
@@ -399,25 +399,38 @@ def recorded_run(submission, stage, task=None):
     admin = User().findOne({"admin": True})
 
     image_reference = stage["image_name"] + ":" + stage["image_tag"]
-    host_tmp_root = os.environ.get("DOCKER_HOST_TMP_ROOT", "/")
-    target_tmp_dir = os.path.join(host_tmp_root, submission["temp_dir"].lstrip("/"))
-    volumes = {
-        target_tmp_dir: {
-            "bind": submission["temp_dir"],
-            "mode": "rw",
-        }
-    }
+    # host_tmp_root = os.environ.get("DOCKER_HOST_TMP_ROOT", "/")
+    # target_workspace_dir = os.path.join(host_tmp_root, submission["workspace_dir"].lstrip("/"))
+    target_workspace_dir = "/workspace"
+    mounts = [
+        docker.types.Mount(
+            target=target_workspace_dir,
+            source=submission["workspace_dir"],
+            type="bind",
+            read_only=False,
+        ),
+        docker.types.Mount(
+            type="tmpfs",
+            source=None,
+            target="/tmp",
+            tmpfs_size="1G",
+        ),
+    ]
     if stata_license_hostpath := os.environ.get("STATA_LICENSE_HOSTPATH"):
-        volumes[stata_license_hostpath] = {
-            "bind": "/usr/local/stata/stata.lic",
-            "mode": "ro",
-        }
+        mounts.append(
+            docker.types.Mount(
+                target="/usr/local/stata/stata.lic",
+                source=stata_license_hostpath,
+                type="bind",
+                read_only=True,
+            )
+        )
 
     cli.images.pull(image_reference)
 
     entrypoint, command, sub_dir, home_dir = _infer_run_command(submission, stage)
     project_dir = get_project_dir(submission)
-    logging.info("Setting working directory to: " + os.path.join(project_dir, sub_dir))
+    logging.info("Setting working directory to: " + os.path.join(target_workspace_dir, "project", sub_dir))
     logging.info("Running Tale with command: " + " ".join(entrypoint + [command]))
 
     container = cli.containers.create(
@@ -425,10 +438,14 @@ def recorded_run(submission, stage, task=None):
         entrypoint=entrypoint,
         command=command,
         detach=True,
-        volumes=volumes,
-        working_dir=os.path.join(project_dir, sub_dir),
+        mounts=mounts,
+        read_only=True,
+        working_dir=os.path.join(target_workspace_dir, "project", sub_dir),
         user=f"{os.getuid()}:{os.getgid()}",
         environment={
+            "TMPDIR": "/tmp",
+            "TEMP": "/tmp",
+            "TMP": "/tmp",
             "HOME": home_dir,
             "R_LIBS": os.path.join(home_dir, "R", "library"),
             "R_LIBS_USER": os.path.join(home_dir, "R", "library"),
