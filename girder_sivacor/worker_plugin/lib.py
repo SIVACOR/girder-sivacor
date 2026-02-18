@@ -399,13 +399,13 @@ def recorded_run(submission, stage, task=None):
     admin = User().findOne({"admin": True})
 
     image_reference = stage["image_name"] + ":" + stage["image_tag"]
-    # host_tmp_root = os.environ.get("DOCKER_HOST_TMP_ROOT", "/")
-    # target_workspace_dir = os.path.join(host_tmp_root, submission["workspace_dir"].lstrip("/"))
+    host_tmp_root = os.environ.get("DOCKER_HOST_TMP_ROOT", "/")
+    source_workspace_dir = os.path.join(host_tmp_root, submission["workspace_dir"].lstrip("/"))
     target_workspace_dir = "/workspace"
     mounts = [
         docker.types.Mount(
             target=target_workspace_dir,
-            source=submission["workspace_dir"],
+            source=source_workspace_dir,
             type="bind",
             read_only=False,
         ),
