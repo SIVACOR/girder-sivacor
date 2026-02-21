@@ -12,7 +12,7 @@ requirements = [
     "pandas",
     "py-cpuinfo",
     "randomname",
-    "tro-utils>=0.1.2",
+    "tro-utils>=0.2.0",
 ]
 
 setup(

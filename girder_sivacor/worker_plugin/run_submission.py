@@ -8,6 +8,7 @@ import tempfile
 import zipfile
 from functools import wraps
 from importlib.metadata import version
+from tro_utils import TRPAttribute
 from zoneinfo import ZoneInfo
 
 import randomname
@@ -147,7 +148,9 @@ def prepare_submission(task, userId, fileId, stages, job_id):
         )
         Job().updateJob(
             job,
-            f"{timestamp()} New submission: '" + submission_folder["name"] + "' created.\n",
+            f"{timestamp()} New submission: '"
+            + submission_folder["name"]
+            + "' created.\n",
             status=JobStatus.RUNNING,
         )
         return {
@@ -297,13 +300,14 @@ def run_tro(task, submission, action, inumber):
                     for fobj in files:
                         with File().open(fobj) as f:
                             extra_attributes = json.load(f)
+            print(run.get("run_attrs", []))
             tro.add_performance(
                 datetime.datetime.fromisoformat(run["run_start_time"]),
                 datetime.datetime.fromisoformat(run["run_end_time"]),
                 comment=f"SIVACOR workflow execution ({main_file}) step {inumber + 1}",
                 accessed_arrangement=f"arrangement/{inumber}",
                 modified_arrangement=f"arrangement/{inumber + 1}",
-                caps=run.get("run_caps", []),
+                attrs=run.get("run_attrs", []),
                 extra_attributes=extra_attributes,
             )
         elif action == "sign":
@@ -389,7 +393,11 @@ def execute_workflow(task, submission, stage):
             {
                 "run_start_time": start_time.isoformat(),
                 "run_end_time": end_time.isoformat(),
-                "run_caps": ["trov:InternetIsolation"],
+                "run_attrs": [
+                    TRPAttribute.ENV_ISOLATION,
+                    TRPAttribute.NON_INTERACTIVE,
+                    TRPAttribute.MACHINE_ENFORCEMENT,
+                ],
             }
         )
     except Exception as exc:
@@ -481,7 +489,9 @@ def upload_workspace(task, submission):
     except Exception as exc:
         Job().updateJob(
             job,
-            f"{timestamp()} Failed to upload executed replication package: \n\t" + str(exc) + "\n",
+            f"{timestamp()} Failed to upload executed replication package: \n\t"
+            + str(exc)
+            + "\n",
             status=JobStatus.ERROR,
         )
         raise exc
