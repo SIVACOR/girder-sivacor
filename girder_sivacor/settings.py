@@ -1,4 +1,5 @@
 from girder.settings import SettingDefault
+from tro_utils import TROVCapability as Caps
 
 
 class PluginSettings:
@@ -9,7 +10,7 @@ class PluginSettings:
     TRO_GPG_FINGERPRINT = "sivacor.tro_gpg_fingerprint"
     TRO_GPG_PASSPHRASE = "sivacor.tro_gpg_passphrase"
     TRO_PROFILE = "sivacor.tro_profile"
-    MAX_ITEM_SIZE = "sivacor.max_item_size"   # in bytes
+    MAX_ITEM_SIZE = "sivacor.max_item_size"  # in bytes
     RETENTION_DAYS = "sivacor.retention_days"  # in days
 
 
@@ -101,10 +102,18 @@ SettingDefault.defaults.update(
         PluginSettings.TRO_PROFILE: {
             "rdfs:comment": "SIVACOR TRO profile",
             "trov:hasCapability": [
-                {"@id": "trs/capability/1", "@type": "trov:CanRecordInternetAccess"},
+                {"@id": "trs/capability/1", "@type": Caps.ENV_ISOLATION.value},
                 {
                     "@id": "trs/capability/2",
-                    "@type": "trov:CanProvideInternetIsolation",
+                    "@type": Caps.NET_ISOLATION.value,
+                },
+                {
+                    "@id": "trs/capability/3",
+                    "@type": Caps.NON_INTERACTIVE.value,
+                },
+                {
+                    "@id": "trs/capability/4",
+                    "@type": Caps.MACHINE_ENFORCEMENT.value,
                 },
             ],
             "trov:owner": "SIVACOR Team",
