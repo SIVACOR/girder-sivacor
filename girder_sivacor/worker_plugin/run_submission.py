@@ -439,9 +439,9 @@ def execute_workflow(task, submission, stage):
                 "run_start_time": start_time.isoformat(),
                 "run_end_time": end_time.isoformat(),
                 "run_attrs": [
-                    TRPAttribute.ENV_ISOLATION,
-                    TRPAttribute.NON_INTERACTIVE,
-                    TRPAttribute.MACHINE_ENFORCEMENT,
+                    TRPAttribute.ENV_ISOLATION.value,
+                    TRPAttribute.NON_INTERACTIVE.value,
+                    TRPAttribute.MACHINE_ENFORCEMENT.value,
                 ],
             }
         )
