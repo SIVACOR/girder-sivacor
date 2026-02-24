@@ -11,6 +11,7 @@ from importlib.metadata import version
 from tro_utils import TRPAttribute
 from zoneinfo import ZoneInfo
 
+import posix1e
 import randomname
 from girder.constants import AccessType
 from girder.models.collection import Collection
@@ -109,6 +110,49 @@ def _create_submission_folder(user):
     )
 
 
+def _matlab_perms(target_path):
+    # Ensure the target directory has read/write/execute permissions for user ID 1001
+    # (the default MATLAB container user)
+    # Pass 1: Access ACL (current perms), Pass 2: Default ACL (inheritance)
+    for is_default in [False, True]:
+        try:
+            acl_type = (
+                posix1e.ACL_TYPE_DEFAULT if is_default else posix1e.ACL_TYPE_ACCESS
+            )
+            acl = (
+                posix1e.ACL(filedef=target_path)
+                if is_default
+                else posix1e.ACL(file=target_path)
+            )
+            found = False
+            for entry in acl:
+                if entry.tag_type == posix1e.ACL_USER and entry.qualifier == 1001:
+                    new_entry = entry
+                    found = True
+                    break
+
+            if not found:
+                new_entry = acl.append()
+                new_entry.tag_type = posix1e.ACL_USER
+                new_entry.qualifier = 1001
+
+            new_entry.permset.clear()
+            new_entry.permset.add(posix1e.ACL_READ)
+            new_entry.permset.add(posix1e.ACL_WRITE)
+            new_entry.permset.add(posix1e.ACL_EXECUTE)
+
+            acl.calc_mask()
+            # Explicitly provide the type here
+            acl.applyto(target_path, acl_type)
+
+        except OSError as e:
+            # If target_path is a file, filedef will fail.
+            # We can safely skip the default pass for files.
+            if is_default:
+                continue
+            raise e
+
+
 @app.task(queue="local")
 def cleanup_submission(submission_folder_id):
     folder = Folder().load(submission_folder_id, force=True)
@@ -189,6 +233,7 @@ def create_workspace(task, submission):
         submission["workspace_dir"] = workspace_dir
         project_dir = get_project_dir(submission)
         os.makedirs(project_dir, exist_ok=False)
+        _matlab_perms(project_dir)
         # Ensure R library directory for user install.packages exists
         for stage in submission.get("stages", []):
             if stage["image_name"].startswith("rocker/"):

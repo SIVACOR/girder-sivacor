@@ -10,6 +10,7 @@ requirements = [
     "girder-plugin-worker>=5.0.0a1",
     "girder-user-quota>=5.0.0a8.dev39",
     "pandas",
+    "pylibacl",
     "py-cpuinfo",
     "randomname",
     "tro-utils>=0.2.1",

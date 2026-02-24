@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -qy \
     git \
     libldap2-dev \
     libsasl2-dev \
+    libacl1-dev \
     libcairo2 \
     python3-pip \
     python3-venv \
@@ -43,6 +44,8 @@ RUN cd /src && \
   cd ../../ && \
   python -m build .
 
+RUN python -m pip wheel --wheel-dir=/src/dist pylibacl
+
 FROM python:3.12-slim
 
 LABEL maintainer="Kacper Kowalik <xarthisius.kk@gmail.com>"
@@ -58,6 +61,7 @@ RUN apt-get update -qy \
     libcairo2 \
     libmagic1 \
     libmagic-mgc \
+    libacl1 \
     gnupg \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/*
