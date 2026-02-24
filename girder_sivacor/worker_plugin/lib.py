@@ -443,8 +443,11 @@ def recorded_run(submission, stage, task=None):
     logging.info("Running Tale with command: " + " ".join(entrypoint + [command]))
     if is_matlab(image_reference):
         user = "1001:100"
+        read_only = False  # Matlab needs write access to its home dir for preferences, so we set
+        # the whole container to read-write in this case...
     else:
         user = f"{os.getuid()}:{os.getgid()}"
+        read_only = True
 
     container = cli.containers.create(
         image=image_reference,
@@ -452,7 +455,7 @@ def recorded_run(submission, stage, task=None):
         command=command,
         detach=True,
         mounts=mounts,
-        read_only=True,
+        read_only=read_only,
         working_dir=os.path.join(target_workspace_dir, "project", sub_dir),
         user=user,
         environment={
