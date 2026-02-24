@@ -175,8 +175,8 @@ class DockerStatsCollectorThread(Thread):
                     blkio_rd, blkio_wr = self.calculate_blkio_bytes(d, convert=False)
                     csv_line = (
                         f'"{ts}",{cpu_percent:.2f},{mem_usage},{mem_limit},'
-                        f'{bytes_in},{bytes_out},{blkio_rd},{blkio_wr},'
-                        f'{d.get("pids_stats", {}).get("current", 0)}\n'
+                        f"{bytes_in},{bytes_out},{blkio_rd},{blkio_wr},"
+                        f"{d.get('pids_stats', {}).get('current', 0)}\n"
                     )
                     fp.write(csv_line)
             time.sleep(5)
@@ -264,6 +264,10 @@ class DummyTask:
 
 def is_stata(image_reference: str) -> bool:
     return image_reference.startswith("dataeditors/stata")
+
+
+def is_matlab(image_reference: str) -> bool:
+    return image_reference.startswith("dynare")
 
 
 def stata_error(log_content: str) -> str | None:
@@ -400,7 +404,9 @@ def recorded_run(submission, stage, task=None):
 
     image_reference = stage["image_name"] + ":" + stage["image_tag"]
     host_tmp_root = os.environ.get("DOCKER_HOST_TMP_ROOT", "/")
-    source_workspace_dir = os.path.join(host_tmp_root, submission["workspace_dir"].lstrip("/"))
+    source_workspace_dir = os.path.join(
+        host_tmp_root, submission["workspace_dir"].lstrip("/")
+    )
     target_workspace_dir = "/workspace"
     mounts = [
         docker.types.Mount(
@@ -430,8 +436,15 @@ def recorded_run(submission, stage, task=None):
 
     entrypoint, command, sub_dir, home_dir = _infer_run_command(submission, stage)
     project_dir = get_project_dir(submission)
-    logging.info("Setting working directory to: " + os.path.join(target_workspace_dir, "project", sub_dir))
+    logging.info(
+        "Setting working directory to: "
+        + os.path.join(target_workspace_dir, "project", sub_dir)
+    )
     logging.info("Running Tale with command: " + " ".join(entrypoint + [command]))
+    if is_matlab(image_reference):
+        user = "1001:100"
+    else:
+        user = f"{os.getuid()}:{os.getgid()}"
 
     container = cli.containers.create(
         image=image_reference,
@@ -441,7 +454,7 @@ def recorded_run(submission, stage, task=None):
         mounts=mounts,
         read_only=True,
         working_dir=os.path.join(target_workspace_dir, "project", sub_dir),
-        user=f"{os.getuid()}:{os.getgid()}",
+        user=user,
         environment={
             "TMPDIR": "/tmp",
             "TEMP": "/tmp",

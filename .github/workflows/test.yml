@@ -31,6 +31,9 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - name: Install libacl1
+      run: sudo apt-get update && sudo apt-get install -y libacl1-dev
+
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
