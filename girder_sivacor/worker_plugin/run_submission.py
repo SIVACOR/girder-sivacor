@@ -110,10 +110,7 @@ def _create_submission_folder(user):
     )
 
 
-def _matlab_perms(target_path):
-    # Ensure the target directory has read/write/execute permissions for user ID 1001
-    # (the default MATLAB container user)
-    # Pass 1: Access ACL (current perms), Pass 2: Default ACL (inheritance)
+def _matlab_perms(target_path, uid=1001):
     for is_default in [False, True]:
         try:
             acl_type = (
@@ -124,9 +121,28 @@ def _matlab_perms(target_path):
                 if is_default
                 else posix1e.ACL(file=target_path)
             )
+
+            # Check if ACL is empty without using len()
+            entries = list(acl)
+
+            # If creating a Default ACL for the first time,
+            # you MUST include the base (minimal) entries.
+            if is_default and not entries:
+                access_acl = posix1e.ACL(file=target_path)
+                for entry in access_acl:
+                    if entry.tag_type in [
+                        posix1e.ACL_USER_OBJ,
+                        posix1e.ACL_GROUP_OBJ,
+                        posix1e.ACL_OTHER,
+                    ]:
+                        new_e = acl.append()
+                        new_e.tag_type = entry.tag_type
+                        new_e.permset = entry.permset
+
+            # Now find or add user {uid}
             found = False
             for entry in acl:
-                if entry.tag_type == posix1e.ACL_USER and entry.qualifier == 1001:
+                if entry.tag_type == posix1e.ACL_USER and entry.qualifier == uid:
                     new_entry = entry
                     found = True
                     break
@@ -134,23 +150,19 @@ def _matlab_perms(target_path):
             if not found:
                 new_entry = acl.append()
                 new_entry.tag_type = posix1e.ACL_USER
-                new_entry.qualifier = 1001
+                new_entry.qualifier = uid
 
             new_entry.permset.clear()
-            new_entry.permset.add(posix1e.ACL_READ)
-            new_entry.permset.add(posix1e.ACL_WRITE)
-            new_entry.permset.add(posix1e.ACL_EXECUTE)
+            for perm in [posix1e.ACL_READ, posix1e.ACL_WRITE, posix1e.ACL_EXECUTE]:
+                new_entry.permset.add(perm)
 
             acl.calc_mask()
-            # Explicitly provide the type here
             acl.applyto(target_path, acl_type)
 
-        except OSError as e:
-            # If target_path is a file, filedef will fail.
-            # We can safely skip the default pass for files.
+        except OSError:
             if is_default:
                 continue
-            raise e
+            raise
 
 
 @app.task(queue="local")
@@ -233,7 +245,10 @@ def create_workspace(task, submission):
         submission["workspace_dir"] = workspace_dir
         project_dir = get_project_dir(submission)
         os.makedirs(project_dir, exist_ok=False)
-        _matlab_perms(project_dir)
+        # Give read/write/execute permissions to myself
+        _matlab_perms(project_dir, uid=os.getuid())
+        # Give read/write/execute permissions to Matlab user
+        _matlab_perms(project_dir, uid=1001)
         # Ensure R library directory for user install.packages exists
         for stage in submission.get("stages", []):
             if stage["image_name"].startswith("rocker/"):
