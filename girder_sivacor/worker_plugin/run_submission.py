@@ -9,6 +9,7 @@ import zipfile
 from functools import wraps
 from importlib.metadata import version
 from tro_utils import TRPAttribute
+from tro_utils.models import ArrangementRef
 from zoneinfo import ZoneInfo
 
 import posix1e
@@ -365,7 +366,7 @@ def run_tro(task, submission, action, inumber):
                 datetime.datetime.fromisoformat(run["run_start_time"]),
                 datetime.datetime.fromisoformat(run["run_end_time"]),
                 comment=f"SIVACOR workflow execution ({main_file}) step {inumber + 1}",
-                accessed_arrangement=f"arrangement/{inumber}",
+                accessed_arrangement=ArrangementRef(f"arrangement/{inumber}", path="/workspace"),
                 modified_arrangement=f"arrangement/{inumber + 1}",
                 attrs=run.get("run_attrs", []),
                 extra_attributes=extra_attributes,
