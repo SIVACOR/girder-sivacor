@@ -13,7 +13,7 @@ requirements = [
     "pylibacl",
     "py-cpuinfo",
     "randomname",
-    "tro-utils>=0.4.1",
+    "tro-utils>=0.4.2",
 ]
 
 setup(
