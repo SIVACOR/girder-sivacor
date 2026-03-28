@@ -315,7 +315,7 @@ def run_tro(task, submission, action, inumber):
 
         with tempfile.NamedTemporaryFile(delete=True) as profile:
             trs_profile = Setting().get(PluginSettings.TRO_PROFILE)
-            trs_profile["sivacor_version"] = version("girder_sivacor")
+            trs_profile["sivacor:stackVersion"] = version("girder_sivacor")
             profile.write(json.dumps(trs_profile).encode())
             profile.seek(0)
             tro = TRO(
