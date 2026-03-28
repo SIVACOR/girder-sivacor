@@ -360,7 +360,14 @@ def run_tro(task, submission, action, inumber):
                     for fobj in files:
                         with File().open(fobj) as f:
                             extra_attributes = json.load(f)
-            print(run.get("run_attrs", []))
+
+            if extra_attributes:
+                extra_attributes = {
+                    f"sivacor:{key}": value
+                    for key, value in extra_attributes.items()
+                    if ":" not in key
+                }
+
             tro.add_performance(
                 datetime.datetime.fromisoformat(run["run_start_time"]),
                 datetime.datetime.fromisoformat(run["run_end_time"]),
