@@ -17,8 +17,6 @@ from girder_sivacor.worker_plugin.run_submission import (
 )
 from pytest_girder.assertions import assertStatusOk
 
-from .conftest import submit_sivacor_job, upload_test_file
-
 
 def test_job_check_decorator_skips_cancelled_job():
     """

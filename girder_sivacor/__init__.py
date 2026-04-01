@@ -31,14 +31,6 @@ def _validate_uploads_folder_name(value):
     return value
 
 
-@setting_utilities.validator(PluginSettings.MAX_ITEM_SIZE)
-def _validate_max_item_size(doc):
-    value = doc.get("value")
-    if not isinstance(value, int) or value <= 0:
-        raise ValidationException("Max item size must be a positive integer.")
-    return value
-
-
 @setting_utilities.validator(PluginSettings.RETENTION_DAYS)
 def _validate_retention_days(doc):
     value = doc.get("value")
@@ -116,8 +108,7 @@ def search_with_job_id(self, event):
         parentId = params.get("parentId")
         if not parentType or not parentId:
             raise ValidationException(
-                "Both parentType and parentId must be provided when "
-                "filtering by jobId."
+                "Both parentType and parentId must be provided when filtering by jobId."
             )
         query = {
             "parentCollection": parentType,

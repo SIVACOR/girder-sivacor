@@ -1,5 +1,6 @@
 import datetime
 import json
+import logging
 import os
 import pathlib
 import shutil
@@ -8,7 +9,6 @@ import tempfile
 import zipfile
 from functools import wraps
 from importlib.metadata import version
-from tro_utils import TRPAttribute
 from zoneinfo import ZoneInfo
 
 import posix1e
@@ -25,6 +25,7 @@ from girder.models.user import User
 from girder_jobs.constants import JobStatus
 from girder_jobs.models.job import Job
 from girder_worker.app import app
+from tro_utils import TRPAttribute
 from tro_utils.tro_utils import TRO
 
 from ..settings import PluginSettings
@@ -38,6 +39,7 @@ from .lib import (
 )
 
 IGNORE_DIRS = [".git", "__pycache__"]
+logger = logging.getLogger(__name__)
 
 
 def timestamp():
@@ -165,15 +167,6 @@ def _matlab_perms(target_path, uid=1001):
             raise
 
 
-@app.task(queue="local")
-def cleanup_submission(submission_folder_id):
-    folder = Folder().load(submission_folder_id, force=True)
-    for item in Folder().childItems(
-        folder, filters={"size": {"$gt": Setting().get(PluginSettings.MAX_ITEM_SIZE)}}
-    ):
-        Item().remove(item)
-
-
 @app.task(queue="local", bind=True)
 @job_check
 def prepare_submission(task, userId, fileId, stages, job_id):
@@ -194,13 +187,6 @@ def prepare_submission(task, userId, fileId, stages, job_id):
                 "status": "submitted",
                 "job_id": str(job["_id"]),
             },
-        )
-        cleanup_submission.apply_async(
-            args=(str(submission_folder["_id"]),),
-            kwargs={
-                "girder_job_title": "Cleanup submission folder",
-            },
-            countdown=Setting().get(PluginSettings.RETENTION_DAYS) * 86400,
         )
         Job().updateJob(
             job,
@@ -577,3 +563,33 @@ def finalize_job(submission):
             status=JobStatus.SUCCESS,
         )
     return submission
+
+
+@app.on_after_configure.connect
+def setup_periodic_tasks(sender, **kwargs):
+    sender.add_periodic_task(
+        12 * 60 * 60,
+        cleanup_submissions.s(),
+        name="Clean up old submissions",
+    )
+
+
+@app.task
+def cleanup_submissions():
+    root_collection = Collection().findOne(
+        {"name": Setting().get(PluginSettings.SUBMISSION_COLLECTION_NAME)}
+    )
+    if not root_collection:
+        return
+
+    admin = User().findOne({"admin": True})
+    cutoff_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+        days=Setting().get(PluginSettings.RETENTION_DAYS)
+    )
+    for folder in Folder().childFolders(root_collection, "collection", user=admin):
+        if folder["created"] > cutoff_time:
+            continue
+        logger.info(
+            f"Cleaning up submission folder {folder['_id']} created at {folder['created']}"
+        )
+        Folder().remove(folder)
