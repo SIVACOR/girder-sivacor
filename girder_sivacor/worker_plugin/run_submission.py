@@ -589,6 +589,10 @@ def cleanup_submissions():
     for folder in Folder().childFolders(root_collection, "collection", user=admin):
         if folder["created"] > cutoff_time:
             continue
+        if job_id := folder.get("meta", {}).get("job_id"):
+            main_job = Job().load(job_id, force=True)
+            Job().remove(main_job)
+            Job().collection.delete_many({"args.0.job_id": job_id})
         logger.info(
             f"Cleaning up submission folder {folder['_id']} created at {folder['created']}"
         )
