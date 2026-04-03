@@ -309,6 +309,7 @@ def run_tro(task, submission, action, inumber):
                 gpg_fingerprint=Setting().get(PluginSettings.TRO_GPG_FINGERPRINT),
                 gpg_passphrase=Setting().get(PluginSettings.TRO_GPG_PASSPHRASE),
                 profile=profile.name,
+                extra_context=[{"sivacor": "https://vocabulary.sivacor.org/0.1/"}],
                 tro_creator="SIVACOR/tro_utils",
                 tro_name=submission_folder["name"],
                 tro_description="SIVACOR Run",
