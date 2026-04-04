@@ -274,7 +274,10 @@ def stata_error(log_content: str) -> str | None:
     # if any of the lines contains r([0-9]+); return True
     regex = r"r\(\d+\);"
     if result := re.search(regex, log_content):
-        return result.group(0)
+        # find a line that contains r([0-9]+); and return the previous line as error message
+        line_start = log_content[: result.start() - 1].rfind("\n")
+        error_message = log_content[line_start : result.start()].strip()
+        return error_message + " " + result.group(0)
     elif log_content == "License is invalid\n":
         return "License is invalid"
     elif log_content.startswith("Cannot find license file"):
