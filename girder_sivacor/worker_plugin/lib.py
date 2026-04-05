@@ -371,7 +371,9 @@ def _infer_run_command(submission, stage):
         # For MATLAB, the command is just the main file name without extension
         command = os.path.splitext(command)[0]
 
-    if " " in command:
+    if is_stata(image_name):
+        command = f'\'"{command}"\''
+    elif " " in command:
         command = f'"{command}"'
 
     return entrypoint, command, sub_dir, home_dir
@@ -558,34 +560,44 @@ def recorded_run(submission, stage, task=None):
                     with open(log_file, "wb") as out_f:
                         _dump_from_fileobj(f, out_f)
 
-            if key != "dockerstats":
-                container_log_path = os.path.join(container_temp_path, key)
-                with open(container_log_path, "wb") as fp:
-                    fp.write(container.logs(stdout=stdout, stderr=stderr))
-
             target_file = os.path.join(container_temp_path, key)
+            if key != "dockerstats":
+                with open(target_file, "wb") as fp:
+                    fp.write(container.logs(stdout=stdout, stderr=stderr))
+                logging.debug(f"Dumped {key} to {target_file}")
+
             if not os.path.isfile(target_file):
                 print(f"{key} file not found, skipping...")
                 continue
             if key == "stdout" and os.path.getsize(target_file) == 0:
+                logging.debug(
+                    "Stdout is empty, attempting to find log file from main file..."
+                )
                 main_file_noext = os.path.splitext(main_file)[0]
                 logfile = None
                 if main_file.endswith(".R"):
                     logfile = main_file_noext + ".Rout"
                 elif main_file.endswith(".do") or is_stata(image_reference):
-                    logfile = main_file_noext + ".log"
+                    logfile = main_file_noext.split(".", 1)[0] + ".log"
+                    logging.debug(f"Looking for Stata log file: {logfile}")
                 else:
-                    logging.info(
+                    logging.debug(
                         f"Cannot infer log file for main file {main_file}, skipping..."
                     )
 
                 if logfile:
+                    logging.debug(
+                        f"Looking for log file {logfile} in project directory {project_dir}..."
+                    )
                     # find .Rout files if stdout is empty and R
                     for root, dirs, files in os.walk(project_dir):
                         for file in files:
                             if file == logfile:
                                 target_file = os.path.join(root, file)
                                 break
+                    logging.debug(
+                        f"Found log file at {target_file}, using it as stdout."
+                    )
 
             stage_stamp = f"\n\n===== Stage {stage_num} Output =====\n\n"
             with open(target_file, "rb") as fp:
@@ -625,6 +637,8 @@ def recorded_run(submission, stage, task=None):
                 "Error executing recorded run. Check stdout/stderr for details."
             )
         elif is_stata(image_reference):
+            if not os.path.isfile(log_files["stdout"]):
+                raise ValueError("Error executing Stata run and no log file found. ")
             with open(log_files["stdout"], "rb") as fp:
                 log_content = fp.read()
                 log_content = log_content.decode("utf-8", errors="ignore")
