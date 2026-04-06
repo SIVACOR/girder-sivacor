@@ -13,7 +13,9 @@ from .conftest import (
 
 
 @pytest.mark.plugin("sivacor")
-@pytest.mark.parametrize("testFile", ["test_stata.tar.gz", "sivacor-test-stata-scenario-A.zip"])
+@pytest.mark.parametrize(
+    "testFile", ["test_stata.tar.gz", "sivacor-test-stata-scenario-A.zip"]
+)
 def test_simple_run(
     server,
     db,
@@ -29,7 +31,9 @@ def test_simple_run(
     image_name = "dataeditors/stata18_5-mp"
     image_tag = "2025-02-26"
     main_file = "main.do"
-    stages = [{"image_name": image_name, "image_tag": image_tag, "main_file": main_file}]
+    stages = [
+        {"image_name": image_name, "image_tag": image_tag, "main_file": main_file}
+    ]
 
     # Upload test file
     assert uploads_folder is not None
@@ -88,7 +92,9 @@ def test_error_detection(
     image_name = "dataeditors/stata18_5-mp"
     image_tag = "2025-02-26"
     main_file = "fail.do"
-    stages = [{"image_name": image_name, "image_tag": image_tag, "main_file": main_file}]
+    stages = [
+        {"image_name": image_name, "image_tag": image_tag, "main_file": main_file}
+    ]
 
     # Upload test file
     assert uploads_folder is not None
@@ -141,3 +147,62 @@ def test_error_detection(
     assert "command command_does_not_exist is unrecognized" in stdout_content.decode(
         "utf-8"
     )
+
+
+@pytest.mark.plugin("sivacor")
+def test_dual_stdout(
+    server,
+    db,
+    user,
+    eagerWorkerTasks,
+    fsAssetstore,
+    patched_gpg,
+    uploads_folder,
+    submission_collection,
+):
+    """Test error detection in Stata submission workflow."""
+    image_name = "dataeditors/stata18_5-mp"
+    image_tag = "2025-02-26"
+    main_file = "main.do"
+    stages = [
+        {"image_name": image_name, "image_tag": image_tag, "main_file": main_file}
+    ]
+
+    # Upload test file
+    assert uploads_folder is not None
+    fobj = upload_test_file(uploads_folder, user, "dual_output.zip")
+
+    # Submit SIVACOR Stata job (expecting failure)
+    resp = server.request(
+        path="/sivacor/submit_job",
+        method="POST",
+        user=user,
+        params={
+            "id": str(fobj["_id"]),
+            "stages": json.dumps(stages),
+        },
+        exception=True,
+    )
+    assertStatusOk(resp)
+    job = resp.json
+
+    # Verify job succeed
+    job = Job().load(job["_id"], force=True)
+    assert job["status"] == JobStatus.SUCCESS
+
+    # Get submission folder and verify metadata
+    resp = get_submission_folder(server, user, job["_id"], submission_collection)
+    assertStatusOk(resp)
+    assert len(resp.json) == 1
+
+    submission_folder = resp.json[0]
+    metadata = submission_folder["meta"]
+
+    # Verify stdout contains both stdout from docker and STATA
+    stdout = File().load(metadata["stdout_file_id"], force=True)
+    with File().open(stdout) as f:
+        stdout_content = f.read()
+
+    stdout_content_decoded = stdout_content.decode("utf-8")
+    assert "optimization converged" in stdout_content_decoded
+    assert "Additional log content from main.log" in stdout_content_decoded
