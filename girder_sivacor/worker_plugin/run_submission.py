@@ -443,15 +443,18 @@ def execute_workflow(task, submission, stage):
 
         if submission.get("runs") is None:
             submission["runs"] = []
+        attrs = [
+            TRPAttribute.ENV_ISOLATION.value,
+            TRPAttribute.NON_INTERACTIVE.value,
+            TRPAttribute.MACHINE_ENFORCEMENT.value,
+        ]
+        if stage.get("network_isolation", False):
+            attrs.append(TRPAttribute.NET_ISOLATION.value)
         submission["runs"].append(
             {
                 "run_start_time": start_time.isoformat(),
                 "run_end_time": end_time.isoformat(),
-                "run_attrs": [
-                    TRPAttribute.ENV_ISOLATION.value,
-                    TRPAttribute.NON_INTERACTIVE.value,
-                    TRPAttribute.MACHINE_ENFORCEMENT.value,
-                ],
+                "run_attrs": attrs,
             }
         )
     except Exception as exc:

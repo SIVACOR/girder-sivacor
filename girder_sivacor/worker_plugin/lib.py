@@ -460,6 +460,7 @@ def recorded_run(submission, stage, task=None):
         command=command,
         detach=True,
         mounts=mounts,
+        network_disabled=stage.get("network_isolation", False),
         read_only=read_only,
         working_dir=os.path.join(target_workspace_dir, "project", sub_dir),
         user=user,

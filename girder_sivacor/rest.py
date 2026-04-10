@@ -39,6 +39,7 @@ stage_schema = {
             "image_name": {"type": "string"},
             "main_file": {"type": "string"},
             "image_tag": {"type": "string"},
+            "network_isolation": {"type": "boolean", "default": False},
         },
         "required": ["image_name", "main_file", "image_tag"],
         "additionalProperties": False,
