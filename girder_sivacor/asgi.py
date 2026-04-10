@@ -1,27 +1,23 @@
-import logging
-from contextlib import asynccontextmanager
-
+from girder.asgi import _WSGIBridge
 from girder.notification import UserNotificationsSocket
 from girder.wsgi import app as wsgi_app
+from girder_async_routes import async_file_routes
+from girder_async_routes.asgi import lifespan
 from starlette.applications import Starlette
 from starlette.middleware.wsgi import WSGIMiddleware
 from starlette.routing import Mount, WebSocketRoute
 
 from .logs import DockerLogStreamer
 
-
-@asynccontextmanager
-async def lifespan(app):
-    logger = logging.getLogger(__name__)
-    logger.info('Girder server running')
-    yield
-
+_wsgi_middleware = WSGIMiddleware(wsgi_app)
+_buffered_wsgi = _WSGIBridge(_wsgi_middleware)
 
 app = Starlette(
     lifespan=lifespan,
     routes=[
-        WebSocketRoute('/notifications/me', UserNotificationsSocket),
+        WebSocketRoute("/notifications/me", UserNotificationsSocket),
         WebSocketRoute("/logs/docker", DockerLogStreamer),
-        Mount('/', app=WSGIMiddleware(wsgi_app)),
+        *async_file_routes,
+        Mount("/", _buffered_wsgi),
     ],
 )

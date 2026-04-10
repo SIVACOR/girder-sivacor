@@ -4,11 +4,12 @@ with open("README.md") as readme_file:
     readme = readme_file.read()
 
 requirements = [
-    "girder>=5.0.0a1",
-    "girder-oauth>=5.0.0a1",
-    "girder-jobs>=5.0.0a1",
-    "girder-plugin-worker>=5.0.0a1",
-    "girder-user-quota>=5.0.0a8.dev39",
+    "girder>=5.0.3",
+    "girder-async-routes>=0.1.2.post1",
+    "girder-oauth>=5.0.0",
+    "girder-jobs>=5.0.0",
+    "girder-plugin-worker>=5.0.0",
+    "girder-user-quota>=5.0.0",
     "pandas",
     "pylibacl",
     "py-cpuinfo",
