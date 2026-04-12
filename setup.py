@@ -5,7 +5,7 @@ with open("README.md") as readme_file:
 
 requirements = [
     "girder>=5.0.3",
-    "girder-async-routes>=0.1.2.post1",
+    "girder-async-routes>=0.1.3",
     "girder-oauth>=5.0.0",
     "girder-jobs>=5.0.0",
     "girder-plugin-worker>=5.0.0",
