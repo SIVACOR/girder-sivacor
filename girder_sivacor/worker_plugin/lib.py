@@ -278,10 +278,12 @@ def stata_error(log_content: str) -> str | None:
         line_start = log_content[: result.start() - 1].rfind("\n")
         error_message = log_content[line_start : result.start()].strip()
         return error_message + " " + result.group(0)
-    elif log_content == "License is invalid\n":
+    elif "License is invalid" in log_content:
         return "License is invalid"
     elif log_content.startswith("Cannot find license file"):
         return "Cannot find license file"
+    elif "Your license has expired" in log_content:
+        return "License has expired"
 
 
 def stop_container(container: docker.models.containers.Container):
