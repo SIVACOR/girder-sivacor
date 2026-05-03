@@ -24,6 +24,7 @@ from .worker_plugin.run_submission import (
     execute_workflow,
     finalize_job,
     prepare_submission,
+    prune_workspace,
     run_tro,
     upload_workspace,
 )
@@ -111,20 +112,27 @@ class SIVACOR(Resource):
             girder_job_title=f"Moving {file['name']} to submission collection",
         )
         workflow |= create_workspace.s().set(girder_job_title="Create Workspace")
-        workflow |= run_tro.s("add_arrangement", 0).set(
+        workflow |= run_tro.s("add_arrangement", 0, None).set(
             girder_job_title="Record initial arrangement"
         )
         for i, stage in enumerate(stages):
             workflow |= execute_workflow.s(stage).set(
                 girder_job_title="Execute SIVACOR Workflow"
             )
-            workflow |= run_tro.s("add_arrangement", i + 1).set(
+            workflow |= run_tro.s("add_arrangement", i + 1, None).set(
                 girder_job_title="Record final arrangement"
             )
-            workflow |= run_tro.s("add_performance", i).set(
-                girder_job_title="Record Performance Metrics"
+            workflow |= run_tro.s("add_performance", i, None).set(
+                girder_job_title="Record user workflow TRP"
             )
-        workflow |= run_tro.s("sign", 0).set(girder_job_title="Sign TRO")
+        workflow |= prune_workspace.s().set(girder_job_title="Prune Workspace")
+        workflow |= run_tro.s(
+            "add_arrangement", len(stages) + 1, "is_pruned"
+        ).set(girder_job_title="Record final pruned arrangement")
+        workflow |= run_tro.s(
+            "prune_performance", len(stages), "is_pruned"
+        ).set(girder_job_title="Record workspace prune TRP")
+        workflow |= run_tro.s("sign", 0, None).set(girder_job_title="Sign TRO")
         workflow |= upload_workspace.s().set(
             girder_job_title="Upload Replicated Package"
         )
@@ -190,6 +198,7 @@ class SIVACOR(Resource):
     )
     def delete_submission(self, folder, progress):
         from girder.tasks import deleteFolderTask
+
         # ensure that user has read access to the folder, but meta confirms he was creator
         user = self.getCurrentUser()
         meta = folder.get("meta", {})

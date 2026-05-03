@@ -11,6 +11,7 @@ from functools import wraps
 from importlib.metadata import version
 from zoneinfo import ZoneInfo
 
+import pathspec
 import posix1e
 import randomname
 from girder.constants import AccessType
@@ -39,6 +40,33 @@ from .lib import (
 )
 
 IGNORE_DIRS = [".git", "__pycache__"]
+DEFAULT_SIVACOR_IGNORE = [
+    # Python
+    "__pycache__/",
+    "*.py[cod]",
+    "*$py.class",
+    ".venv/",
+    "venv/",
+    ".env",
+    # Version Control & IDEs
+    ".git/",
+    ".svn/",
+    ".idea/",
+    ".vscode/",
+    "*.swp",
+    ".DS_Store",  # macOS noise
+    "Thumbs.db",  # Windows noise
+    # Common Research/Data temporary files
+    "*.tmp",
+    "node_modules/",
+    # Jupyter Notebook checkpoints
+    ".ipynb_checkpoints/",
+    # Stata/R temporary files
+    "*.smcl",
+    ".Rhistory",
+    ".RData",
+    ".Ruserdata",
+]
 logger = logging.getLogger(__name__)
 
 
@@ -279,15 +307,27 @@ def create_workspace(task, submission):
     return submission
 
 
+def skip_condition(condition, submission):
+    if condition == "is_pruned":
+        return not submission.get("pruned", False)
+    return False
+
+
 @app.task(queue="local", bind=True)
 @job_check
-def run_tro(task, submission, action, inumber):
+def run_tro(task, submission, action, inumber, condition):
     job = Job().load(submission["job_id"], force=True)
     job = Job().updateJob(
         job,
         f"{timestamp()} Running TRO utilities in the workspace. ({action})\n",
         status=JobStatus.RUNNING,
     )
+    if skip_condition(condition, submission):
+        logger.info(
+            f"Skipping TRO action '{action}' for submission {submission['folder_id']} "
+            f"due to condition '{condition}'."
+        )
+        return submission
     try:
         admin = User().findOne({"admin": True})
         submission_folder = Folder().load(submission["folder_id"], force=True)
@@ -332,6 +372,17 @@ def run_tro(task, submission, action, inumber):
                     ignore_dirs=IGNORE_DIRS,
                     resolve_symlinks=False,
                 )
+        elif action == "prune_performance":
+            runs = submission.get("runs", [])
+            run = runs[-1] if runs else {}
+            tro.add_performance(
+                datetime.datetime.fromisoformat(run["run_start_time"]),
+                datetime.datetime.fromisoformat(run["run_end_time"]),
+                comment="SIVACOR Workspace pruning step",
+                accessed_arrangement=(f"arrangement/{inumber}", "/workspace"),
+                modified_arrangement=(f"arrangement/{inumber + 1}", "/workspace"),
+                attrs=run.get("run_attrs", []),
+            )
         elif action == "add_performance":
             stages = submission.get("stages", [])
             main_file = stages[inumber].get("main_file", "unknown")
@@ -465,6 +516,70 @@ def execute_workflow(task, submission, stage):
         )
         raise exc
 
+    return submission
+
+
+@app.task(queue="local", bind=True)
+@job_check
+def prune_workspace(task, submission):
+    logger.info(f"Pruning workspace for submission {submission['folder_id']}")
+    start_time = datetime.datetime.now()
+    project_dir = pathlib.Path(get_project_dir(submission))
+    patterns = set(DEFAULT_SIVACOR_IGNORE)
+    # Check if user provided a custom .sivacorignore
+    if ignore_path := next(project_dir.rglob(".sivacorignore"), None):
+        logger.info(
+            f"Found custom .sivacorignore at {ignore_path}, applying user patterns."
+        )
+        ignore_base_dir = ignore_path.parent
+        with open(ignore_path, "r") as f:
+            user_patterns = [
+                line.strip() for line in f if line.strip() and not line.startswith("#")
+            ]
+            patterns.update(user_patterns)
+    else:
+        logger.info("No custom .sivacorignore found, using default ignore patterns.")
+        ignore_base_dir = project_dir
+
+    spec = pathspec.PathSpec.from_lines("gitignore", list(patterns))
+
+    removed_paths = []
+    for current_root, dirs, files in os.walk(project_dir, topdown=True):
+        current_root_path = pathlib.Path(current_root).resolve()
+        try:
+            relative_base = current_root_path.relative_to(ignore_base_dir)
+        except ValueError:
+            continue  # current_root is not under ignore_base_dir, skip it
+
+        for d in list(dirs):
+            rel_dir_path = relative_base / d
+            if spec.match_file(str(rel_dir_path) + "/"):
+                shutil.rmtree(current_root_path / d)
+                dirs.remove(d)
+                removed_paths.append(str(rel_dir_path) + "/")
+
+        for f in files:
+            if f == ".sivacorignore":
+                continue
+            rel_file_path = relative_base / f
+            if spec.match_file(str(rel_file_path)):
+                os.remove(current_root_path / f)
+                removed_paths.append(str(rel_file_path))
+
+    end_time = datetime.datetime.now()
+    if removed_paths:
+        logger.info(
+            "Pruned the following paths from the workspace:\n"
+            + "\n".join(removed_paths)
+        )
+    submission["pruned"] = len(removed_paths) > 0
+    submission["runs"].append(
+        {
+            "run_start_time": start_time.isoformat(),
+            "run_end_time": end_time.isoformat(),
+            "run_attrs": [],
+        }
+    )
     return submission
 
 
