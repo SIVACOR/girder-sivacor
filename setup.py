@@ -4,6 +4,7 @@ with open("README.md") as readme_file:
     readme = readme_file.read()
 
 requirements = [
+    "cryptography",
     "girder>=5.0.3",
     "girder-async-routes>=0.1.3",
     "girder-oauth>=5.0.0",

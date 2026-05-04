@@ -19,6 +19,7 @@ from girder_jobs.models.job import Job
 from zoneinfo import ZoneInfo
 
 from .settings import PluginSettings
+from .utils import encrypt_job_secrets
 from .worker_plugin.run_submission import (
     create_workspace,
     execute_workflow,
@@ -33,19 +34,37 @@ stage_schema = {
     "$schema": "http://json-schema.org/draft-04/schema#",
     "title": "Workflow",
     "description": "A SIVACOR replication workflow.",
-    "type": "array",
-    "items": {
-        "type": "object",
-        "properties": {
-            "image_name": {"type": "string"},
-            "main_file": {"type": "string"},
-            "image_tag": {"type": "string"},
-            "network_isolation": {"type": "boolean", "default": False},
+    "type": "object",
+    "properties": {
+        "stages": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "image_name": {"type": "string"},
+                    "main_file": {"type": "string"},
+                    "image_tag": {"type": "string"},
+                    "network_isolation": {"type": "boolean", "default": False},
+                },
+                "required": ["image_name", "main_file", "image_tag"],
+                "additionalProperties": False,
+            },
+            "minItems": 1,
         },
-        "required": ["image_name", "main_file", "image_tag"],
-        "additionalProperties": False,
+        "env_secrets": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string"},
+                    "value": {"type": "string"},
+                },
+                "required": ["key", "value"],
+                "additionalProperties": False,
+            },
+        },
     },
-    "minItems": 1,
+    "required": ["stages"],
 }
 
 
@@ -69,15 +88,18 @@ class SIVACOR(Resource):
             paramType="query",
         )
         .jsonParam(
-            "stages",
+            "workflow",
             "The defintion of replication workflow stages to execute.",
-            requireArray=True,
+            paramType="body",
+            requireObject=True,
             required=True,
             schema=stage_schema,
         )
     )
     @filtermodel(model=Job)
-    def submit_job(self, file, stages):
+    def submit_job(self, file, workflow):
+        stages = workflow.get("stages", [])
+        env_secrets = encrypt_job_secrets(workflow.get("env_secrets", []))
         tags = self._get_tags()
         for stage in stages:
             image_name = stage.get("image_name")
@@ -116,7 +138,7 @@ class SIVACOR(Resource):
             girder_job_title="Record initial arrangement"
         )
         for i, stage in enumerate(stages):
-            workflow |= execute_workflow.s(stage).set(
+            workflow |= execute_workflow.s(stage, env_secrets).set(
                 girder_job_title="Execute SIVACOR Workflow"
             )
             workflow |= run_tro.s("add_arrangement", i + 1, None).set(
@@ -126,12 +148,12 @@ class SIVACOR(Resource):
                 girder_job_title="Record user workflow TRP"
             )
         workflow |= prune_workspace.s().set(girder_job_title="Prune Workspace")
-        workflow |= run_tro.s(
-            "add_arrangement", len(stages) + 1, "is_pruned"
-        ).set(girder_job_title="Record final pruned arrangement")
-        workflow |= run_tro.s(
-            "prune_performance", len(stages), "is_pruned"
-        ).set(girder_job_title="Record workspace prune TRP")
+        workflow |= run_tro.s("add_arrangement", len(stages) + 1, "is_pruned").set(
+            girder_job_title="Record final pruned arrangement"
+        )
+        workflow |= run_tro.s("prune_performance", len(stages), "is_pruned").set(
+            girder_job_title="Record workspace prune TRP"
+        )
         workflow |= run_tro.s("sign", 0, None).set(girder_job_title="Sign TRO")
         workflow |= upload_workspace.s().set(
             girder_job_title="Upload Replicated Package"
