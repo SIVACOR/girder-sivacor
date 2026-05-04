@@ -130,7 +130,7 @@ def upload_test_file(uploads_folder, user, filename):
         )
 
 
-def submit_sivacor_job(server, user, file_obj, stages):
+def submit_sivacor_job(server, user, file_obj, stages, secrets=None, exception=False):
     """
     Helper function to submit a SIVACOR job.
 
@@ -150,8 +150,15 @@ def submit_sivacor_job(server, user, file_obj, stages):
         user=user,
         params={
             "id": str(file_obj["_id"]),
-            "stages": json.dumps(stages),
         },
+        body=json.dumps(
+            {
+                "stages": stages,
+                "env_secrets": secrets or [],
+            }
+        ),
+        type="application/json",
+        exception=exception,
     )
 
 
@@ -180,9 +187,7 @@ def get_submission_folder(server, user, job_id, submission_collection):
     )
 
 
-def assert_submission_metadata(
-    metadata, user, job_id, stages, status, expected_files
-):
+def assert_submission_metadata(metadata, user, job_id, stages, status, expected_files):
     """
     Helper function to assert submission folder metadata.
 

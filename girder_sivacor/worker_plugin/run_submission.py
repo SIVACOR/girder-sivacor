@@ -468,7 +468,7 @@ def run_tro(task, submission, action, inumber, condition):
 
 @app.task(queue="local", bind=True)
 @job_check
-def execute_workflow(task, submission, stage):
+def execute_workflow(task, submission, stage, env_vars):
     job = Job().load(submission["job_id"], force=True)
     job = Job().updateJob(
         job,
@@ -479,7 +479,7 @@ def execute_workflow(task, submission, stage):
         # Placeholder for actual workflow execution logic
 
         start_time = datetime.datetime.now()
-        ret = recorded_run(submission, stage, task=task)
+        ret = recorded_run(submission, stage, env_vars, task=task)
         if ret["StatusCode"] == -123:
             print("Termination requested, stopping execution.")
             if task.request.chain:

@@ -1,3 +1,4 @@
+import base64
 import functools
 import io
 import json
@@ -10,6 +11,7 @@ import stat
 import tempfile
 import time
 import zipfile
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from pathlib import Path
 from threading import Event, Thread
 
@@ -28,6 +30,13 @@ from girder.models.user import User
 from girder.settings import SettingKey
 from girder.utility import RequestBodyStream
 
+MASTER_KEY_HEX = os.environ.get(
+    "MASTER_KEY_HEX", "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+)
+_master_key = bytes.fromhex(MASTER_KEY_HEX)
+MASTER_AES = AESGCM(_master_key)
+MASK = "***SECRET_REDACTED***"
+
 
 class NpEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -38,6 +47,21 @@ class NpEncoder(json.JSONEncoder):
         if isinstance(obj, np.ndarray):
             return obj.tolist()
         return super(NpEncoder, self).default(obj)
+
+
+def decrypt_job_secrets(encrypted_secrets_b64, wrapped_job_key_b64):
+    """
+    Unwraps the job key and decrypts the secrets.
+    """
+    # Decode and extract nonces (first 12 bytes)
+    key_payload = base64.b64decode(wrapped_job_key_b64)
+    job_key = MASTER_AES.decrypt(key_payload[:12], key_payload[12:], None)
+
+    secrets_payload = base64.b64decode(encrypted_secrets_b64)
+    job_aes = AESGCM(job_key)
+    decrypted_json = job_aes.decrypt(secrets_payload[:12], secrets_payload[12:], None)
+
+    return json.loads(decrypted_json.decode("utf-8"))
 
 
 def annotate_item_type(file_obj: dict, item_type: str) -> None:
@@ -92,12 +116,13 @@ def _redis_client_sync() -> redis.Redis:
 
 
 class LogPublisher(Thread):
-    def __init__(self, container_name, channel):
+    def __init__(self, container_name, channel, known_secrets):
         super().__init__()
         self.container_name = container_name
         self.channel = channel
         self.client = docker.from_env()
         self._stop_event = Event()
+        self.known_secrets = known_secrets
         self.daemon = True  # Allows Python to exit even if this thread is running
 
     def run(self):
@@ -115,6 +140,8 @@ class LogPublisher(Thread):
                     break
 
                 log_line = log_line_bytes.decode("utf-8").strip()
+                for secret in self.known_secrets:
+                    log_line = log_line.replace(secret, MASK)
                 # Use the synchronous client for publishing
                 _redis_client_sync().publish(self.channel, log_line)
         except Exception as e:
@@ -381,7 +408,7 @@ def _infer_run_command(submission, stage):
     return entrypoint, command, sub_dir, home_dir
 
 
-def recorded_run(submission, stage, task=None):
+def recorded_run(submission, stage, env_vars, task=None):
     cli = docker.from_env()
     info = cli.info()
     cpu_info = cpuinfo.get_cpu_info()
@@ -395,10 +422,20 @@ def recorded_run(submission, stage, task=None):
         "NCPU": info.get("NCPU"),
         "Processor": cpu_info.get("brand_raw"),
     }
+    user_env = {
+        _["key"]: _["value"]
+        for _ in decrypt_job_secrets(
+            env_vars["encrypted_secrets"], env_vars["wrapped_job_key"]
+        )
+    }
+    known_secrets = list(user_env.values())
 
     def logging_worker(log_queue, container):
         for line in container.logs(stream=True):
-            log_queue.put(line.decode("utf-8").strip(), block=False)
+            line = line.decode("utf-8", errors="ignore").strip()
+            for secret in known_secrets:
+                line = line.replace(secret, MASK)
+            log_queue.put(line, block=False)
 
     task = task or DummyTask
     log_queue = queue.Queue()
@@ -456,6 +493,17 @@ def recorded_run(submission, stage, task=None):
         user = f"{os.getuid()}:{os.getgid()}"
         read_only = True
 
+    environment = {
+        "TMPDIR": "/tmp",
+        "TEMP": "/tmp",
+        "TMP": "/tmp",
+        "HOME": home_dir,
+        "R_LIBS": os.path.join(home_dir, "R", "library"),
+        "R_LIBS_USER": os.path.join(home_dir, "R", "library"),
+        "MLM_LICENSE_FILE": "27007@rtlicense1.uits.indiana.edu",
+    }
+    environment.update(user_env)
+
     container = cli.containers.create(
         image=image_reference,
         entrypoint=entrypoint,
@@ -466,22 +514,14 @@ def recorded_run(submission, stage, task=None):
         read_only=read_only,
         working_dir=os.path.join(target_workspace_dir, "project", sub_dir),
         user=user,
-        environment={
-            "TMPDIR": "/tmp",
-            "TEMP": "/tmp",
-            "TMP": "/tmp",
-            "HOME": home_dir,
-            "R_LIBS": os.path.join(home_dir, "R", "library"),
-            "R_LIBS_USER": os.path.join(home_dir, "R", "library"),
-            "MLM_LICENSE_FILE": "27007@rtlicense1.uits.indiana.edu",
-        },
+        environment=environment,
     )
 
     logging_thread = Thread(target=logging_worker, args=(log_queue, container))
     with tempfile.TemporaryDirectory() as container_temp_path:
         dstats_tmppath = os.path.join(container_temp_path, "dockerstats")
         stats_thread = DockerStatsCollectorThread(container, dstats_tmppath)
-        publisher = LogPublisher(container.name, f"docker:logs:{creator_id}")
+        publisher = LogPublisher(container.name, f"docker:logs:{creator_id}", known_secrets)
 
         # Job output must come from stdout/stderr
         container.start()
@@ -594,6 +634,8 @@ def recorded_run(submission, stage, task=None):
                                 log_content = log_content.decode(
                                     "utf-8", errors="ignore"
                                 )
+                                for secret in known_secrets:
+                                    log_content = log_content.replace(secret, MASK)
                                 stata_err = stata_error(log_content)
                         break
 
@@ -603,6 +645,19 @@ def recorded_run(submission, stage, task=None):
             if not os.path.isfile(target_file):
                 print(f"{key} file not found, skipping...")
                 continue
+
+            # obfuscate secrets in the log file before uploading,
+            # line by line to avoid memory issues with large files
+            with (
+                open(target_file, "rb") as fp,
+                open(target_file + ".tmp", "wb") as out_f,
+            ):
+                for line in fp:
+                    line_decoded = line.decode("utf-8", errors="ignore")
+                    for secret in known_secrets:
+                        line_decoded = line_decoded.replace(secret, MASK)
+                    out_f.write(line_decoded.encode("utf-8"))
+            os.replace(target_file + ".tmp", target_file)
 
             log_file = f"/tmp/{key}-{submission['job_id']}"
             log_obj = None
