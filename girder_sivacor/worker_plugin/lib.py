@@ -460,10 +460,9 @@ def recorded_run(submission, stage, env_vars, task=None):
             read_only=False,
         ),
         docker.types.Mount(
-            type="tmpfs",
-            source=None,
+            source=os.path.join(host_tmp_root, submission["tmp_dir"].lstrip("/")),
             target="/tmp",
-            tmpfs_size="1G",
+            type="bind",
         ),
     ]
     if stata_license_hostpath := os.environ.get("STATA_LICENSE_HOSTPATH"):
@@ -521,7 +520,9 @@ def recorded_run(submission, stage, env_vars, task=None):
     with tempfile.TemporaryDirectory() as container_temp_path:
         dstats_tmppath = os.path.join(container_temp_path, "dockerstats")
         stats_thread = DockerStatsCollectorThread(container, dstats_tmppath)
-        publisher = LogPublisher(container.name, f"docker:logs:{creator_id}", known_secrets)
+        publisher = LogPublisher(
+            container.name, f"docker:logs:{creator_id}", known_secrets
+        )
 
         # Job output must come from stdout/stderr
         container.start()

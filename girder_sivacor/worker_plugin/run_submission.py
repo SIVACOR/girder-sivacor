@@ -255,6 +255,11 @@ def create_workspace(task, submission):
     )
 
     try:
+        submission["tmp_dir"] = f"/tmp/tmp-{submission['folder_id']}"
+        os.makedirs(submission["tmp_dir"], exist_ok=False)
+        # add sticky bit to tmp_dir
+        os.chmod(submission["tmp_dir"], 0o1777)
+
         workspace_dir = f"/tmp/workspace-{submission['folder_id']}"
         submission["workspace_dir"] = workspace_dir
         project_dir = get_project_dir(submission)
@@ -673,6 +678,7 @@ def upload_workspace(task, submission):
 
 @app.task(queue="local")
 def finalize_job(submission):
+    shutil.rmtree(submission["tmp_dir"], ignore_errors=True)
     shutil.rmtree(submission["workspace_dir"], ignore_errors=True)
     job = Job().load(submission["job_id"], force=True)
     if job["status"] == JobStatus.RUNNING:
