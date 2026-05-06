@@ -205,6 +205,7 @@ def set_submission_status(event: events.Event) -> None:
                 str(e),
             )
         shutil.rmtree(f"/tmp/workspace-{submission_folder['_id']}", ignore_errors=True)
+        shutil.rmtree(f"/tmp/tmp-{submission_folder['_id']}", ignore_errors=True)
     else:
         submission_status = "processing"
     Folder().collection.update_one(
