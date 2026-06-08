@@ -503,18 +503,23 @@ def recorded_run(submission, stage, env_vars, task=None):
     }
     environment.update(user_env)
 
-    container = cli.containers.create(
-        image=image_reference,
-        entrypoint=entrypoint,
-        command=command,
-        detach=True,
-        mounts=mounts,
-        network_disabled=stage.get("network_isolation", False),
-        read_only=read_only,
-        working_dir=os.path.join(target_workspace_dir, "project", sub_dir),
-        user=user,
-        environment=environment,
-    )
+    container_kwargs = {
+        "image": image_reference,
+        "entrypoint": entrypoint,
+        "command": command,
+        "detach": True,
+        "mounts": mounts,
+        "network_disabled": stage.get("network_isolation", False),
+        "read_only": read_only,
+        "working_dir": os.path.join(target_workspace_dir, "project", sub_dir),
+        "user": user,
+        "environment": environment,
+    }
+    container = cli.containers.create(**container_kwargs)
+    # redact env in container_kwargs since we dump them later
+    container_kwargs["environment"] = {
+        k: (MASK if k in user_env else v) for k, v in container_kwargs["environment"].items()
+    }
 
     logging_thread = Thread(target=logging_worker, args=(log_queue, container))
     with tempfile.TemporaryDirectory() as container_temp_path:
@@ -566,6 +571,7 @@ def recorded_run(submission, stage, env_vars, task=None):
                 "FinishedAt": container.attrs["State"]["FinishedAt"],
             }
         )
+        performance_data.update({"DockerRunArgs": json.dumps(container_kwargs)})
         if os.path.isfile(dstats_tmppath + ".csv"):
             df = pd.read_csv(dstats_tmppath + ".csv")
             performance_data.update(
