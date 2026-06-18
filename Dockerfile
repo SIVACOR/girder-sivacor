@@ -44,6 +44,25 @@ RUN cd /src && \
   cd ../../ && \
   python -m build .
 
+# Temporary OAuth
+RUN cd /tmp && \
+  git clone https://github.com/xarthisius/girder -b oauth_approve && \
+  cd girder/plugins/oauth/girder_oauth/web_client && \
+  npm install && \
+  npm run build && \
+  cd ../../ && \
+  python -m build . && \
+  cp dist/* /src/dist/ && \
+  cd /tmp/girder && \
+  git checkout auth_email_events && \
+  cd girder/web && \
+  npm i && \
+  npm run build && \
+  cd ../../ && \
+  python -m build . && \
+  cp dist/* /src/dist/ && \
+  cd /tmp && rm -rf girder
+
 RUN python -m pip wheel --wheel-dir=/src/dist pylibacl
 
 FROM python:3.12-slim
@@ -66,7 +85,7 @@ RUN apt-get update -qy \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/*
 
-RUN python3 -m pip install \
+RUN python3 -m pip install --no-cache-dir \
   'celery>=5.5.2' \
   'girder>=5.0.0a8.dev39' \
   'girder-user-quota>=5.0.0a8.dev39'
