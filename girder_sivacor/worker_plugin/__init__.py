@@ -134,9 +134,18 @@ def notify_user(job, submission_folder, success: bool) -> None:
     msg, recipients = _createMessage(
         subject, text_content, rendered_html, [user["email"]], None
     )
+    events.trigger("_sendmail", info={"message": msg, "recipients": recipients})
 
+
+def _sendmail(event):
+    msg = event.info["message"]
+    recipients = event.info["recipients"]
+    _submitEmail(msg, recipients)
+
+
+def _submitEmail(msg, recipients):
     if os.environ.get("GIRDER_EMAIL_TO_CONSOLE"):
-        print("Redirecting email to console:")
+        print("[sivacor] Redirecting email to console:")
         print(msg.as_string())
         return
 
@@ -219,6 +228,8 @@ class SIVACORWorkerPlugin(GirderWorkerPluginABC):
         self.app = app
         mail_utils.addTemplateDirectory((_HERE.parent / "mail_templates").as_posix())
         events.bind("jobs.job.update.after", "sivacor", set_submission_status)
+        events.unbind("_sendmail", "core.email")
+        events.bind("_sendmail", "sivacor", _sendmail)
 
     def task_imports(self):
         return [

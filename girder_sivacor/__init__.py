@@ -1,3 +1,4 @@
+import datetime
 import logging
 from pathlib import Path
 
@@ -10,7 +11,7 @@ from girder.exceptions import ValidationException
 from girder.models.folder import Folder
 from girder.models.user import User
 from girder.plugin import GirderPlugin, getPlugin, registerPluginStaticContent
-from girder.utility import setting_utilities
+from girder.utility import mail_utils, setting_utilities
 from girder.utility.model_importer import ModelImporter
 from girder_jobs.constants import JobStatus
 from girder_jobs.models.job import Job as JobModel
@@ -20,6 +21,10 @@ from girder_oauth.settings import PluginSettings as OAuthSettings
 from .auth.orcid import ORCID
 from .rest import SIVACOR, get_submission_child_jobs
 from .settings import PluginSettings
+from .worker_plugin import (
+    _createMessage,
+    _sendmail
+)
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +102,59 @@ def create_uploads_folder(event: events.Event) -> None:
     folderModel.setUserAccess(uploads_folder, user, level=AccessType.ADMIN, save=True)
 
 
+def send_approval_email(event: events.Event) -> None:
+    logger.info("In send_approval")
+    user = event.info["user"]
+    context = {
+        "user": user,
+        "base_url": "https://submit.sivacor.org",
+        "docs_url": "https://docs.sivacor.org",
+        "feedback_url": "https://feedback.sivacor.org",
+        "current_year": datetime.datetime.now().year,
+        "logo_url": "https://submit.sivacor.org/sivacor_logo_notext_trans.png",
+        "submission_url": "https://submit.sivacor.org/",
+    }
+    text_content = (
+        f"Hello Admin,\n\n"
+        "Someone has registered a new account that needs admin approval.\n"
+        f"Login: {user['login']}\n"
+        f"Email: {user['email']}\n"
+        f"Name: {user['firstName']} {user['lastName']}"
+    )
+    rendered_html = mail_utils.renderTemplate("account_approval.mako", context)
+    to = [u["email"] for u in User().getAdmins()]
+    logger.info("creating message")
+    msg, recipients = _createMessage(
+        "Account pending approval", text_content, rendered_html, to, None
+    )
+    events.trigger("_sendmail", info={"message": msg, "recipients": recipients})
+    event.preventDefault()
+
+
+def send_approved_email(event: events.Event) -> None:
+    user = event.info["user"]
+    context = {
+        "user": user,
+        "base_url": "https://submit.sivacor.org",
+        "docs_url": "https://docs.sivacor.org",
+        "feedback_url": "https://feedback.sivacor.org",
+        "current_year": datetime.datetime.now().year,
+        "logo_url": "https://submit.sivacor.org/sivacor_logo_notext_trans.png",
+        "submission_url": "https://submit.sivacor.org/",
+    }
+    text_content = (
+        f"Hello {user['firstName']} {user['lastName']},\n\n"
+        "Your account has been approved. You may now login."
+    )
+    rendered_html = mail_utils.renderTemplate("account_approved.mako", context)
+    to = [user["email"]]
+    msg, recipients = _createMessage(
+        "Account pending approval", text_content, rendered_html, to, None
+    )
+    events.trigger("_sendmail", info={"message": msg, "recipients": recipients})
+    event.preventDefault()
+
+
 @access.public(scope=TokenScope.DATA_READ)
 @filtermodel(model=Folder)
 @boundHandler
@@ -159,6 +217,10 @@ class SIVACORPlugin(GirderPlugin):
     def load(self, info):
         from girder.api.v1.folder import Folder as FolderResource
 
+        events.unbind("_sendmail", "core.email")
+        events.bind("_sendmail", "sivacor", _sendmail)
+        events.bind("email.approval", "sivacor", send_approval_email)
+        events.bind("email.approved", "sivacor", send_approved_email)
         events.bind("model.user.save.created", "sivacor", create_uploads_folder)
         events.bind("rest.get.folder.before", "sivacor", search_with_job_id)
         ModelImporter.model("user").exposeFields(
@@ -185,7 +247,9 @@ class SIVACORPlugin(GirderPlugin):
             required=False,
             dataType="string",
         )
-
+        template_dir = (Path(__file__).parent / "mail_templates").as_posix()
+        logger.warning(f"Adding {template_dir} as template directory")
+        mail_utils.addTemplateDirectory(template_dir)
         registerPluginStaticContent(
             plugin="sivacor",
             css=["/style.css"],
