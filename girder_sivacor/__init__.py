@@ -149,7 +149,7 @@ def send_approved_email(event: events.Event) -> None:
     rendered_html = mail_utils.renderTemplate("account_approved.mako", context)
     to = [user["email"]]
     msg, recipients = _createMessage(
-        "Account pending approval", text_content, rendered_html, to, None
+        "SIVACOR account approved", text_content, rendered_html, to, None
     )
     events.trigger("_sendmail", info={"message": msg, "recipients": recipients})
     event.preventDefault()
