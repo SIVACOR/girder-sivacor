@@ -103,7 +103,6 @@ def create_uploads_folder(event: events.Event) -> None:
 
 
 def send_approval_email(event: events.Event) -> None:
-    logger.info("In send_approval")
     user = event.info["user"]
     context = {
         "user": user,
@@ -123,7 +122,6 @@ def send_approval_email(event: events.Event) -> None:
     )
     rendered_html = mail_utils.renderTemplate("account_approval.mako", context)
     to = [u["email"] for u in User().getAdmins()]
-    logger.info("creating message")
     msg, recipients = _createMessage(
         "Account pending approval", text_content, rendered_html, to, None
     )
