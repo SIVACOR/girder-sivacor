@@ -46,13 +46,7 @@ RUN cd /src && \
 
 # Temporary OAuth
 RUN cd /tmp && \
-  git clone https://github.com/xarthisius/girder -b oauth_approve && \
-  cd girder/plugins/oauth/girder_oauth/web_client && \
-  npm install && \
-  npm run build && \
-  cd ../../ && \
-  python -m build . && \
-  cp dist/* /src/dist/ && \
+  git clone https://github.com/xarthisius/girder -b auth_email_events && \
   cd /tmp/girder && \
   git checkout auth_email_events && \
   cd girder/web && \
