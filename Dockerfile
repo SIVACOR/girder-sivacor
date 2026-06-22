@@ -45,17 +45,17 @@ RUN cd /src && \
   python -m build .
 
 # Temporary OAuth
-RUN cd /tmp && \
-  git clone https://github.com/xarthisius/girder -b auth_email_events && \
-  cd /tmp/girder && \
-  git checkout auth_email_events && \
-  cd girder/web && \
-  npm i && \
-  npm run build && \
-  cd ../../ && \
-  python -m build . && \
-  cp dist/* /src/dist/ && \
-  cd /tmp && rm -rf girder
+# RUN cd /tmp && \
+#  git clone https://github.com/xarthisius/girder -b auth_email_events && \
+#  cd /tmp/girder && \
+#  git checkout auth_email_events && \
+#  cd girder/web && \
+#  npm i && \
+#  npm run build && \
+#  cd ../../ && \
+#  python -m build . && \
+#  cp dist/* /src/dist/ && \
+#  cd /tmp && rm -rf girder
 
 RUN python -m pip wheel --wheel-dir=/src/dist pylibacl
 
@@ -81,8 +81,8 @@ RUN apt-get update -qy \
 
 RUN python3 -m pip install --no-cache-dir \
   'celery>=5.5.2' \
-  'girder>=5.0.0a8.dev39' \
-  'girder-user-quota>=5.0.0a8.dev39'
+  'girder>=5.0.11.dev27' \
+  'girder-user-quota>=5.0.11.dev27'
 
 # Copy the virtual environment from the compiler stage
 COPY --from=compiler /src/dist /src/dist
