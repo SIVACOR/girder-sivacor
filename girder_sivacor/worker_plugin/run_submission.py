@@ -1,3 +1,4 @@
+import copy
 import datetime
 import json
 import logging
@@ -530,7 +531,7 @@ def prune_workspace(task, submission):
     logger.info(f"Pruning workspace for submission {submission['folder_id']}")
     start_time = datetime.datetime.now()
     project_dir = pathlib.Path(get_project_dir(submission))
-    patterns = set(DEFAULT_SIVACOR_IGNORE)
+    patterns = copy.deepcopy(DEFAULT_SIVACOR_IGNORE)
     # Check if user provided a custom .sivacorignore
     if ignore_path := next(project_dir.rglob(".sivacorignore"), None):
         logger.info(
@@ -541,41 +542,22 @@ def prune_workspace(task, submission):
             user_patterns = [
                 line.strip() for line in f if line.strip() and not line.startswith("#")
             ]
-            patterns.update(user_patterns)
+            patterns += user_patterns
     else:
         logger.info("No custom .sivacorignore found, using default ignore patterns.")
         ignore_base_dir = project_dir
 
-    spec = pathspec.PathSpec.from_lines("gitignore", list(patterns))
-
     removed_paths = []
-    for current_root, dirs, files in os.walk(project_dir, topdown=True):
-        current_root_path = pathlib.Path(current_root).resolve()
-        try:
-            relative_base = current_root_path.relative_to(ignore_base_dir)
-        except ValueError:
-            continue  # current_root is not under ignore_base_dir, skip it
-
-        for d in list(dirs):
-            rel_dir_path = relative_base / d
-            if spec.match_file(str(rel_dir_path) + "/"):
-                shutil.rmtree(current_root_path / d)
-                dirs.remove(d)
-                removed_paths.append(str(rel_dir_path) + "/")
-
-        for f in files:
-            if f == ".sivacorignore":
-                continue
-            rel_file_path = relative_base / f
-            if spec.match_file(str(rel_file_path)):
-                os.remove(current_root_path / f)
-                removed_paths.append(str(rel_file_path))
+    spec = pathspec.PathSpec.from_lines("gitignore", list(patterns))
+    for fpath in set(spec.match_tree_files(ignore_base_dir)):
+        removed_paths.append(fpath)
+        (ignore_base_dir / fpath).unlink()
 
     end_time = datetime.datetime.now()
     if removed_paths:
         logger.info(
             "Pruned the following paths from the workspace:\n"
-            + "\n".join(removed_paths)
+            + "\n - ".join(removed_paths)
         )
     submission["pruned"] = len(removed_paths) > 0
     submission["runs"].append(
