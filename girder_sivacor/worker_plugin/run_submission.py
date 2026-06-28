@@ -549,14 +549,32 @@ def prune_workspace(task, submission):
 
     removed_paths = []
     spec = pathspec.PathSpec.from_lines("gitignore", list(patterns))
-    for fpath in set(spec.match_tree_files(ignore_base_dir)):
-        removed_paths.append(fpath)
-        (ignore_base_dir / fpath).unlink()
+
+    for root, dirs, files in os.walk(ignore_base_dir, topdown=True):
+        root_path = pathlib.Path(root)
+
+        kept_dirs = []
+        for d in dirs:
+            dir_p = root_path / d
+            relative_dir_str = str(dir_p.relative_to(ignore_base_dir)) + "/"
+            if spec.match_file(relative_dir_str):
+                removed_paths.append(relative_dir_str)
+                shutil.rmtree(dir_p, ignore_errors=True)
+            else:
+                kept_dirs.append(d)
+
+        dirs[:] = kept_dirs
+        for f in files:
+            file_p = root_path / f
+            relative_file_str = str(file_p.relative_to(ignore_base_dir))
+            if spec.match_file(relative_file_str):
+                removed_paths.append(relative_file_str)
+                file_p.unlink()
 
     end_time = datetime.datetime.now()
     if removed_paths:
         logger.info(
-            "Pruned the following paths from the workspace:\n"
+            "Pruned the following paths from the workspace:\n - "
             + "\n - ".join(removed_paths)
         )
     submission["pruned"] = len(removed_paths) > 0
