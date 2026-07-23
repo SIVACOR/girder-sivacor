@@ -3,14 +3,15 @@ from setuptools import setup, find_packages
 with open("README.md") as readme_file:
     readme = readme_file.read()
 
+girder_version = "5.0.12"
 requirements = [
     "cryptography",
-    "girder>=5.0.3",
+    f"girder>={girder_version}",
     "girder-async-routes>=0.1.3",
-    "girder-oauth>=5.0.0",
-    "girder-jobs>=5.0.0",
-    "girder-plugin-worker>=5.0.0",
-    "girder-user-quota>=5.0.0",
+    f"girder-oauth>={girder_version}",
+    f"girder-jobs>={girder_version}",
+    f"girder-plugin-worker>={girder_version}",
+    f"girder-user-quota>={girder_version}",
     "pandas",
     "pathspec",
     "pylibacl",

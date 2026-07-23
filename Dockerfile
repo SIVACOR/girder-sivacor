@@ -81,8 +81,9 @@ RUN apt-get update -qy \
 
 RUN python3 -m pip install --no-cache-dir \
   'celery>=5.5.2' \
-  'girder>=5.0.11.dev27' \
-  'girder-user-quota>=5.0.11.dev27'
+  'girder>=5.0.12' \
+  'girder-oauth>=5.0.12' \
+  'girder-user-quota>=5.0.12'
 
 # Copy the virtual environment from the compiler stage
 COPY --from=compiler /src/dist /src/dist
