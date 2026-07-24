@@ -11,6 +11,8 @@ class PluginSettings:
     TRO_GPG_PASSPHRASE = "sivacor.tro_gpg_passphrase"
     TRO_PROFILE = "sivacor.tro_profile"
     RETENTION_DAYS = "sivacor.retention_days"  # in days
+    BANNER_ENABLED = "sivacor.banner_enabled"
+    BANNER_MESSAGE = "sivacor.banner_message"
 
 
 SettingDefault.defaults.update(
@@ -19,6 +21,8 @@ SettingDefault.defaults.update(
         PluginSettings.SUBMISSION_COLLECTION_NAME: "Submissions",
         PluginSettings.EDITORS_GROUP_NAME: "Editors",
         PluginSettings.RETENTION_DAYS: 7,
+        PluginSettings.BANNER_ENABLED: False,
+        PluginSettings.BANNER_MESSAGE: "",
         PluginSettings.IMAGE_TAGS: {
             "dataeditors/stata15": ["latest", "2023-01-27"],
             "dataeditors/stata16": ["latest", "2023-06-13", "2022-10-14"],
