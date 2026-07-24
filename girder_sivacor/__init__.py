@@ -9,6 +9,7 @@ from girder.api.rest import boundHandler, filtermodel
 from girder.constants import AccessType, TokenScope
 from girder.exceptions import ValidationException
 from girder.models.folder import Folder
+from girder.models.setting import Setting
 from girder.models.user import User
 from girder.plugin import GirderPlugin, getPlugin, registerPluginStaticContent
 from girder.utility import mail_utils, setting_utilities
@@ -72,6 +73,22 @@ def _validate_image_tags(doc):
     value = doc.get("value")
     if not isinstance(value, dict):
         raise ValidationException("Image tags must be a dictionary.")
+    return value
+
+
+@setting_utilities.validator(PluginSettings.BANNER_ENABLED)
+def _validate_banner_enabled(doc):
+    value = doc.get("value")
+    if not isinstance(value, bool):
+        raise ValidationException("Banner enabled must be a boolean.")
+    return value
+
+
+@setting_utilities.validator(PluginSettings.BANNER_MESSAGE)
+def _validate_banner_message(doc):
+    value = doc.get("value")
+    if not isinstance(value, str):
+        raise ValidationException("Banner message must be a string.")
     return value
 
 
@@ -186,6 +203,22 @@ def search_with_job_id(self, event):
         event.preventDefault().addResponse(folders)
 
 
+@access.public
+@boundHandler
+def add_public_settings(self, event):
+    """Expose selected SIVACOR settings to unauthenticated clients.
+
+    Bound to ``rest.get.system/public_settings.after`` so that the frontend can
+    read them (e.g. the maintenance banner) without authenticating.
+    """
+    settings = event.info["returnVal"]
+    public_settings = [
+        PluginSettings.BANNER_ENABLED,
+        PluginSettings.BANNER_MESSAGE,
+    ]
+    settings.update({key: Setting().get(key) for key in public_settings})
+
+
 def cancel_jobs(event):
     job = event.info
     if job["type"] != "sivacor_submission":
@@ -221,6 +254,9 @@ class SIVACORPlugin(GirderPlugin):
         events.bind("email.approved", "sivacor", send_approved_email)
         events.bind("model.user.save.created", "sivacor", create_uploads_folder)
         events.bind("rest.get.folder.before", "sivacor", search_with_job_id)
+        events.bind(
+            "rest.get.system/public_settings.after", "sivacor", add_public_settings
+        )
         ModelImporter.model("user").exposeFields(
             level=AccessType.READ, fields=("lastJobId", "lastProjectId")
         )
