@@ -1,12 +1,12 @@
 import base64
 import functools
-import io
 import json
 import logging
 import math
 import os
 import queue
 import re
+import shutil
 import stat
 import tempfile
 import time
@@ -21,14 +21,6 @@ import numpy as np
 import pandas as pd
 import redis
 import requests
-from girder.models.file import File
-from girder.models.folder import Folder
-from girder.models.item import Item
-from girder.models.setting import Setting
-from girder.models.upload import Upload
-from girder.models.user import User
-from girder.settings import SettingKey
-from girder.utility import RequestBodyStream
 
 MASTER_KEY_HEX = os.environ.get(
     "MASTER_KEY_HEX", "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
@@ -64,49 +56,8 @@ def decrypt_job_secrets(encrypted_secrets_b64, wrapped_job_key_b64):
     return json.loads(decrypted_json.decode("utf-8"))
 
 
-def annotate_item_type(file_obj: dict, item_type: str) -> None:
-    item = Item().load(file_obj["itemId"], force=True)
-    if "type" not in item["meta"]:
-        Item().setMetadata(item, {"type": item_type})
-
-
 def get_project_dir(submission):
     return os.path.join(submission["workspace_dir"], "project")
-
-
-def _update_file_from_path(file, path, user):
-    size = os.path.getsize(path)
-    upload = Upload().createUploadToFile(
-        file=file, user=user, size=size, reference=None, assetstore=None
-    )
-    if size == 0:
-        return Upload().finalizeUpload(upload)
-
-    chunkSize = Upload()._getChunkSize()
-    with open(path, "rb") as f:
-        while True:
-            data = f.read(chunkSize)
-            if not data:
-                break
-            upload = Upload().handleChunk(
-                upload, RequestBodyStream(io.BytesIO(data), len(data))
-            )
-    return upload
-
-
-def _dump_from_fileobj(in_f, out_f, is_zip=False, arcname=None):
-    chunk_size = Setting().get(SettingKey.FILEHANDLE_MAX_SIZE)
-    while True:
-        chunk = in_f.read(chunk_size)
-        if not chunk:
-            break
-        if is_zip:
-            if arcname:
-                out_f.writestr(arcname, chunk)
-            else:
-                out_f.writestr(in_f._file["name"], chunk)
-        else:
-            out_f.write(chunk)
 
 
 @functools.lru_cache
@@ -408,7 +359,7 @@ def _infer_run_command(submission, stage):
     return entrypoint, command, sub_dir, home_dir
 
 
-def recorded_run(submission, stage, env_vars, task=None):
+def recorded_run(api, submission, stage, env_vars, task=None):
     cli = docker.from_env()
     info = cli.info()
     cpu_info = cpuinfo.get_cpu_info()
@@ -441,10 +392,11 @@ def recorded_run(submission, stage, env_vars, task=None):
     log_queue = queue.Queue()
     logging.info("Starting recorded run")
 
-    submission_folder = Folder().load(submission["folder_id"], force=True)
-    creator_id = submission_folder["meta"]["creator_id"]
-    stage_num = submission_folder["meta"]["stages"].index(stage) + 1
-    admin = User().findOne({"admin": True})
+    submission_folder = api.folder(submission["folder_id"])
+    folder_id = submission_folder["_id"]
+    folder_meta = submission_folder.get("meta", {})
+    creator_id = folder_meta["creator_id"]
+    stage_num = folder_meta["stages"].index(stage) + 1
 
     image_reference = stage["image_name"] + ":" + stage["image_tag"]
     host_tmp_root = os.environ.get("DOCKER_HOST_TMP_ROOT", "/")
@@ -580,17 +532,13 @@ def recorded_run(submission, stage, env_vars, task=None):
                     "MaxMemoryUsage": df["Memory Usage"].max(),
                 }
             )
-        pdata = io.BytesIO(json.dumps(performance_data, cls=NpEncoder).encode("utf-8"))
-        fobj = Upload().uploadFromFile(
-            pdata,
-            pdata.getbuffer().nbytes,
+        api.upload_bytes(
+            folder_id,
+            json.dumps(performance_data, cls=NpEncoder).encode("utf-8"),
             f"performance_data_stage_{stage_num}.json",
-            parentType="folder",
-            parent=submission_folder,
-            user=admin,
-            mimeType="text/plain",
+            mime_type="text/plain",
+            item_type="performance_data",
         )
-        annotate_item_type(fobj, "performance_data")
         logging.info("Performance data collected and uploaded.")
 
         # Dump run std{out,err} and entrypoint used.
@@ -634,7 +582,7 @@ def recorded_run(submission, stage, env_vars, task=None):
                         with open(os.path.join(root, file), "rb") as fp:
                             with open(target_file, "ab") as out_f:
                                 out_f.write(msg.encode("utf-8"))
-                                _dump_from_fileobj(fp, out_f)
+                                shutil.copyfileobj(fp, out_f)
                             if is_stata(image_reference):
                                 fp.seek(0)
                                 log_content = fp.read()
@@ -667,13 +615,9 @@ def recorded_run(submission, stage, env_vars, task=None):
             os.replace(target_file + ".tmp", target_file)
 
             log_file = f"/tmp/{key}-{submission['job_id']}"
-            log_obj = None
-            meta_key = f"{key}_file_id"
-            if submission_folder["meta"].get(meta_key) is not None:
-                log_obj = File().load(submission_folder["meta"][meta_key], force=True)
-                with File().open(log_obj) as f:
-                    with open(log_file, "wb") as out_f:
-                        _dump_from_fileobj(f, out_f)
+            log_obj = api.file(folder_meta.get(f"{key}_file_id"))
+            if log_obj:
+                api.download_file(log_obj["_id"], log_file)
 
             stage_stamp = f"\n\n===== Stage {stage_num} Output =====\n\n"
             with open(target_file, "rb") as fp:
@@ -682,27 +626,21 @@ def recorded_run(submission, stage, env_vars, task=None):
                 )
                 with open(log_file, "ab") as out_f:
                     out_f.write(stage_stamp.encode("utf-8"))
-                    _dump_from_fileobj(fp, out_f)
+                    shutil.copyfileobj(fp, out_f)
 
-            with open(log_file, "rb") as fp:
-                log_files[key] = target_file
-                if not log_obj:
-                    fobj = Upload().uploadFromFile(
-                        fp,
-                        os.path.getsize(fp.name),
-                        os.path.basename(fp.name),
-                        parentType="folder",
-                        parent=submission_folder,
-                        user=admin,
-                        mimeType="text/plain",
-                    )
-                    Folder().setMetadata(
-                        submission_folder, {key + "_file_id": str(fobj["_id"])}
-                    )
-                    annotate_item_type(fobj, key)
-                else:
-                    _update_file_from_path(log_obj, log_file, admin)
-                    annotate_item_type(log_obj, key)
+            log_files[key] = target_file
+            if log_obj:
+                api.replace_file(log_obj["_id"], log_file)
+                api.annotate_item_type(log_obj, key)
+            else:
+                # Keep the job-stamped basename; upload_workspace pulls these
+                # into the zip under the name Girder knows them by.
+                fobj = api.upload_file(
+                    folder_id, log_file, mime_type="text/plain", item_type=key
+                )
+                api.set_folder_metadata(
+                    folder_id, {f"{key}_file_id": str(fobj["_id"])}
+                )
             os.remove(log_file)
 
     try:

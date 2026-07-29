@@ -2,7 +2,7 @@
 Tests for job cancellation functionality.
 
 This test module verifies:
-1. The job_check decorator properly skips tasks when a job is not RUNNING
+1. The submission_task decorator properly skips tasks when a job is not RUNNING
 2. The cancel_jobs event handler correctly cancels child jobs when the parent is cancelled
 3. The chain cancellation mechanism works correctly
 4. The StatusCode -123 handling in execute_workflow properly stops execution
@@ -12,34 +12,41 @@ import mock
 import pytest
 from girder_jobs.constants import JobStatus
 from girder_jobs.models.job import Job
-from girder_sivacor.worker_plugin.run_submission import (
-    job_check,
-)
+from girder_sivacor.worker_plugin.routing import QUEUE_PREFIX, pin_chain, worker_queue
+from girder_sivacor.worker_plugin.run_submission import submission_task
 from pytest_girder.assertions import assertStatusOk
 
 
-def test_job_check_decorator_skips_cancelled_job():
+def _decorate(func, status=JobStatus.RUNNING, failure="Task failed"):
+    """Wrap ``func`` in submission_task with a stubbed Girder API.
+
+    Returns the decorated callable and the stub, so tests can assert on the
+    REST calls the decorator makes on the task's behalf.
     """
-    Test that the job_check decorator skips task execution when job is not RUNNING.
+    api = mock.MagicMock()
+    api.job.return_value = {"status": status}
+    patcher = mock.patch(
+        "girder_sivacor.worker_plugin.run_submission.GirderApi.for_task",
+        return_value=api,
+    )
+    return submission_task(failure)(func), api, patcher
+
+
+def test_submission_task_skips_cancelled_job():
+    """
+    Test that the submission_task decorator skips execution when job is not RUNNING.
 
     This test verifies that when a job is cancelled or in any non-RUNNING state,
     the decorator causes the task to return early without executing the actual task logic.
     """
-    # Create a mock task function
     mock_task = mock.MagicMock()
     mock_task.__name__ = "mock_task"
-    decorated_task = job_check(mock_task)
+    decorated_task, _api, patcher = _decorate(mock_task, status=JobStatus.CANCELED)
 
-    # Create a mock task instance with request.chain
     mock_task_instance = mock.MagicMock()
     mock_task_instance.request.chain = ["some", "tasks"]
 
-    # Mock the Job model to return a cancelled job
-    with mock.patch("girder_sivacor.worker_plugin.run_submission.Job") as MockJob:
-        mock_job = {"status": JobStatus.CANCELED}
-        MockJob.return_value.load.return_value = mock_job
-
-        # Call the decorated function with a job_id in args
+    with patcher:
         result = decorated_task(mock_task_instance, {"job_id": "test-job-id"})
 
     # Assert that the actual task was NOT called
@@ -52,59 +59,125 @@ def test_job_check_decorator_skips_cancelled_job():
     assert mock_task_instance.request.chain is None
 
 
-def test_job_check_decorator_allows_running_job():
+def test_submission_task_allows_running_job():
     """
-    Test that the job_check decorator allows task execution when job is RUNNING.
+    Test that the submission_task decorator allows execution when job is RUNNING.
 
-    This test verifies that when a job is in RUNNING state, the decorator
-    allows the task to execute normally.
+    The decorator also injects the Girder API client as the task's second
+    argument, so the task never has to build one itself.
     """
-    # Create a mock task function
     mock_task = mock.MagicMock(return_value={"result": "success"})
     mock_task.__name__ = "mock_task"
-    decorated_task = job_check(mock_task)
+    decorated_task, api, patcher = _decorate(mock_task)
 
-    # Create a mock task instance
     mock_task_instance = mock.MagicMock()
+    submission = {"job_id": "test-job-id"}
 
-    # Mock the Job model to return a running job
-    with mock.patch("girder_sivacor.worker_plugin.run_submission.Job") as MockJob:
-        mock_job = {"status": JobStatus.RUNNING}
-        MockJob.return_value.load.return_value = mock_job
+    with patcher:
+        result = decorated_task(mock_task_instance, submission)
 
-        # Call the decorated function with a job_id in args
-        result = decorated_task(mock_task_instance, {"job_id": "test-job-id"})
-
-    # Assert that the actual task WAS called
-    mock_task.assert_called_once()
-
-    # Assert that the result is from the actual task
+    mock_task.assert_called_once_with(mock_task_instance, api, submission)
     assert result == {"result": "success"}
 
 
-def test_job_check_decorator_without_job_id():
+def test_submission_task_reports_failure_and_discards_workspace(tmp_path):
     """
-    Test that the job_check decorator handles tasks without job_id gracefully.
+    Test that a raising task marks the job failed and removes its scratch dirs.
 
-    This test verifies that when no job_id is present in the args,
-    the decorator allows the task to execute normally.
+    The worker no longer shares Girder's database, so the job-update event
+    handler that used to do this cleanup runs on the server and cannot see
+    these paths.
     """
-    # Create a mock task function
-    mock_task = mock.MagicMock(return_value={"result": "success"})
-    mock_task.__name__ = "mock_task"
-    decorated_task = job_check(mock_task)
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "tmp"
+    workspace.mkdir()
+    scratch.mkdir()
 
-    # Create a mock task instance
-    mock_task_instance = mock.MagicMock()
+    def failing_task(task, api, submission):
+        raise ValueError("boom")
 
-    # Call the decorated function without a job_id
-    result = decorated_task(mock_task_instance, {"some": "data"})
+    failing_task.__name__ = "failing_task"
+    decorated_task, api, patcher = _decorate(failing_task, failure="Failed to explode")
 
-    # Assert that the actual task WAS called
-    mock_task.assert_called_once()
+    submission = {
+        "job_id": "test-job-id",
+        "workspace_dir": str(workspace),
+        "tmp_dir": str(scratch),
+    }
 
-    # Assert that the result is from the actual task
-    assert result == {"result": "success"}
+    with patcher, pytest.raises(ValueError, match="boom"):
+        decorated_task(mock.MagicMock(), submission)
+
+    api.update_job.assert_called_once()
+    _args, kwargs = api.update_job.call_args
+    assert kwargs["status"] == JobStatus.ERROR
+    assert "Failed to explode" in kwargs["log"]
+    assert "boom" in kwargs["log"]
+
+    assert not workspace.exists()
+    assert not scratch.exists()
+
+
+def test_submission_task_propagates_original_error_if_reporting_fails():
+    """
+    A job the user cancelled rejects the transition to ERROR.
+
+    That 400 must not surface in place of whatever actually went wrong, or the
+    real failure never reaches the log.
+    """
+
+    def failing_task(task, api, submission):
+        raise ValueError("the actual problem")
+
+    failing_task.__name__ = "failing_task"
+    decorated_task, api, patcher = _decorate(failing_task)
+    api.update_job.side_effect = RuntimeError("400: invalid state transition")
+
+    with patcher, pytest.raises(ValueError, match="the actual problem"):
+        decorated_task(mock.MagicMock(), {"job_id": "test-job-id"})
+
+
+def test_worker_queue_derives_from_celery_node_name(monkeypatch):
+    """The private queue name has to match what the worker was started with."""
+    monkeypatch.delenv("SIVACOR_WORKER_QUEUE", raising=False)
+    task = mock.MagicMock()
+    task.request.hostname = "celery@worker-3"
+
+    assert worker_queue(task) == QUEUE_PREFIX + "worker-3"
+
+    monkeypatch.setenv("SIVACOR_WORKER_QUEUE", "explicit-queue")
+    assert worker_queue(task) == "explicit-queue"
+
+
+def test_pin_chain_routes_remaining_steps_to_one_worker():
+    """
+    Every step after the first has to land on the worker holding the workspace.
+
+    celery re-reads each queued signature's options when it publishes it, so
+    rewriting them in place is what keeps the chain together.
+    """
+    task = mock.MagicMock()
+    task.request.chain = [
+        {"task": "step-c", "options": {"queue": "sivacor"}},
+        {"task": "step-b"},
+    ]
+
+    pin_chain(task, "sivacor.worker-3")
+
+    assert [link["options"]["queue"] for link in task.request.chain] == [
+        "sivacor.worker-3",
+        "sivacor.worker-3",
+    ]
+
+
+def test_pin_chain_tolerates_last_task_in_chain():
+    """The final step has no chain left to pin; that must not be an error."""
+    task = mock.MagicMock()
+    task.request.chain = None
+
+    pin_chain(task, "sivacor.worker-3")
+
+    assert task.request.chain is None
 
 
 def test_cancel_jobs_event_handler():
@@ -262,28 +335,21 @@ def test_execute_workflow_raises_on_error_status():
     assert "Workflow execution failed with code 1" in str(exc_info.value)
 
 
-def test_job_check_decorator_with_error_status():
+def test_submission_task_with_error_status():
     """
-    Test that the job_check decorator handles ERROR status correctly.
+    Test that the submission_task decorator handles ERROR status correctly.
 
     This test verifies that when a job is in ERROR state,
     the decorator skips execution.
     """
-    # Create a mock task function
     mock_task = mock.MagicMock()
     mock_task.__name__ = "mock_task"
-    decorated_task = job_check(mock_task)
+    decorated_task, _api, patcher = _decorate(mock_task, status=JobStatus.ERROR)
 
-    # Create a mock task instance with request.chain
     mock_task_instance = mock.MagicMock()
     mock_task_instance.request.chain = ["task1", "task2"]
 
-    # Mock the Job model to return an errored job
-    with mock.patch("girder_sivacor.worker_plugin.run_submission.Job") as MockJob:
-        mock_job = {"status": JobStatus.ERROR}
-        MockJob.return_value.load.return_value = mock_job
-
-        # Call the decorated function with a job_id in args
+    with patcher:
         result = decorated_task(mock_task_instance, {"job_id": "test-job-id"})
 
     # Assert that the actual task was NOT called
@@ -296,28 +362,21 @@ def test_job_check_decorator_with_error_status():
     assert mock_task_instance.request.chain is None
 
 
-def test_job_check_decorator_clears_chain_only_when_present():
+def test_submission_task_clears_chain_only_when_present():
     """
-    Test that the job_check decorator only clears chain when it exists.
+    Test that the submission_task decorator only clears chain when it exists.
 
     This test verifies that when a task doesn't have a chain,
     the decorator doesn't cause an error.
     """
-    # Create a mock task function
     mock_task = mock.MagicMock()
     mock_task.__name__ = "mock_task"
-    decorated_task = job_check(mock_task)
+    decorated_task, _api, patcher = _decorate(mock_task, status=JobStatus.CANCELED)
 
-    # Create a mock task instance without a chain
     mock_task_instance = mock.MagicMock()
     mock_task_instance.request.chain = None
 
-    # Mock the Job model to return a cancelled job
-    with mock.patch("girder_sivacor.worker_plugin.run_submission.Job") as MockJob:
-        mock_job = {"status": JobStatus.CANCELED}
-        MockJob.return_value.load.return_value = mock_job
-
-        # Call the decorated function with a job_id in args
+    with patcher:
         result = decorated_task(mock_task_instance, {"job_id": "test-job-id"})
 
     # Assert that the actual task was NOT called

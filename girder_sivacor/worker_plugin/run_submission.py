@@ -16,29 +16,15 @@ import pathspec
 import posix1e
 import randomname
 from girder.constants import AccessType
-from girder.models.collection import Collection
-from girder.models.file import File
-from girder.models.folder import Folder
-from girder.models.group import Group
-from girder.models.item import Item
-from girder.models.setting import Setting
-from girder.models.upload import Upload
-from girder.models.user import User
-from girder_jobs.constants import JobStatus
-from girder_jobs.models.job import Job
 from girder_worker.app import app
+from girder_worker.utils import JobStatus
 from tro_utils import TRPAttribute
 from tro_utils.tro_utils import TRO
 
 from ..settings import PluginSettings
-from .lib import (
-    _dump_from_fileobj,
-    _update_file_from_path,
-    annotate_item_type,
-    get_project_dir,
-    recorded_run,
-    zip_symlink,
-)
+from .girder_api import GirderApi, dump_to_zip
+from .lib import get_project_dir, recorded_run, zip_symlink
+from .routing import DISPATCH_QUEUE, pin_chain, worker_queue
 
 IGNORE_DIRS = [".git", "__pycache__"]
 DEFAULT_SIVACOR_IGNORE = [
@@ -76,18 +62,73 @@ def timestamp():
     return f"[{datetime.datetime.now().astimezone(zone).replace(microsecond=0).isoformat()}]"
 
 
-def job_check(task):
-    @wraps(task)
-    def inner(self, *args, **kwargs):
-        if len(args) > 0 and isinstance(args[0], dict) and args[0].get("job_id"):
-            job = Job().load(args[0]["job_id"], force=True)
-            if job["status"] != JobStatus.RUNNING:
-                if self.request.chain:
-                    self.request.chain = None
-                return {"job_id": str(args[0]["job_id"])}
-        return task(self, *args, **kwargs)
+def report(api, job_id, message, status=JobStatus.RUNNING):
+    """Append a timestamped line to the submission's Girder job log."""
+    api.update_job(job_id, log=f"{timestamp()} {message}\n", status=status)
 
-    return inner
+
+def report_failure(api, job_id, failure, exc):
+    """Mark the job failed, without letting that replace ``exc``.
+
+    Reporting is itself a REST call and has its own ways to fail -- most
+    routinely, a job the user cancelled rejects the transition to ERROR. The
+    original exception is the one worth propagating.
+    """
+    try:
+        report(api, job_id, f"{failure}: \n\t{exc}", status=JobStatus.ERROR)
+    except Exception:
+        logger.exception("Could not mark job %s as failed", job_id)
+
+
+def discard_workspace(submission):
+    """Delete the scratch directories of a submission that will not continue.
+
+    While the worker shared Girder's database this was a side effect of the
+    ``jobs.job.update.after`` handler. That handler now runs on the server,
+    which cannot see these paths, so every exit from the pipeline has to do it
+    itself.
+    """
+    for key in ("tmp_dir", "workspace_dir"):
+        if path := submission.get(key):
+            shutil.rmtree(path, ignore_errors=True)
+
+
+def submission_task(failure):
+    """Wrap a pipeline step in its Girder job bookkeeping.
+
+    Each step used to open with a job lookup and close with a near-identical
+    ``except`` clause that logged ``failure`` and re-raised. Doing it once here
+    also gives the two exits from a submission -- a job that is no longer
+    running, and a step that raised -- a single place to drop the workspace.
+
+    The wrapped function is called as ``func(task, api, submission, ...)``.
+    """
+
+    def decorator(func):
+        @wraps(func)
+        def inner(task, submission, *args, **kwargs):
+            api = GirderApi.for_task(task)
+            job_id = submission["job_id"]
+            if api.job(job_id)["status"] != JobStatus.RUNNING:
+                return abandon(task, submission)
+            try:
+                return func(task, api, submission, *args, **kwargs)
+            except Exception as exc:
+                report_failure(api, job_id, failure, exc)
+                discard_workspace(submission)
+                raise
+
+        return inner
+
+    return decorator
+
+
+def abandon(task, submission):
+    """Drop the rest of the chain and clean up after a cancelled submission."""
+    if task.request.chain:
+        task.request.chain = None
+    discard_workspace(submission)
+    return {"job_id": str(submission["job_id"])}
 
 
 def safe_tar_extract(tar, path):
@@ -103,42 +144,30 @@ def safe_tar_extract(tar, path):
     tar.extractall(root, members=tar.getmembers(), filter="data")
 
 
-def _create_submission_folder(user):
+def _create_submission_folder(api, user_id):
     # Logic to create submission directory based on fileId and image_tag
-    admin = User().findOne({"admin": True})
-    root_collection = Collection().createCollection(
-        Setting().get(PluginSettings.SUBMISSION_COLLECTION_NAME),
-        creator=admin,
-        public=True,
-        reuseExisting=True,
+    settings = api.settings(
+        [
+            PluginSettings.SUBMISSION_COLLECTION_NAME,
+            PluginSettings.EDITORS_GROUP_NAME,
+        ]
     )
-    editors_group_name = Setting().get(PluginSettings.EDITORS_GROUP_NAME)
-    editors_group = Group().findOne({"name": editors_group_name})
-    if editors_group is None:
-        editors_group = Group().createGroup(editors_group_name, admin, public=True)
+    root_collection = api.find_or_create_collection(
+        settings[PluginSettings.SUBMISSION_COLLECTION_NAME]
+    )
+    editors_group = api.find_or_create_group(
+        settings[PluginSettings.EDITORS_GROUP_NAME]
+    )
+    api.grant_group_access(
+        root_collection["_id"], editors_group["_id"], AccessType.READ
+    )
 
-    Collection().setGroupAccess(
-        root_collection, editors_group, AccessType.READ, save=True, currentUser=admin
+    submission_folder = api.create_folder(
+        root_collection["_id"], randomname.get_name(), public=False
     )
-
-    submission_folder = Folder().createFolder(
-        root_collection,
-        randomname.get_name(),
-        parentType="collection",
-        public=False,
-        creator=admin,
-        reuseExisting=False,
-    )
-    submission_folder = Folder().setMetadata(
-        submission_folder,
-        {"creator_id": str(user["_id"])},
-    )
-    return Folder().setUserAccess(
-        submission_folder,
-        user,
-        AccessType.READ,
-        save=True,
-    )
+    api.set_folder_metadata(submission_folder["_id"], {"creator_id": str(user_id)})
+    api.grant_user_access(submission_folder["_id"], user_id, AccessType.READ)
+    return submission_folder
 
 
 def _matlab_perms(target_path, uid=1001):
@@ -196,89 +225,68 @@ def _matlab_perms(target_path, uid=1001):
             raise
 
 
-@app.task(queue="local", bind=True)
-@job_check
+@app.task(queue=DISPATCH_QUEUE, bind=True)
 def prepare_submission(task, userId, fileId, stages, job_id):
     # Create a submission directory
-    job = Job().load(job_id, force=True)
+    api = GirderApi.for_task(task)
+    # Every later step works out of a directory on this machine, so claim the
+    # rest of the chain for this worker before doing anything else.
+    queue = worker_queue(task)
+    pin_chain(task, queue)
     try:
-        user = User().load(userId, force=True)
-        submission_folder = _create_submission_folder(user)
+        submission_folder = _create_submission_folder(api, userId)
         # Move file to the submission directory
-        fobj = File().load(fileId, user=user, level=AccessType.READ)
-        annotate_item_type(fobj, "submission_file")
-        item = Item().load(fobj["itemId"], user=user, level=AccessType.READ)
-        Item().move(item, submission_folder)
-        Folder().setMetadata(
-            submission_folder,
+        fobj = api.file(fileId)
+        api.annotate_item_type(fobj, "submission_file")
+        api.move_item(fobj["itemId"], submission_folder["_id"])
+        api.set_folder_metadata(
+            submission_folder["_id"],
             {
                 "stages": stages,
                 "status": "submitted",
-                "job_id": str(job["_id"]),
+                "job_id": str(job_id),
             },
         )
-        Job().updateJob(
-            job,
-            f"{timestamp()} New submission: '"
-            + submission_folder["name"]
-            + "' created.\n",
-            status=JobStatus.RUNNING,
-        )
+        report(api, job_id, f"New submission: '{submission_folder['name']}' created.")
         return {
             "folder_id": str(submission_folder["_id"]),
             "file_id": str(fobj["_id"]),
             "job_id": str(job_id),
             "stages": stages,
+            "queue": queue,
         }
     except Exception as exc:
-        Job().updateJob(
-            job,
-            f"{timestamp()} Failed to prepare submission: \n\t" + str(exc) + "\n",
-            status=JobStatus.ERROR,
-        )
-        raise exc
-    return {
-        "folder_id": None,
-        "file_id": None,
-        "stages": None,
-        "job_id": str(job_id),
-    }
+        report_failure(api, job_id, "Failed to prepare submission", exc)
+        raise
 
 
-@app.task(queue="local", bind=True)
-@job_check
-def create_workspace(task, submission):
-    job = Job().load(submission["job_id"], force=True)
-    job = Job().updateJob(
-        job,
-        f"{timestamp()} Creating workspace from source folder.\n",
-        status=JobStatus.RUNNING,
-    )
+@app.task(queue=DISPATCH_QUEUE, bind=True)
+@submission_task("Failed to create workspace")
+def create_workspace(task, api, submission):
+    report(api, submission["job_id"], "Creating workspace from source folder.")
 
+    submission["tmp_dir"] = f"/tmp/tmp-{submission['folder_id']}"
+    os.makedirs(submission["tmp_dir"], exist_ok=False)
+    # add sticky bit to tmp_dir
+    os.chmod(submission["tmp_dir"], 0o1777)
+
+    workspace_dir = f"/tmp/workspace-{submission['folder_id']}"
+    submission["workspace_dir"] = workspace_dir
+    project_dir = get_project_dir(submission)
+    os.makedirs(project_dir, exist_ok=False)
+    # Give read/write/execute permissions to myself
+    _matlab_perms(project_dir, uid=os.getuid())
+    # Give read/write/execute permissions to Matlab user
+    _matlab_perms(project_dir, uid=1001)
+    # Ensure R library directory for user install.packages exists
+    for stage in submission.get("stages", []):
+        if stage["image_name"].startswith("rocker/"):
+            os.makedirs(os.path.join(workspace_dir, "R", "library"), exist_ok=True)
+
+    fobj = api.file(submission["file_id"])
+    temp_filename = os.path.join(workspace_dir, fobj["name"])
     try:
-        submission["tmp_dir"] = f"/tmp/tmp-{submission['folder_id']}"
-        os.makedirs(submission["tmp_dir"], exist_ok=False)
-        # add sticky bit to tmp_dir
-        os.chmod(submission["tmp_dir"], 0o1777)
-
-        workspace_dir = f"/tmp/workspace-{submission['folder_id']}"
-        submission["workspace_dir"] = workspace_dir
-        project_dir = get_project_dir(submission)
-        os.makedirs(project_dir, exist_ok=False)
-        # Give read/write/execute permissions to myself
-        _matlab_perms(project_dir, uid=os.getuid())
-        # Give read/write/execute permissions to Matlab user
-        _matlab_perms(project_dir, uid=1001)
-        # Ensure R library directory for user install.packages exists
-        for stage in submission.get("stages", []):
-            if stage["image_name"].startswith("rocker/"):
-                os.makedirs(os.path.join(workspace_dir, "R", "library"), exist_ok=True)
-
-        fobj = File().load(submission["file_id"], force=True)
-        temp_filename = os.path.join(workspace_dir, fobj["name"])
-        with File().open(fobj) as f:
-            with open(temp_filename, "wb") as out_f:
-                _dump_from_fileobj(f, out_f)
+        api.download_file(fobj["_id"], temp_filename)
         # File is either a zip or tar archive; extract accordingly
         extracted = False
         try:
@@ -299,17 +307,10 @@ def create_workspace(task, submission):
         except tarfile.TarError as e:
             print(f"Not a tar file either... Reason: {e}")
             raise ValueError("Unsupported file format for workspace creation.")
+    finally:
+        if os.path.exists(temp_filename):
+            os.remove(temp_filename)
 
-    except Exception as exc:
-        os.remove(temp_filename)
-        Job().updateJob(
-            job,
-            f"{timestamp()} Failed to create workspace: \n\t" + str(exc) + "\n",
-            status=JobStatus.ERROR,
-        )
-        raise exc
-
-    os.remove(temp_filename)
     return submission
 
 
@@ -319,14 +320,13 @@ def skip_condition(condition, submission):
     return False
 
 
-@app.task(queue="local", bind=True)
-@job_check
-def run_tro(task, submission, action, inumber, condition):
-    job = Job().load(submission["job_id"], force=True)
-    job = Job().updateJob(
-        job,
-        f"{timestamp()} Running TRO utilities in the workspace. ({action})\n",
-        status=JobStatus.RUNNING,
+@app.task(queue=DISPATCH_QUEUE, bind=True)
+@submission_task("Failed to run TRO utilities")
+def run_tro(task, api, submission, action, inumber, condition):
+    report(
+        api,
+        submission["job_id"],
+        f"Running TRO utilities in the workspace. ({action})",
     )
     if skip_condition(condition, submission):
         logger.info(
@@ -334,200 +334,167 @@ def run_tro(task, submission, action, inumber, condition):
             f"due to condition '{condition}'."
         )
         return submission
-    try:
-        admin = User().findOne({"admin": True})
-        submission_folder = Folder().load(submission["folder_id"], force=True)
-        tro_file = f"/tmp/tro-{submission['job_id']}.jsonld"
-        tro_obj = None
-        if submission.get("troId") is not None:
-            tro_obj = File().load(submission["troId"], force=True)
-            with File().open(tro_obj) as f:
-                with open(tro_file, "wb") as out_f:
-                    _dump_from_fileobj(f, out_f)
 
-        with tempfile.NamedTemporaryFile(delete=True) as profile:
-            trs_profile = Setting().get(PluginSettings.TRO_PROFILE)
-            trs_profile["sivacor:stackVersion"] = version("girder_sivacor")
-            profile.write(json.dumps(trs_profile).encode())
-            profile.seek(0)
-            tro = TRO(
-                filepath=tro_file,
-                gpg_fingerprint=Setting().get(PluginSettings.TRO_GPG_FINGERPRINT),
-                gpg_passphrase=Setting().get(PluginSettings.TRO_GPG_PASSPHRASE),
-                profile=profile.name,
-                extra_context={"sivacor": "https://vocabulary.sivacor.org/0.1/"},
-                tro_creator="SIVACOR/tro_utils",
-                tro_name=submission_folder["name"],
-                tro_description="SIVACOR Run",
-            )
-
-        meta = {}
-        project_dir = get_project_dir(submission)
-        if action == "add_arrangement":
-            arrangements = tro.list_arrangements()
-            if not arrangements:
-                tro.add_arrangement(
-                    project_dir,
-                    comment="Before executing workflow",
-                    ignore_dirs=IGNORE_DIRS,
-                )
-            else:
-                tro.add_arrangement(
-                    project_dir,
-                    comment=f"After executing workflow step {inumber}",
-                    ignore_dirs=IGNORE_DIRS,
-                    resolve_symlinks=False,
-                )
-        elif action == "prune_performance":
-            runs = submission.get("runs", [])
-            run = runs[-1] if runs else {}
-            tro.add_performance(
-                datetime.datetime.fromisoformat(run["run_start_time"]),
-                datetime.datetime.fromisoformat(run["run_end_time"]),
-                comment="SIVACOR Workspace pruning step",
-                accessed_arrangement=(f"arrangement/{inumber}", "/workspace"),
-                modified_arrangement=(f"arrangement/{inumber + 1}", "/workspace"),
-                attrs=run.get("run_attrs", []),
-            )
-        elif action == "add_performance":
-            stages = submission.get("stages", [])
-            main_file = stages[inumber].get("main_file", "unknown")
-            runs = submission.get("runs", [])
-            run = runs[-1] if runs else {}
-            extra_attributes = None
-            for item in Folder().childItems(
-                submission_folder,
-                filters={"name": f"performance_data_stage_{inumber + 1}.json"},
-                limit=1,
-            ):
-                with Item().childFiles(item) as files:
-                    for fobj in files:
-                        with File().open(fobj) as f:
-                            extra_attributes = json.load(f)
-
-            if extra_attributes:
-                extra_attributes = {
-                    f"sivacor:{key}": value
-                    for key, value in extra_attributes.items()
-                    if ":" not in key
-                }
-
-            tro.add_performance(
-                datetime.datetime.fromisoformat(run["run_start_time"]),
-                datetime.datetime.fromisoformat(run["run_end_time"]),
-                comment=f"SIVACOR workflow execution ({main_file}) step {inumber + 1}",
-                accessed_arrangement=(f"arrangement/{inumber}", "/workspace"),
-                modified_arrangement=(f"arrangement/{inumber + 1}", "/workspace"),
-                attrs=run.get("run_attrs", []),
-                extra_attributes=extra_attributes,
-            )
-        elif action == "sign":
-            tro.request_timestamp()
-
-            for meta_key, filename, nice_name in zip(
-                ("sig_file_id", "tsr_file_id"),
-                (tro.sig_filename, tro.tsr_filename),
-                ("tro_signature", "tro_timestamp"),
-            ):
-                with open(filename, "rb") as f:
-                    fobj = Upload().uploadFromFile(
-                        f,
-                        os.path.getsize(filename),
-                        os.path.basename(filename),
-                        parentType="folder",
-                        parent=submission_folder,
-                        user=admin,
-                        mimeType="text/plain",
-                    )
-                    annotate_item_type(fobj, nice_name)
-                    meta[meta_key] = str(fobj["_id"])
-                os.remove(filename)
-
-        tro.save()
-        if tro_obj:
-            _update_file_from_path(tro_obj, tro.tro_filename, admin)
-        else:
-            tro_obj = Upload().uploadFromFile(
-                open(tro.tro_filename, "rb"),
-                os.path.getsize(tro.tro_filename),
-                os.path.basename(tro.tro_filename),
-                parentType="folder",
-                parent=submission_folder,
-                user=admin,
-                mimeType="application/ld+json",
-            )
-            annotate_item_type(tro_obj, "tro_declaration")
-            submission["troId"] = str(tro_obj["_id"])
-        os.remove(tro.tro_filename)
-        meta["tro_file_id"] = str(tro_obj["_id"])
-        Folder().setMetadata(submission_folder, meta)
-    except Exception as exc:
-        Job().updateJob(
-            job,
-            f"{timestamp()} Failed to run TRO utilities: \n\t" + str(exc) + "\n",
-            status=JobStatus.ERROR,
-        )
-        raise exc
-
-    return submission
-
-
-@app.task(queue="local", bind=True)
-@job_check
-def execute_workflow(task, submission, stage, env_vars):
-    job = Job().load(submission["job_id"], force=True)
-    job = Job().updateJob(
-        job,
-        f"{timestamp()} Executing workflow on workspace.\n",
-        status=JobStatus.RUNNING,
-    )
-    try:
-        # Placeholder for actual workflow execution logic
-
-        start_time = datetime.datetime.now()
-        ret = recorded_run(submission, stage, env_vars, task=task)
-        if ret["StatusCode"] == -123:
-            print("Termination requested, stopping execution.")
-            if task.request.chain:
-                task.request.chain = None
-            return {"job_id": submission["job_id"]}
-
-        if ret["StatusCode"] != 0:
-            raise RuntimeError(
-                f"Workflow execution failed with code {ret['StatusCode']}"
-            )
-        end_time = datetime.datetime.now()
-
-        if submission.get("runs") is None:
-            submission["runs"] = []
-        attrs = [
-            TRPAttribute.ENV_ISOLATION.value,
-            TRPAttribute.NON_INTERACTIVE.value,
-            TRPAttribute.MACHINE_ENFORCEMENT.value,
+    folder_id = submission["folder_id"]
+    submission_folder = api.folder(folder_id)
+    settings = api.settings(
+        [
+            PluginSettings.TRO_PROFILE,
+            PluginSettings.TRO_GPG_FINGERPRINT,
+            PluginSettings.TRO_GPG_PASSPHRASE,
         ]
-        if stage.get("network_isolation", False):
-            attrs.append(TRPAttribute.NET_ISOLATION.value)
-        submission["runs"].append(
-            {
-                "run_start_time": start_time.isoformat(),
-                "run_end_time": end_time.isoformat(),
-                "run_attrs": attrs,
-            }
+    )
+
+    tro_file = f"/tmp/tro-{submission['job_id']}.jsonld"
+    tro_obj = None
+    if submission.get("troId") is not None:
+        tro_obj = api.file(submission["troId"])
+        api.download_file(tro_obj["_id"], tro_file)
+
+    with tempfile.NamedTemporaryFile(delete=True) as profile:
+        trs_profile = settings[PluginSettings.TRO_PROFILE]
+        trs_profile["sivacor:stackVersion"] = version("girder_sivacor")
+        profile.write(json.dumps(trs_profile).encode())
+        profile.seek(0)
+        tro = TRO(
+            filepath=tro_file,
+            gpg_fingerprint=settings[PluginSettings.TRO_GPG_FINGERPRINT],
+            gpg_passphrase=settings[PluginSettings.TRO_GPG_PASSPHRASE],
+            profile=profile.name,
+            extra_context={"sivacor": "https://vocabulary.sivacor.org/0.1/"},
+            tro_creator="SIVACOR/tro_utils",
+            tro_name=submission_folder["name"],
+            tro_description="SIVACOR Run",
         )
-    except Exception as exc:
-        Job().updateJob(
-            job,
-            f"{timestamp()} Failed to execute workflow: \n\t" + str(exc) + "\n",
-            status=JobStatus.ERROR,
+
+    meta = {}
+    project_dir = get_project_dir(submission)
+    if action == "add_arrangement":
+        arrangements = tro.list_arrangements()
+        if not arrangements:
+            tro.add_arrangement(
+                project_dir,
+                comment="Before executing workflow",
+                ignore_dirs=IGNORE_DIRS,
+            )
+        else:
+            tro.add_arrangement(
+                project_dir,
+                comment=f"After executing workflow step {inumber}",
+                ignore_dirs=IGNORE_DIRS,
+                resolve_symlinks=False,
+            )
+    elif action == "prune_performance":
+        runs = submission.get("runs", [])
+        run = runs[-1] if runs else {}
+        tro.add_performance(
+            datetime.datetime.fromisoformat(run["run_start_time"]),
+            datetime.datetime.fromisoformat(run["run_end_time"]),
+            comment="SIVACOR Workspace pruning step",
+            accessed_arrangement=(f"arrangement/{inumber}", "/workspace"),
+            modified_arrangement=(f"arrangement/{inumber + 1}", "/workspace"),
+            attrs=run.get("run_attrs", []),
         )
-        raise exc
+    elif action == "add_performance":
+        stages = submission.get("stages", [])
+        main_file = stages[inumber].get("main_file", "unknown")
+        runs = submission.get("runs", [])
+        run = runs[-1] if runs else {}
+        extra_attributes = _performance_attributes(api, folder_id, inumber + 1)
+
+        tro.add_performance(
+            datetime.datetime.fromisoformat(run["run_start_time"]),
+            datetime.datetime.fromisoformat(run["run_end_time"]),
+            comment=f"SIVACOR workflow execution ({main_file}) step {inumber + 1}",
+            accessed_arrangement=(f"arrangement/{inumber}", "/workspace"),
+            modified_arrangement=(f"arrangement/{inumber + 1}", "/workspace"),
+            attrs=run.get("run_attrs", []),
+            extra_attributes=extra_attributes,
+        )
+    elif action == "sign":
+        tro.request_timestamp()
+
+        for meta_key, filename, nice_name in zip(
+            ("sig_file_id", "tsr_file_id"),
+            (tro.sig_filename, tro.tsr_filename),
+            ("tro_signature", "tro_timestamp"),
+        ):
+            fobj = api.upload_file(
+                folder_id, filename, mime_type="text/plain", item_type=nice_name
+            )
+            meta[meta_key] = str(fobj["_id"])
+            os.remove(filename)
+
+    tro.save()
+    if tro_obj:
+        api.replace_file(tro_obj["_id"], tro.tro_filename)
+    else:
+        tro_obj = api.upload_file(
+            folder_id,
+            tro.tro_filename,
+            mime_type="application/ld+json",
+            item_type="tro_declaration",
+        )
+        submission["troId"] = str(tro_obj["_id"])
+    os.remove(tro.tro_filename)
+    meta["tro_file_id"] = str(tro_obj["_id"])
+    api.set_folder_metadata(folder_id, meta)
 
     return submission
 
 
-@app.task(queue="local", bind=True)
-@job_check
-def prune_workspace(task, submission):
+def _performance_attributes(api, folder_id, stage_num):
+    """Read back the performance data recorded_run uploaded for a stage."""
+    item = api.find_child_item(folder_id, f"performance_data_stage_{stage_num}.json")
+    if not item:
+        return None
+    files = api.item_files(item["_id"])
+    if not files:
+        return None
+    data = json.loads(b"".join(api.file_chunks(files[0]["_id"])))
+    # Namespace the bare keys; anything already prefixed is left alone.
+    return {f"sivacor:{key}": value for key, value in data.items() if ":" not in key}
+
+
+@app.task(queue=DISPATCH_QUEUE, bind=True)
+@submission_task("Failed to execute workflow")
+def execute_workflow(task, api, submission, stage, env_vars):
+    report(api, submission["job_id"], "Executing workflow on workspace.")
+
+    # Placeholder for actual workflow execution logic
+    start_time = datetime.datetime.now()
+    ret = recorded_run(api, submission, stage, env_vars, task=task)
+    if ret["StatusCode"] == -123:
+        print("Termination requested, stopping execution.")
+        return abandon(task, submission)
+
+    if ret["StatusCode"] != 0:
+        raise RuntimeError(f"Workflow execution failed with code {ret['StatusCode']}")
+    end_time = datetime.datetime.now()
+
+    if submission.get("runs") is None:
+        submission["runs"] = []
+    attrs = [
+        TRPAttribute.ENV_ISOLATION.value,
+        TRPAttribute.NON_INTERACTIVE.value,
+        TRPAttribute.MACHINE_ENFORCEMENT.value,
+    ]
+    if stage.get("network_isolation", False):
+        attrs.append(TRPAttribute.NET_ISOLATION.value)
+    submission["runs"].append(
+        {
+            "run_start_time": start_time.isoformat(),
+            "run_end_time": end_time.isoformat(),
+            "run_attrs": attrs,
+        }
+    )
+
+    return submission
+
+
+@app.task(queue=DISPATCH_QUEUE, bind=True)
+@submission_task("Failed to prune workspace")
+def prune_workspace(task, api, submission):
     logger.info(f"Pruning workspace for submission {submission['folder_id']}")
     start_time = datetime.datetime.now()
     project_dir = pathlib.Path(get_project_dir(submission))
@@ -588,103 +555,75 @@ def prune_workspace(task, submission):
     return submission
 
 
-@app.task(queue="local", bind=True)
-@job_check
-def upload_workspace(task, submission):
+@app.task(queue=DISPATCH_QUEUE, bind=True)
+@submission_task("Failed to upload executed replication package")
+def upload_workspace(task, api, submission):
     # Upload the modified workspace back to Girder as a zip file
     # called 'executed_replication_package.zip'
-    job = Job().load(submission["job_id"], force=True)
-    job = Job().updateJob(
-        job,
-        f"{timestamp()} Uploading executed replication package to Girder.\n",
-        status=JobStatus.RUNNING,
+    report(
+        api,
+        submission["job_id"],
+        "Uploading executed replication package to Girder.",
     )
-    try:
-        admin = User().findOne({"admin": True})
-        submission_folder = Folder().load(submission["folder_id"], force=True)
 
-        submission_fobj = File().load(submission["file_id"], force=True)
-        zip_basename = (
-            pathlib.Path(submission_fobj["name"]).stem + f"-{submission['job_id']}.zip"
-        )
-        project_dir = get_project_dir(submission)
+    folder_id = submission["folder_id"]
+    folder_meta = api.folder(folder_id).get("meta", {})
 
-        zip_path = os.path.join(submission["workspace_dir"], zip_basename)
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-            for root, dirs, files in os.walk(project_dir):
-                # ignore contents of dirs from IGNORE_DIRS
-                dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
-                for file in files:
-                    if file == zip_basename:
-                        continue
-                    file_path = os.path.join(root, file)
-                    arcname = os.path.relpath(file_path, submission["workspace_dir"])
-                    if os.path.islink(file_path):
-                        zip_symlink(zipf, file_path, arcname=arcname)
-                    else:
-                        zipf.write(file_path, arcname)
+    submission_fobj = api.file(submission["file_id"])
+    zip_basename = (
+        pathlib.Path(submission_fobj["name"]).stem + f"-{submission['job_id']}.zip"
+    )
+    project_dir = get_project_dir(submission)
 
-            # Store TRO files in a separate 'tro/' directory within the zip
-            for key in ("tro_file_id", "sig_file_id", "tsr_file_id"):
-                if fobj := File().load(
-                    submission_folder.get("meta", {}).get(key), force=True
-                ):
-                    with File().open(fobj) as fp:  # TODO: use _dump_from_fileobj?
-                        _dump_from_fileobj(
-                            fp, zipf, is_zip=True, arcname="tro/" + fobj["name"]
-                        )
+    zip_path = os.path.join(submission["workspace_dir"], zip_basename)
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for root, dirs, files in os.walk(project_dir):
+            # ignore contents of dirs from IGNORE_DIRS
+            dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+            for file in files:
+                if file == zip_basename:
+                    continue
+                file_path = os.path.join(root, file)
+                arcname = os.path.relpath(file_path, submission["workspace_dir"])
+                if os.path.islink(file_path):
+                    zip_symlink(zipf, file_path, arcname=arcname)
+                else:
+                    zipf.write(file_path, arcname)
 
-            for ext in (".jsonld", ".sig", ".tsr"):
-                basename = f"tro-{submission['job_id']}.{ext}"
-                tro_file_path = os.path.join("/tmp", basename)
-                arcname = "tro/" + basename
-                if os.path.exists(tro_file_path):
-                    zipf.write(tro_file_path, arcname)
+        # Store TRO files in a separate 'tro/' directory within the zip
+        for key in ("tro_file_id", "sig_file_id", "tsr_file_id"):
+            if fobj := api.file(folder_meta.get(key)):
+                dump_to_zip(
+                    api.file_chunks(fobj["_id"]), zipf, "tro/" + fobj["name"]
+                )
 
-            # Store stdout and stderr logs
-            for key in ("stderr_file_id", "stdout_file_id"):
-                if fobj := File().load(
-                    submission_folder.get("meta", {}).get(key), force=True
-                ):
-                    with File().open(fobj) as fp:
-                        _dump_from_fileobj(fp, zipf, is_zip=True)
+        # Store stdout and stderr logs
+        for key in ("stderr_file_id", "stdout_file_id"):
+            if fobj := api.file(folder_meta.get(key)):
+                dump_to_zip(api.file_chunks(fobj["_id"]), zipf, fobj["name"])
 
-        with open(zip_path, "rb") as f:
-            fobj = Upload().uploadFromFile(
-                f,
-                os.path.getsize(zip_path),
-                zip_basename,
-                parentType="folder",
-                parent=submission_folder,
-                user=admin,
-                mimeType="application/zip",
-            )
-            annotate_item_type(fobj, "replicated_package")
-        os.remove(zip_path)
-        Folder().setMetadata(submission_folder, {"replpack_file_id": str(fobj["_id"])})
-        submission["replpack_file_id"] = str(fobj["_id"])
-    except Exception as exc:
-        Job().updateJob(
-            job,
-            f"{timestamp()} Failed to upload executed replication package: \n\t"
-            + str(exc)
-            + "\n",
-            status=JobStatus.ERROR,
-        )
-        raise exc
+    fobj = api.upload_file(
+        folder_id,
+        zip_path,
+        mime_type="application/zip",
+        item_type="replicated_package",
+    )
+    os.remove(zip_path)
+    api.set_folder_metadata(folder_id, {"replpack_file_id": str(fobj["_id"])})
+    submission["replpack_file_id"] = str(fobj["_id"])
 
     return submission
 
 
-@app.task(queue="local")
-def finalize_job(submission):
-    shutil.rmtree(submission["tmp_dir"], ignore_errors=True)
-    shutil.rmtree(submission["workspace_dir"], ignore_errors=True)
-    job = Job().load(submission["job_id"], force=True)
-    if job["status"] == JobStatus.RUNNING:
-        job = Job().updateJob(
-            job,
-            f"{timestamp()} Submission job finalized successfully.\n",
+@app.task(queue=DISPATCH_QUEUE, bind=True)
+def finalize_job(task, submission):
+    api = GirderApi.for_task(task)
+    discard_workspace(submission)
+    if api.job(submission["job_id"])["status"] == JobStatus.RUNNING:
+        report(
+            api,
+            submission["job_id"],
+            "Submission job finalized successfully.",
             status=JobStatus.SUCCESS,
         )
     return submission
@@ -699,26 +638,21 @@ def setup_periodic_tasks(sender, **kwargs):
     )
 
 
-@app.task
+@app.task(queue=DISPATCH_QUEUE)
 def cleanup_submissions():
-    root_collection = Collection().findOne(
-        {"name": Setting().get(PluginSettings.SUBMISSION_COLLECTION_NAME)}
-    )
-    if not root_collection:
-        return
+    """Trigger the retention sweep.
 
-    admin = User().findOne({"admin": True})
-    cutoff_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
-        days=Setting().get(PluginSettings.RETENTION_DAYS)
-    )
-    for folder in Folder().childFolders(root_collection, "collection", user=admin):
-        if folder["created"] > cutoff_time:
-            continue
-        if job_id := folder.get("meta", {}).get("job_id"):
-            main_job = Job().load(job_id, force=True)
-            Job().remove(main_job)
-            Job().collection.delete_many({"args.0.job_id": job_id})
+    The sweep itself runs on the Girder server: it removes jobs by query, which
+    has no REST equivalent. A periodic task has no submission to inherit a
+    token from, so this needs a standing credential and quietly does nothing
+    without one.
+    """
+    api_url = os.environ.get("GIRDER_API_URL")
+    api_key = os.environ.get("GIRDER_API_KEY")
+    if not (api_url and api_key):
         logger.info(
-            f"Cleaning up submission folder {folder['_id']} created at {folder['created']}"
+            "Skipping submission retention sweep: set GIRDER_API_URL and "
+            "GIRDER_API_KEY on a worker to enable it."
         )
-        Folder().remove(folder)
+        return
+    GirderApi(api_url, api_key=api_key).client.post("sivacor/cleanup")

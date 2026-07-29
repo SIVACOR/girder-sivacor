@@ -20,12 +20,9 @@ from girder_oauth.providers import addProvider
 from girder_oauth.settings import PluginSettings as OAuthSettings
 
 from .auth.orcid import ORCID
+from .notifications import _createMessage, _sendmail, set_submission_status
 from .rest import SIVACOR, get_submission_child_jobs
 from .settings import PluginSettings
-from .worker_plugin import (
-    _createMessage,
-    _sendmail
-)
 
 logger = logging.getLogger(__name__)
 
@@ -270,6 +267,9 @@ class SIVACORPlugin(GirderPlugin):
         info["apiRoot"].sivacor = SIVACOR()
         getPlugin("jobs").load(info)
         events.bind("jobs.cancel", "sivacor", cancel_jobs)
+        # Workers report progress over REST, so this fires here rather than in
+        # the worker process as it used to.
+        events.bind("jobs.job.update.after", "sivacor", set_submission_status)
         info["apiRoot"].job.route("GET", (":id", "children"), get_submission_child_jobs)
 
         FolderResource.find.description.param(

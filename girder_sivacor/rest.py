@@ -1,5 +1,6 @@
 import datetime
 import json
+import logging
 import os
 
 import requests
@@ -13,13 +14,16 @@ from girder.models.collection import Collection
 from girder.models.file import File
 from girder.models.folder import Folder
 from girder.models.setting import Setting
+from girder.models.token import Token
 from girder.models.user import User
 from girder_jobs.constants import JobStatus
 from girder_jobs.models.job import Job
+from girder_plugin_worker.utils import getWorkerApiUrl
 from zoneinfo import ZoneInfo
 
 from .settings import PluginSettings
 from .utils import encrypt_job_secrets
+from .worker_plugin.routing import DISPATCH_QUEUE
 from .worker_plugin.run_submission import (
     create_workspace,
     execute_workflow,
@@ -29,6 +33,12 @@ from .worker_plugin.run_submission import (
     run_tro,
     upload_workspace,
 )
+
+logger = logging.getLogger(__name__)
+
+#: How long the token handed to the worker stays valid. It has to outlive the
+#: longest replication run, but it grants admin access, so not by much.
+WORKER_TOKEN_DAYS = 7
 
 stage_schema = {
     "$schema": "http://json-schema.org/draft-04/schema#",
@@ -77,6 +87,7 @@ class SIVACOR(Resource):
         super(SIVACOR, self).__init__()
         self.resourceName = "sivacor"
         self.route("POST", ("submit_job",), self.submit_job)
+        self.route("POST", ("cleanup",), self.cleanup_submissions)
         self.route("GET", ("image_tags",), self.get_image_tags)
         self.route("DELETE", ("submission", ":id"), self.delete_submission)
 
@@ -141,44 +152,62 @@ class SIVACOR(Resource):
             job, f"{timestamp} Preparing SIVACOR submission\n", status=JobStatus.RUNNING
         )
 
-        workflow = prepare_submission.s(
-            str(user["_id"]),
-            str(file["_id"]),
-            stages,
-            str(job["_id"]),
-        ).set(
-            girder_job_title=f"Moving {file['name']} to submission collection",
+        # The worker has no database of its own; it reaches back over REST as
+        # an administrator. girder_worker copies these headers from a running
+        # task onto the next one it publishes, but the chain is built here, so
+        # set them on every step rather than relying on that.
+        admin = User().findOne({"admin": True})
+        worker_token = str(
+            Token().createToken(user=admin, days=WORKER_TOKEN_DAYS)["_id"]
         )
-        workflow |= create_workspace.s().set(girder_job_title="Create Workspace")
-        workflow |= run_tro.s("add_arrangement", 0, None).set(
-            girder_job_title="Record initial arrangement"
+        api_url = getWorkerApiUrl()
+
+        def step(signature, title):
+            return signature.set(
+                girder_job_title=title,
+                girder_api_url=api_url,
+                girder_client_token=worker_token,
+            )
+
+        workflow = step(
+            prepare_submission.s(
+                str(user["_id"]),
+                str(file["_id"]),
+                stages,
+                str(job["_id"]),
+            ),
+            f"Moving {file['name']} to submission collection",
+        )
+        workflow |= step(create_workspace.s(), "Create Workspace")
+        workflow |= step(
+            run_tro.s("add_arrangement", 0, None), "Record initial arrangement"
         )
         for i, stage in enumerate(stages):
-            workflow |= execute_workflow.s(stage, env_secrets).set(
-                girder_job_title="Execute SIVACOR Workflow"
+            workflow |= step(
+                execute_workflow.s(stage, env_secrets), "Execute SIVACOR Workflow"
             )
-            workflow |= run_tro.s("add_arrangement", i + 1, None).set(
-                girder_job_title="Record final arrangement"
+            workflow |= step(
+                run_tro.s("add_arrangement", i + 1, None), "Record final arrangement"
             )
-            workflow |= run_tro.s("add_performance", i, None).set(
-                girder_job_title="Record user workflow TRP"
+            workflow |= step(
+                run_tro.s("add_performance", i, None), "Record user workflow TRP"
             )
-        workflow |= prune_workspace.s().set(girder_job_title="Prune Workspace")
-        workflow |= run_tro.s("add_arrangement", len(stages) + 1, "is_pruned").set(
-            girder_job_title="Record final pruned arrangement"
+        workflow |= step(prune_workspace.s(), "Prune Workspace")
+        workflow |= step(
+            run_tro.s("add_arrangement", len(stages) + 1, "is_pruned"),
+            "Record final pruned arrangement",
         )
-        workflow |= run_tro.s("prune_performance", len(stages), "is_pruned").set(
-            girder_job_title="Record workspace prune TRP"
+        workflow |= step(
+            run_tro.s("prune_performance", len(stages), "is_pruned"),
+            "Record workspace prune TRP",
         )
-        workflow |= run_tro.s("sign", 0, None).set(girder_job_title="Sign TRO")
-        workflow |= upload_workspace.s().set(
-            girder_job_title="Upload Replicated Package"
-        )
-        workflow |= finalize_job.s().set(girder_job_title="Finalize Job Submission")
+        workflow |= step(run_tro.s("sign", 0, None), "Sign TRO")
+        workflow |= step(upload_workspace.s(), "Upload Replicated Package")
+        workflow |= step(finalize_job.s(), "Finalize Job Submission")
         try:
-            workflow.apply_async(queue="local")
+            workflow.apply_async(queue=DISPATCH_QUEUE)
         except Exception:
-            pass  # Exceptions are handled in the job steps
+            logger.exception("Failed to dispatch submission %s", str(job["_id"]))
         return job
 
     @staticmethod
@@ -205,6 +234,45 @@ class SIVACOR(Resource):
             code=409,
             extra=str(job["_id"]),
         )
+
+    @access.admin
+    @autoDescribeRoute(
+        Description("Remove submissions older than the retention window.").notes(
+            "Called periodically by the celery worker. It runs here rather than "
+            "on the worker because it deletes jobs by query, which the REST API "
+            "cannot express."
+        )
+    )
+    def cleanup_submissions(self):
+        root_collection = Collection().findOne(
+            {"name": Setting().get(PluginSettings.SUBMISSION_COLLECTION_NAME)}
+        )
+        if not root_collection:
+            return {"removed": 0}
+
+        admin = self.getCurrentUser()
+        cutoff_time = datetime.datetime.now(
+            datetime.timezone.utc
+        ) - datetime.timedelta(days=Setting().get(PluginSettings.RETENTION_DAYS))
+        removed = 0
+        # Materialize the cursor: removing folders while iterating it can make
+        # Mongo skip documents.
+        folders = list(Folder().childFolders(root_collection, "collection", user=admin))
+        for folder in folders:
+            if folder["created"] > cutoff_time:
+                continue
+            if job_id := folder.get("meta", {}).get("job_id"):
+                if main_job := Job().load(job_id, force=True):
+                    Job().remove(main_job)
+                Job().collection.delete_many({"args.0.job_id": job_id})
+            logger.info(
+                "Cleaning up submission folder %s created at %s",
+                str(folder["_id"]),
+                folder["created"],
+            )
+            Folder().remove(folder)
+            removed += 1
+        return {"removed": removed}
 
     @access.public
     @autoDescribeRoute(Description("Get available Docker image tags for SIVACOR."))
