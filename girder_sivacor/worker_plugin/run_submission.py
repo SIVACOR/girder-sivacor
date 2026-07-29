@@ -24,7 +24,7 @@ from tro_utils.tro_utils import TRO
 from ..settings import PluginSettings
 from .girder_api import GirderApi, dump_to_zip
 from .lib import get_project_dir, recorded_run, zip_symlink
-from .routing import DISPATCH_QUEUE, pin_chain, worker_queue
+from .routing import DISPATCH_QUEUE, MAINTENANCE_QUEUE, pin_chain, worker_queue
 
 IGNORE_DIRS = [".git", "__pycache__"]
 DEFAULT_SIVACOR_IGNORE = [
@@ -631,28 +631,64 @@ def finalize_job(task, submission):
 
 @app.on_after_configure.connect
 def setup_periodic_tasks(sender, **kwargs):
+    # ``add_periodic_task`` builds the message itself, so the queue has to be
+    # named here too -- the task's own default only applies to ``apply_async``.
     sender.add_periodic_task(
         12 * 60 * 60,
         cleanup_submissions.s(),
         name="Clean up old submissions",
+        options={"queue": MAINTENANCE_QUEUE},
+    )
+    sender.add_periodic_task(
+        10 * 60,
+        reap_stranded_submissions.s(),
+        name="Reap stranded submissions",
+        options={"queue": MAINTENANCE_QUEUE},
     )
 
 
-@app.task(queue=DISPATCH_QUEUE)
-def cleanup_submissions():
-    """Trigger the retention sweep.
+def _maintenance_api():
+    """Client for a task that has no submission to inherit a token from.
 
-    The sweep itself runs on the Girder server: it removes jobs by query, which
-    has no REST equivalent. A periodic task has no submission to inherit a
-    token from, so this needs a standing credential and quietly does nothing
-    without one.
+    Periodic tasks arrive without ``girder_client_token`` headers, so this
+    needs a standing credential; there is deliberately no fallback, and the
+    caller reports that as a skip rather than a failure.
     """
     api_url = os.environ.get("GIRDER_API_URL")
     api_key = os.environ.get("GIRDER_API_KEY")
     if not (api_url and api_key):
+        return None
+    return GirderApi(api_url, api_key=api_key)
+
+
+@app.task(queue=MAINTENANCE_QUEUE)
+def cleanup_submissions():
+    """Trigger the retention sweep.
+
+    The sweep itself runs on the Girder server: it removes jobs by query, which
+    has no REST equivalent.
+    """
+    if not (api := _maintenance_api()):
         logger.info(
             "Skipping submission retention sweep: set GIRDER_API_URL and "
             "GIRDER_API_KEY on a worker to enable it."
         )
         return
-    GirderApi(api_url, api_key=api_key).client.post("sivacor/cleanup")
+    api.client.post("sivacor/cleanup")
+
+
+@app.task(queue=MAINTENANCE_QUEUE)
+def reap_stranded_submissions():
+    """Ask Girder to fail submissions whose worker went away.
+
+    Same shape as :func:`cleanup_submissions`, and for the same reason: the
+    sweep is a query over the job collection. It has to be driven from outside
+    the submission it might be failing, so it cannot live on the chain.
+    """
+    if not (api := _maintenance_api()):
+        logger.info(
+            "Skipping stranded-submission reap: set GIRDER_API_URL and "
+            "GIRDER_API_KEY on a worker to enable it."
+        )
+        return
+    api.client.post("sivacor/reap")

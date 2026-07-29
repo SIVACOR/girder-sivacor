@@ -43,6 +43,18 @@ def _validate_retention_days(doc):
 
 
 @setting_utilities.validator(
+    {PluginSettings.HEARTBEAT_TIMEOUT, PluginSettings.MAX_RUNTIME}
+)
+def _validate_reaper_thresholds(doc):
+    value = doc.get("value")
+    # Zero would fail every running submission on the next sweep, so unlike
+    # the retention window these have to be strictly positive.
+    if not isinstance(value, float) or value <= 0.0:
+        raise ValidationException("This setting must be a positive number.")
+    return value
+
+
+@setting_utilities.validator(
     {
         PluginSettings.SUBMISSION_COLLECTION_NAME,
         PluginSettings.EDITORS_GROUP_NAME,

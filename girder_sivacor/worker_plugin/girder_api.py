@@ -89,6 +89,20 @@ class GirderApi:
             params["status"] = status
         return self.client.put(f"job/{job_id}", parameters=params)
 
+    def heartbeat(self, job_id):
+        """Tell the server this submission's worker is still alive.
+
+        Best effort on purpose: a submission that is running fine should not be
+        killed off because one heartbeat request lost a race with a Traefik
+        restart. Missing several in a row is what the reaper acts on.
+        """
+        try:
+            self.client.post(f"sivacor/heartbeat/{job_id}")
+            return True
+        except Exception:
+            logger.warning("Heartbeat failed for job %s", job_id, exc_info=True)
+            return False
+
     # -- collections, groups and access -----------------------------------
 
     def _find_collection(self, name):

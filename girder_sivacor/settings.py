@@ -13,6 +13,8 @@ class PluginSettings:
     RETENTION_DAYS = "sivacor.retention_days"  # in days
     BANNER_ENABLED = "sivacor.banner_enabled"
     BANNER_MESSAGE = "sivacor.banner_message"
+    HEARTBEAT_TIMEOUT = "sivacor.heartbeat_timeout"  # in minutes
+    MAX_RUNTIME = "sivacor.max_runtime"  # in hours
 
 
 SettingDefault.defaults.update(
@@ -23,6 +25,12 @@ SettingDefault.defaults.update(
         PluginSettings.RETENTION_DAYS: 7,
         PluginSettings.BANNER_ENABLED: False,
         PluginSettings.BANNER_MESSAGE: "",
+        # Generous relative to the one-minute heartbeat: only the container run
+        # ticks it, so the quiet stretches are whole pipeline steps -- zipping
+        # and uploading a multi-gigabyte package chief among them. Better to
+        # notice a dead worker late than to fail a live submission.
+        PluginSettings.HEARTBEAT_TIMEOUT: 30.0,
+        PluginSettings.MAX_RUNTIME: 24.0,
         PluginSettings.IMAGE_TAGS: {
             "dataeditors/stata15": ["latest", "2023-01-27"],
             "dataeditors/stata16": ["latest", "2023-06-13", "2022-10-14"],

@@ -29,6 +29,10 @@ _master_key = bytes.fromhex(MASTER_KEY_HEX)
 MASTER_AES = AESGCM(_master_key)
 MASK = "***SECRET_REDACTED***"
 
+#: Seconds between liveness pings while a user's container runs. Cheap enough
+#: to be frequent; the server's staleness threshold is a large multiple of it.
+HEARTBEAT_INTERVAL = 60
+
 
 class NpEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -489,12 +493,21 @@ def recorded_run(api, submission, stage, env_vars, task=None):
 
         try:
             container = cli.containers.get(container.id)
+            last_heartbeat = 0.0
             while container.status == "running":
                 while not log_queue.empty():
                     print(log_queue.get_nowait(), flush=True)
                 if task.canceled:
                     stop_container(container)
                     break
+                # A replication can run for hours without writing a line, and
+                # the job log is the only thing that otherwise touches the job.
+                # This is the sole reason the server can tell a slow run from a
+                # dead worker.
+                now = time.monotonic()
+                if now - last_heartbeat >= HEARTBEAT_INTERVAL:
+                    last_heartbeat = now
+                    api.heartbeat(submission["job_id"])
                 time.sleep(1)
                 container = cli.containers.get(container.id)
         except docker.errors.NotFound:

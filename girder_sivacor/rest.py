@@ -40,6 +40,18 @@ logger = logging.getLogger(__name__)
 #: longest replication run, but it grants admin access, so not by much.
 WORKER_TOKEN_DAYS = 7
 
+
+def _as_utc(value):
+    """Make a Mongo timestamp safe to compare against an aware ``now``.
+
+    Whether pymongo hands back aware datetimes depends on how the client was
+    built, and a naive one turns the reaper's comparisons into a TypeError
+    rather than a wrong answer -- silent in a periodic task.
+    """
+    if value.tzinfo is None:
+        return value.replace(tzinfo=datetime.timezone.utc)
+    return value
+
 stage_schema = {
     "$schema": "http://json-schema.org/draft-04/schema#",
     "title": "Workflow",
@@ -88,6 +100,8 @@ class SIVACOR(Resource):
         self.resourceName = "sivacor"
         self.route("POST", ("submit_job",), self.submit_job)
         self.route("POST", ("cleanup",), self.cleanup_submissions)
+        self.route("POST", ("reap",), self.reap_submissions)
+        self.route("POST", ("heartbeat", ":id"), self.heartbeat)
         self.route("GET", ("image_tags",), self.get_image_tags)
         self.route("DELETE", ("submission", ":id"), self.delete_submission)
 
@@ -273,6 +287,135 @@ class SIVACOR(Resource):
             Folder().remove(folder)
             removed += 1
         return {"removed": removed}
+
+    @access.admin
+    @autoDescribeRoute(
+        Description("Record a liveness heartbeat for a running submission.")
+        .notes(
+            "Called by the worker while a container runs. A submission can "
+            "execute for hours without logging anything, so the job's "
+            "'updated' timestamp is not by itself a liveness signal -- this is "
+            "what tells /sivacor/reap the worker is still there."
+        )
+        .modelParam(
+            "id",
+            "The ID of the submission job.",
+            model=Job,
+            force=True,
+            required=True,
+        )
+    )
+    def heartbeat(self, job):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        # Straight to the collection rather than through updateJob(): that
+        # fires jobs.job.update.after, and re-running the status handler --
+        # folder write, possibly an email -- once a minute per submission is
+        # not what a heartbeat should cost.
+        Job().collection.update_one(
+            {"_id": job["_id"]}, {"$set": {"meta.heartbeat": now}}
+        )
+        return {"heartbeat": now}
+
+    @access.admin
+    @autoDescribeRoute(
+        Description("Fail submissions whose worker stopped reporting.").notes(
+            "Called periodically by the celery worker. A chain publishes each "
+            "step only after the previous one returns, so a worker that dies "
+            "mid-submission leaves no message to retry and no step to fail: "
+            "the job stays RUNNING forever. Retrying is not an option either, "
+            "since the workspace died with the worker -- so fail loudly."
+        )
+    )
+    def reap_submissions(self):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        stale_after = datetime.timedelta(
+            minutes=Setting().get(PluginSettings.HEARTBEAT_TIMEOUT)
+        )
+        max_runtime = datetime.timedelta(
+            hours=Setting().get(PluginSettings.MAX_RUNTIME)
+        )
+
+        # Materialize the cursor: this loop moves jobs out of the status the
+        # query selects on, and Mongo can skip documents that shift under a
+        # live cursor. Same reason cleanup_submissions() lists its folders.
+        # Job().find() drops the log from the projection, which is what we want
+        # -- these documents are only read for their timestamps.
+        stranded = list(
+            Job().find({"type": "sivacor_submission", "status": JobStatus.RUNNING})
+        )
+
+        reaped = []
+        for job in stranded:
+            created = _as_utc(job["created"])
+            # Any of the three counts as a sign of life: the heartbeat covers a
+            # long container run, 'updated' covers every step that logs, and
+            # 'created' keeps a submission that has not reached its first step
+            # from being reaped before it starts.
+            last_seen = max(
+                _as_utc(t)
+                for t in (
+                    created,
+                    job.get("updated") or created,
+                    job.get("meta", {}).get("heartbeat") or created,
+                )
+            )
+            if now - created > max_runtime:
+                reason = (
+                    f"exceeded the maximum runtime of {max_runtime}; "
+                    "started at " + created.isoformat()
+                )
+            elif now - last_seen > stale_after:
+                reason = (
+                    f"no sign of life for {now - last_seen}; the worker "
+                    "running it is presumed lost"
+                )
+            else:
+                continue
+
+            logger.warning("Reaping stranded submission %s: %s", job["_id"], reason)
+            self._fail_stranded(job, reason)
+            reaped.append(str(job["_id"]))
+
+        return {"reaped": reaped}
+
+    @staticmethod
+    def _fail_stranded(job, reason):
+        """Transition a stranded job to ERROR and settle its children.
+
+        Going through ``updateJob`` is the point: it fires
+        ``jobs.job.update.after``, which is what marks the submission folder
+        failed and emails the user.
+        """
+        zone = ZoneInfo("America/Chicago")
+        stamp = (
+            datetime.datetime.now().astimezone(zone).replace(microsecond=0).isoformat()
+        )
+        try:
+            Job().updateJob(
+                job,
+                log=f"[{stamp}] Submission abandoned: {reason}.\n",
+                status=JobStatus.ERROR,
+            )
+        except Exception:
+            logger.exception("Could not fail stranded submission %s", job["_id"])
+            return
+
+        # The per-step celery jobs are stranded too, and nothing else will ever
+        # touch them. They carry no submission status of their own, so update
+        # the collection directly rather than replaying the event handler.
+        Job().collection.update_many(
+            {
+                "type": "celery",
+                "$or": [
+                    {"args.0.job_id": str(job["_id"])},
+                    {"args.3": str(job["_id"])},
+                ],
+                "status": {
+                    "$in": [JobStatus.INACTIVE, JobStatus.QUEUED, JobStatus.RUNNING]
+                },
+            },
+            {"$set": {"status": JobStatus.ERROR}},
+        )
 
     @access.public
     @autoDescribeRoute(Description("Get available Docker image tags for SIVACOR."))
