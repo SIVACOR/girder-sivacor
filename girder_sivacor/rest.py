@@ -8,7 +8,7 @@ from girder.api import access
 from girder.api.describe import Description, autoDescribeRoute
 from girder.api.rest import Resource, boundHandler, filtermodel
 from girder.constants import AccessType
-from girder.exceptions import AccessException, ValidationException
+from girder.exceptions import AccessException, RestException, ValidationException
 from girder.models.collection import Collection
 from girder.models.file import File
 from girder.models.folder import Folder
@@ -67,6 +67,10 @@ stage_schema = {
     "required": ["stages"],
 }
 
+# Statuses in which a submission is still in flight. A user is allowed at most
+# one submission in one of these states at a time.
+ACTIVE_JOB_STATUSES = (JobStatus.INACTIVE, JobStatus.QUEUED, JobStatus.RUNNING)
+
 
 class SIVACOR(Resource):
     def __init__(self):
@@ -95,9 +99,15 @@ class SIVACOR(Resource):
             required=True,
             schema=stage_schema,
         )
+        .errorResponse("You already have a submission in progress.", 409)
     )
     @filtermodel(model=Job)
     def submit_job(self, file, workflow):
+        # Only one submission per user may be in flight at a time.
+        user = self.getCurrentUser()
+        if active := self._active_submission(user):
+            raise self._active_submission_error(active)
+
         stages = workflow.get("stages", [])
         env_secrets = encrypt_job_secrets(workflow.get("env_secrets", []))
         tags = self._get_tags()
@@ -108,14 +118,20 @@ class SIVACOR(Resource):
             if image_name not in tags or tag not in tags.get(image_name, []):
                 raise ValidationException(f"Invalid image: {image_reference}")
 
-        # Job submission logic goes here
-        user = self.getCurrentUser()
         job = Job().createJob(
             title=f"SIVACOR Run for {file['name']} by {user['firstName']} {user['lastName']}",
             type="sivacor_submission",
             public=False,
             user=user,
         )
+        # Close the window between the check above and the job creation: two
+        # concurrent requests can both pass it, so whoever ends up with the
+        # older job wins and the other one is rolled back. Nothing has been
+        # dispatched yet, so removing the job is enough to undo it.
+        if active := self._active_submission(user, older_than=job["_id"]):
+            Job().remove(job)
+            raise self._active_submission_error(active)
+
         User().collection.update_one(
             {"_id": user["_id"]}, {"$set": {"lastJobId": job["_id"]}}
         )
@@ -164,6 +180,31 @@ class SIVACOR(Resource):
         except Exception:
             pass  # Exceptions are handled in the job steps
         return job
+
+    @staticmethod
+    def _active_submission(user, older_than=None):
+        """Return the user's oldest unfinished submission job, if any.
+
+        :param older_than: only consider jobs created before this job id.
+        """
+        query = {
+            "userId": user["_id"],
+            "type": "sivacor_submission",
+            "status": {"$in": list(ACTIVE_JOB_STATUSES)},
+        }
+        if older_than is not None:
+            query["_id"] = {"$lt": older_than}
+        return Job().findOne(query, sort=[("created", 1)])
+
+    @staticmethod
+    def _active_submission_error(job):
+        return RestException(
+            f"You already have a submission in progress ('{job['title']}'). "
+            "Please wait for it to finish, or cancel it, before submitting "
+            "a new one.",
+            code=409,
+            extra=str(job["_id"]),
+        )
 
     @access.public
     @autoDescribeRoute(Description("Get available Docker image tags for SIVACOR."))
