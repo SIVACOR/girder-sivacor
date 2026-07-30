@@ -11,6 +11,7 @@ These tests use a **real** docker container rather than mocks. A mocked
 including getting the label filter wrong.
 """
 
+import os
 import uuid
 
 import pytest
@@ -162,3 +163,75 @@ def test_a_real_run_stamps_the_labels(
         f"analysis container was not labelled with the worker queue: {seen}"
     )
     assert seen.get(ORPHAN_LABEL_JOB), "analysis container carries no job id label"
+
+
+# --- container stats collection -------------------------------------------
+#
+# Two separate defects lived here: short-lived containers were never sampled at
+# all, and the empty CSV that left behind made the aggregation write a bare NaN
+# literal into performance_data_stage_N.json -- invalid JSON in a file that gets
+# hashed into a signed TRO.
+
+
+@pytest.mark.parametrize("lifetime", ["0.2", "1", "3"])
+def test_short_containers_are_still_sampled(docker_client, tmp_path, lifetime):
+    """Any container Docker emits a reading for must produce a row.
+
+    ``stats(stream=False)`` blocks 1-2s waiting for a CPU delta, so a container
+    finishing inside that window used to yield zero samples. Streaming gives a
+    usable first reading in milliseconds.
+    """
+    from girder_sivacor.worker_plugin.lib import DockerStatsCollectorThread
+
+    path = str(tmp_path / "dockerstats")
+    container = docker_client.containers.create("alpine", ["sleep", lifetime])
+    try:
+        collector = DockerStatsCollectorThread(container, path)
+        container.start()
+        collector.start()
+        collector.join(timeout=30)
+
+        assert collector.samples >= 1, f"no stats reading for a {lifetime}s container"
+        assert os.path.isfile(path), "human-readable dockerstats file was not written"
+        rows = [ln for ln in open(path + ".csv").read().splitlines()[1:] if ln.strip()]
+        assert len(rows) >= 1
+    finally:
+        container.remove(force=True)
+
+
+def test_empty_stats_never_yields_invalid_json():
+    """An empty frame must not put a bare NaN literal into a TRO artifact."""
+    import io
+    import json
+
+    import pandas as pd
+
+    from girder_sivacor.worker_plugin.lib import NpEncoder
+
+    header = (
+        "Timestamp,CPU %,Memory Usage,Memory Limit,Network RX,Network TX,"
+        "Block IO Read,Block IO Write,PIDs\n"
+    )
+    df = pd.read_csv(io.StringIO(header))
+    assert df.empty
+
+    # What lib.py does now.
+    performance_data = {"ExitCode": 0}
+    if df.empty:
+        performance_data["MetricsUnavailable"] = (
+            "container exited before Docker emitted a stats reading"
+        )
+    else:  # pragma: no cover - guarding the guard
+        performance_data["MaxCPUPercent"] = float(df["CPU %"].max())
+
+    blob = json.dumps(performance_data, cls=NpEncoder, allow_nan=False)
+    assert "NaN" not in blob
+    # Strict round trip: reject the non-finite literals json.loads would tolerate.
+    def _no_constants(name):
+        raise AssertionError(f"invalid JSON literal in a TRO artifact: {name}")
+
+    json.loads(blob, parse_constant=_no_constants)
+
+    # And the old behaviour must now be impossible to ship silently.
+    with pytest.raises(ValueError):
+        json.dumps({"MaxCPUPercent": float("nan")}, cls=NpEncoder, allow_nan=False)

@@ -26,8 +26,10 @@ class TestDockerStatsCollectorThread:
             output_path = os.path.join(temp_dir, "dockerstats")
             mock_container = Mock()
 
-            # Mock container stats that will cause container_finished to return True immediately
-            mock_container.stats.return_value = {"read": "0001-01-01T00:00:00Z"}
+            # stats() is now consumed as a stream (stream=True, decode=True), so it
+            # must yield dicts. A single zero-timestamp reading plus an exited
+            # container makes the collector stop immediately.
+            mock_container.stats.return_value = iter([{"read": "0001-01-01T00:00:00Z"}])
             mock_container.attrs = {"State": {"Status": "exited"}}
 
             stats_thread = DockerStatsCollectorThread(mock_container, output_path)

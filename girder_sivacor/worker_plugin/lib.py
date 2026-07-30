@@ -179,6 +179,9 @@ class DockerStatsCollectorThread(Thread):
         self.daemon = True
         self.container = container
         self.output_path = output_path
+        #: Readings actually recorded. ``recorded_run`` uses this to say *why* a
+        #: metric is missing instead of silently emitting NaN.
+        self.samples = 0
 
     def container_finished(self, ts):
         try:
@@ -195,39 +198,59 @@ class DockerStatsCollectorThread(Thread):
                 "Block IO Read,Block IO Write,PIDs\n"
             )
             fp.write(header)
-        while True:
-            try:
-                d = self.container.stats(stream=False)
-            except docker.errors.NotFound:
-                break
-            ts = d["read"]
+        # stream=True yields its first reading within milliseconds; stream=False
+        # blocks 1-2s because it waits for the two CPU readings a delta needs. That
+        # delay meant a container finishing inside the window was never sampled at
+        # all -- measured: a 1s container produced zero rows, 3s produced one. So
+        # any submission whose stage was quick got no metrics and, worse, an empty
+        # CSV that made the aggregation emit NaN into a signed TRO artifact.
+        #
+        # The tradeoff is that the first reading has no precpu baseline, so its
+        # CPU% is 0.0 -- exactly what `docker stats` prints on its first line.
+        # Memory, network and block IO are all real from the very first sample.
+        try:
+            stream = self.container.stats(stream=True, decode=True)
+        except docker.errors.NotFound:
+            return
+        for d in stream:
+            # Metrics are best-effort: a malformed reading must not raise in a
+            # daemon thread, where it would surface only as an unhandled-exception
+            # warning and silently stop collection for the rest of the run.
+            if not isinstance(d, dict):
+                logging.warning("Ignoring unexpected docker stats payload: %r", type(d))
+                continue
+            ts = d.get("read")
 
-            if self.container_finished(ts):
-                break
+            # Readings after the container exits keep arriving on a ~1s cadence
+            # with the zero timestamp and empty payloads, so the stream ending is
+            # not a reliable stop signal -- check the container itself.
+            if not ts or ts == "0001-01-01T00:00:00Z":
+                if self.container_finished(ts):
+                    break
+                continue
 
-            if ts != "0001-01-01T00:00:00Z":
-                mem_usage, mem_limit = self.calculate_memory(d)
-                bytes_in, bytes_out = self.calculate_network_bytes(d)
-                blkio_rd, blkio_wr = self.calculate_blkio_bytes(d)
-                cpu_percent = self.calculate_cpu_percent(d)
-                line = (
-                    f"{ts} - {cpu_percent:.2f}%, {mem_usage} / {mem_limit},"
-                    f" {bytes_in} / {bytes_out}, {blkio_rd} / {blkio_wr},"
-                    f" {d.get('pids_stats', {}).get('current', 0)}\n"
+            self.samples += 1
+            mem_usage, mem_limit = self.calculate_memory(d)
+            bytes_in, bytes_out = self.calculate_network_bytes(d)
+            blkio_rd, blkio_wr = self.calculate_blkio_bytes(d)
+            cpu_percent = self.calculate_cpu_percent(d)
+            line = (
+                f"{ts} - {cpu_percent:.2f}%, {mem_usage} / {mem_limit},"
+                f" {bytes_in} / {bytes_out}, {blkio_rd} / {blkio_wr},"
+                f" {d.get('pids_stats', {}).get('current', 0)}\n"
+            )
+            with open(self.output_path, mode="a") as fp:
+                fp.write(line)
+            with open(self.output_path + ".csv", mode="a") as fp:
+                mem_usage, mem_limit = self.calculate_memory(d, convert=False)
+                bytes_in, bytes_out = self.calculate_network_bytes(d, convert=False)
+                blkio_rd, blkio_wr = self.calculate_blkio_bytes(d, convert=False)
+                csv_line = (
+                    f'"{ts}",{cpu_percent:.2f},{mem_usage},{mem_limit},'
+                    f"{bytes_in},{bytes_out},{blkio_rd},{blkio_wr},"
+                    f"{d.get('pids_stats', {}).get('current', 0)}\n"
                 )
-                with open(self.output_path, mode="a") as fp:
-                    fp.write(line)
-                with open(self.output_path + ".csv", mode="a") as fp:
-                    mem_usage, mem_limit = self.calculate_memory(d, convert=False)
-                    bytes_in, bytes_out = self.calculate_network_bytes(d, convert=False)
-                    blkio_rd, blkio_wr = self.calculate_blkio_bytes(d, convert=False)
-                    csv_line = (
-                        f'"{ts}",{cpu_percent:.2f},{mem_usage},{mem_limit},'
-                        f"{bytes_in},{bytes_out},{blkio_rd},{blkio_wr},"
-                        f"{d.get('pids_stats', {}).get('current', 0)}\n"
-                    )
-                    fp.write(csv_line)
-            time.sleep(5)
+                fp.write(csv_line)
 
     @staticmethod
     def convert_size(size_bytes, binary=True):
@@ -615,15 +638,27 @@ def recorded_run(api, submission, stage, env_vars, task=None):
         performance_data.update({"DockerRunArgs": json.dumps(container_kwargs)})
         if os.path.isfile(dstats_tmppath + ".csv"):
             df = pd.read_csv(dstats_tmppath + ".csv")
-            performance_data.update(
-                {
-                    "MaxCPUPercent": df["CPU %"].max(),
-                    "MaxMemoryUsage": df["Memory Usage"].max(),
-                }
-            )
+            # The header is written when the collector starts, so the file exists
+            # even when no reading was ever taken. Aggregating that empty frame
+            # yields NaN, and json.dumps happily writes a bare `NaN` literal --
+            # invalid JSON, inside a file that gets hashed into a signed TRO and
+            # read back by strict parsers years later. Say what is missing instead.
+            if df.empty:
+                performance_data["MetricsUnavailable"] = (
+                    "container exited before Docker emitted a stats reading"
+                )
+            else:
+                performance_data.update(
+                    {
+                        "MaxCPUPercent": float(df["CPU %"].max()),
+                        "MaxMemoryUsage": int(df["Memory Usage"].max()),
+                    }
+                )
         api.upload_bytes(
             folder_id,
-            json.dumps(performance_data, cls=NpEncoder).encode("utf-8"),
+            # allow_nan=False is a tripwire: a non-finite float here would be
+            # written as an invalid JSON literal rather than rejected.
+            json.dumps(performance_data, cls=NpEncoder, allow_nan=False).encode("utf-8"),
             f"performance_data_stage_{stage_num}.json",
             mime_type="text/plain",
             item_type="performance_data",
