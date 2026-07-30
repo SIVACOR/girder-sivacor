@@ -2,13 +2,14 @@ import datetime
 import json
 import logging
 import os
+from zoneinfo import ZoneInfo
 
 import requests
 import yaml
 from girder.api import access
 from girder.api.describe import Description, autoDescribeRoute
 from girder.api.rest import Resource, boundHandler, filtermodel
-from girder.constants import AccessType
+from girder.constants import AccessType, TokenScope
 from girder.exceptions import AccessException, RestException, ValidationException
 from girder.models.collection import Collection
 from girder.models.file import File
@@ -16,10 +17,9 @@ from girder.models.folder import Folder
 from girder.models.setting import Setting
 from girder.models.token import Token
 from girder.models.user import User
-from girder_jobs.constants import JobStatus
+from girder_jobs.constants import REST_CREATE_JOB_TOKEN_SCOPE, JobStatus
 from girder_jobs.models.job import Job
 from girder_plugin_worker.utils import getWorkerApiUrl
-from zoneinfo import ZoneInfo
 
 from .settings import PluginSettings
 from .utils import encrypt_job_secrets
@@ -51,6 +51,7 @@ def _as_utc(value):
     if value.tzinfo is None:
         return value.replace(tzinfo=datetime.timezone.utc)
     return value
+
 
 stage_schema = {
     "$schema": "http://json-schema.org/draft-04/schema#",
@@ -171,8 +172,21 @@ class SIVACOR(Resource):
         # task onto the next one it publishes, but the chain is built here, so
         # set them on every step rather than relying on that.
         admin = User().findOne({"admin": True})
+        # REST_CREATE_JOB_TOKEN_SCOPE is not optional. girder_worker's
+        # girder_before_task_publish POSTs to /job to record a child job for every
+        # step it publishes, and that endpoint is
+        # @access.token(scope=REST_CREATE_JOB_TOKEN_SCOPE, required=True) -- which a
+        # plain USER_AUTH token does not satisfy even for an administrator. Without
+        # it every step logs "Failed to post job: HTTP error 403 ... Invalid token
+        # scope" and carries on, so the submission still runs but no child job is
+        # ever created: GET /job/:id/children comes back empty, per-step progress
+        # vanishes from the UI, and the reaper has no child jobs to settle.
         worker_token = str(
-            Token().createToken(user=admin, days=WORKER_TOKEN_DAYS)["_id"]
+            Token().createToken(
+                user=admin,
+                days=WORKER_TOKEN_DAYS,
+                scope=[TokenScope.USER_AUTH, REST_CREATE_JOB_TOKEN_SCOPE],
+            )["_id"]
         )
         api_url = getWorkerApiUrl()
 
@@ -265,9 +279,9 @@ class SIVACOR(Resource):
             return {"removed": 0}
 
         admin = self.getCurrentUser()
-        cutoff_time = datetime.datetime.now(
-            datetime.timezone.utc
-        ) - datetime.timedelta(days=Setting().get(PluginSettings.RETENTION_DAYS))
+        cutoff_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+            days=Setting().get(PluginSettings.RETENTION_DAYS)
+        )
         removed = 0
         # Materialize the cursor: removing folders while iterating it can make
         # Mongo skip documents.

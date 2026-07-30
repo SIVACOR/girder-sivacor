@@ -370,3 +370,41 @@ def test_maintenance_skips_when_the_model_layer_is_unreachable(
         assert run_submission._maintenance_api() is None
         # The task turns that into a logged skip, not an exception.
         run_submission.reap_stranded_submissions()
+
+
+@pytest.mark.plugin("sivacor")
+def test_worker_token_can_create_child_jobs(
+    server, db, admin, user, fsAssetstore, uploads_folder, submission_collection
+):
+    """The worker token must carry REST_CREATE_JOB_TOKEN_SCOPE.
+
+    girder_worker records a child job for every step it publishes by POSTing to
+    /job, and that endpoint is @access.token(scope=REST_CREATE_JOB_TOKEN_SCOPE,
+    required=True) -- which a plain USER_AUTH token fails even as an admin. The
+    failure is a logged 403 that girder_worker swallows, so the submission still
+    succeeds and nothing points at the cause; only the child jobs silently go
+    missing. Assert on the token itself rather than on a chain run.
+    """
+    from girder.constants import TokenScope
+    from girder.models.token import Token
+    from girder_jobs.constants import REST_CREATE_JOB_TOKEN_SCOPE
+
+    from .conftest import submit_sivacor_job, upload_test_file
+
+    fobj = upload_test_file(uploads_folder, user, "with_space_R.zip")
+    stages = [
+        {"image_name": "rocker/r-ver", "image_tag": "4.3.1", "main_file": "main.R"}
+    ]
+    # Stop before celery actually runs the chain: the token is minted during
+    # submit_job, which is all this test cares about.
+    with mock.patch("celery.canvas._chain.apply_async"):
+        resp = submit_sivacor_job(server, user, fobj, stages)
+    assertStatusOk(resp)
+
+    # The most recently minted admin token is the worker's.
+    tok = Token().find({"userId": admin["_id"]}, sort=[("created", -1)], limit=1)[0]
+    scopes = tok["scope"] if isinstance(tok["scope"], list) else [tok["scope"]]
+    assert REST_CREATE_JOB_TOKEN_SCOPE in scopes, (
+        "worker token lacks the job-creation scope; child jobs would 403"
+    )
+    assert TokenScope.USER_AUTH in scopes, "worker token lost normal user access"
