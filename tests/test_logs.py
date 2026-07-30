@@ -18,7 +18,11 @@ class TestRedisClient:
             _redis_client_async.cache_clear()  # Clear cache for test
 
             _redis_client_async()
-            mock_redis.assert_called_once_with("redis://localhost:6379")
+            # decode_responses is required: without it pubsub yields bytes and
+            # the relay's websocket.send_text() blows up inside uvicorn.
+            mock_redis.assert_called_once_with(
+                "redis://localhost:6379", decode_responses=True
+            )
 
     def test_redis_client_custom_url(self):
         """Test Redis client with custom URL from environment."""
@@ -31,7 +35,7 @@ class TestRedisClient:
             _redis_client_async.cache_clear()  # Clear cache for test
 
             _redis_client_async()
-            mock_redis.assert_called_once_with(custom_url)
+            mock_redis.assert_called_once_with(custom_url, decode_responses=True)
 
 
 class TestDockerLogStreamerMethods:

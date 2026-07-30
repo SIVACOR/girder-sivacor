@@ -12,7 +12,15 @@ from starlette.endpoints import WebSocketEndpoint
 @functools.lru_cache
 def _redis_client_async() -> aioredis.Redis:
     url = os.environ.get("GIRDER_NOTIFICATION_REDIS_URL", "redis://localhost:6379")
-    return aioredis.Redis.from_url(url)
+    # decode_responses is load-bearing, not a nicety. Without it every pubsub
+    # payload arrives as bytes, and ``listen_to_redis`` hands it straight to
+    # ``websocket.send_text``. Starlette does not object -- it puts the bytes in
+    # the ASGI message's "text" field -- but uvicorn then calls .encode() on it
+    # and raises AttributeError: 'bytes' object has no attribute 'encode'. The
+    # relay's own except clause swallows that and closes the socket with 1011, so
+    # the client sees the greeting (a real str) and then nothing, and the UI
+    # reconnects into the same failure. Verified against uvicorn 0.52.0.
+    return aioredis.Redis.from_url(url, decode_responses=True)
 
 
 class DockerLogStreamer(WebSocketEndpoint):
