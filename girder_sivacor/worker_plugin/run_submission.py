@@ -24,7 +24,7 @@ from tro_utils.tro_utils import TRO
 from ..settings import PluginSettings
 from .girder_api import GirderApi, dump_to_zip
 from .lib import get_project_dir, recorded_run, zip_symlink
-from .routing import DISPATCH_QUEUE, MAINTENANCE_QUEUE, pin_chain, worker_queue
+from .routing import DISPATCH_QUEUE, LOCAL_QUEUE, pin_chain, worker_queue
 
 IGNORE_DIRS = [".git", "__pycache__"]
 DEFAULT_SIVACOR_IGNORE = [
@@ -637,31 +637,63 @@ def setup_periodic_tasks(sender, **kwargs):
         12 * 60 * 60,
         cleanup_submissions.s(),
         name="Clean up old submissions",
-        options={"queue": MAINTENANCE_QUEUE},
+        options={"queue": LOCAL_QUEUE},
     )
     sender.add_periodic_task(
         10 * 60,
         reap_stranded_submissions.s(),
         name="Reap stranded submissions",
-        options={"queue": MAINTENANCE_QUEUE},
+        options={"queue": LOCAL_QUEUE},
     )
+
+
+def _local_admin_token():
+    """Mint a short-lived admin token through the model layer.
+
+    Only the co-located worker consumes ``sivacor.maintenance``, and that
+    worker has ``GIRDER_MONGO_URI`` and the model layer -- so it can issue its
+    own credential instead of being handed a standing API key. Nothing is
+    persisted beyond the token itself, which is scoped to a single day because
+    it is used for exactly one POST.
+
+    Returns ``None`` on any failure. This is a *fallback*, and the whole point
+    of the REST conversion was that a worker need not reach MongoDB: a remote
+    worker importing this must degrade to a skip, not raise.
+    """
+    try:
+        from girder.models.token import Token
+        from girder.models.user import User
+
+        # Sorted so a multi-admin deployment attributes the sweeps to the same
+        # account every time, which matters when reading the job log later.
+        admin = User().findOne({"admin": True}, sort=[("created", 1)])
+        if admin is None:
+            return None
+        return Token().createToken(admin, days=1)["_id"]
+    except Exception:
+        logger.debug("No local Girder model layer for maintenance", exc_info=True)
+        return None
 
 
 def _maintenance_api():
     """Client for a task that has no submission to inherit a token from.
 
-    Periodic tasks arrive without ``girder_client_token`` headers, so this
-    needs a standing credential; there is deliberately no fallback, and the
-    caller reports that as a skip rather than a failure.
+    Periodic tasks arrive without ``girder_client_token`` headers, so the
+    credential has to come from somewhere else. Prefer an explicit
+    ``GIRDER_API_KEY``; failing that, mint one locally. The caller reports
+    having neither as a skip rather than a failure.
     """
     api_url = os.environ.get("GIRDER_API_URL")
-    api_key = os.environ.get("GIRDER_API_KEY")
-    if not (api_url and api_key):
+    if not api_url:
         return None
-    return GirderApi(api_url, api_key=api_key)
+    if api_key := os.environ.get("GIRDER_API_KEY"):
+        return GirderApi(api_url, api_key=api_key)
+    if token := _local_admin_token():
+        return GirderApi(api_url, token=token)
+    return None
 
 
-@app.task(queue=MAINTENANCE_QUEUE)
+@app.task(queue=LOCAL_QUEUE)
 def cleanup_submissions():
     """Trigger the retention sweep.
 
@@ -670,25 +702,40 @@ def cleanup_submissions():
     """
     if not (api := _maintenance_api()):
         logger.info(
-            "Skipping submission retention sweep: set GIRDER_API_URL and "
-            "GIRDER_API_KEY on a worker to enable it."
+            "Skipping submission retention sweep: set GIRDER_API_URL on a "
+            "worker (plus GIRDER_API_KEY, unless it can reach MongoDB) to "
+            "enable it."
         )
         return
     api.client.post("sivacor/cleanup")
 
 
-@app.task(queue=MAINTENANCE_QUEUE)
+@app.task(queue=LOCAL_QUEUE)
 def reap_stranded_submissions():
     """Ask Girder to fail submissions whose worker went away.
 
     Same shape as :func:`cleanup_submissions`, and for the same reason: the
     sweep is a query over the job collection. It has to be driven from outside
     the submission it might be failing, so it cannot live on the chain.
+
+    .. note::
+
+       This stays an HTTP call even though the only consumer of
+       :data:`~.routing.LOCAL_QUEUE` has the model layer and could sweep
+       in-process. Failing a submission works by ``updateJob()`` firing
+       ``jobs.job.update.after``, and that handler is bound in
+       ``SIVACORPlugin.load()`` -- which runs in the Girder *server*, not here:
+       a celery worker loads ``girder_worker_plugins`` entry points only, so in
+       this process the topic has zero handlers. Sweeping locally would
+       transition the job and silently skip the folder status update and the
+       user's failure email. The test suite cannot catch that, because
+       ``pytest-girder`` loads the full plugin in-process.
     """
     if not (api := _maintenance_api()):
         logger.info(
-            "Skipping stranded-submission reap: set GIRDER_API_URL and "
-            "GIRDER_API_KEY on a worker to enable it."
+            "Skipping stranded-submission reap: set GIRDER_API_URL on a "
+            "worker (plus GIRDER_API_KEY, unless it can reach MongoDB) to "
+            "enable it."
         )
         return
     api.client.post("sivacor/reap")

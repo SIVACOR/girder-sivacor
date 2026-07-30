@@ -260,16 +260,19 @@ def test_maintenance_tasks_are_off_the_dispatch_queue(server, db):
     for a worker; a periodic task sitting in it would, under scale-to-zero,
     book a whole VM to issue one HTTP POST.
     """
-    from girder_sivacor.worker_plugin.routing import DISPATCH_QUEUE, MAINTENANCE_QUEUE
+    from girder_sivacor.worker_plugin.routing import DISPATCH_QUEUE, LOCAL_QUEUE
     from girder_sivacor.worker_plugin.run_submission import (
         cleanup_submissions,
         prepare_submission,
         reap_stranded_submissions,
     )
 
-    assert MAINTENANCE_QUEUE != DISPATCH_QUEUE
+    # Housekeeping rides Girder core's queue, which the co-located worker has to
+    # consume anyway. A separate queue name would not have given it its own
+    # execution slot -- concurrency is one pool per worker, not per queue.
+    assert LOCAL_QUEUE != DISPATCH_QUEUE
     for task in (cleanup_submissions, reap_stranded_submissions):
-        assert task.queue == MAINTENANCE_QUEUE
+        assert task.queue == LOCAL_QUEUE
     assert prepare_submission.queue == DISPATCH_QUEUE
 
 
@@ -317,3 +320,53 @@ def test_reap_task_drives_the_endpoint(server, db, admin, user, submission_colle
         reap_stranded_submissions()
 
     assert Job().load(job["_id"], force=True)["status"] == JobStatus.ERROR
+
+
+@pytest.mark.plugin("sivacor")
+def test_maintenance_mints_its_own_token_without_an_api_key(
+    server, db, admin, user, submission_collection, monkeypatch
+):
+    """A co-located worker needs no standing credential.
+
+    ``local_worker`` has ``GIRDER_MONGO_URI`` and the model layer, so requiring
+    an admin API key just to POST a trigger is redundant -- it can create an
+    admin token itself. Drop the key and the sweep must still work.
+    """
+    monkeypatch.delenv("GIRDER_API_KEY", raising=False)
+    job, _ = make_submission(user, submission_collection)
+    backdate(job, hours=2)
+
+    from girder_sivacor.worker_plugin.run_submission import reap_stranded_submissions
+
+    with mock.patch("smtplib.SMTP") as smtp_class:
+        smtp_class.return_value = mock.MagicMock()
+        reap_stranded_submissions()
+
+    assert Job().load(job["_id"], force=True)["status"] == JobStatus.ERROR
+
+
+@pytest.mark.plugin("sivacor")
+def test_maintenance_skips_when_the_model_layer_is_unreachable(
+    server, db, monkeypatch
+):
+    """A remote worker degrades to a skip rather than raising.
+
+    The REST conversion exists so a worker need not reach MongoDB. If one
+    without Mongo somehow consumes ``sivacor.maintenance``, the local-token
+    fallback must fail soft -- an unhandled exception in a periodic task is
+    silent until someone reads the worker log.
+    """
+    from girder_sivacor.worker_plugin import run_submission
+
+    monkeypatch.delenv("GIRDER_API_KEY", raising=False)
+
+    # Fail inside the fallback, the way an unreachable Mongo would, rather than
+    # stubbing out the function being tested.
+    with mock.patch(
+        "girder.models.token.Token.createToken",
+        side_effect=RuntimeError("no server selected"),
+    ):
+        assert run_submission._local_admin_token() is None
+        assert run_submission._maintenance_api() is None
+        # The task turns that into a logged skip, not an exception.
+        run_submission.reap_stranded_submissions()
