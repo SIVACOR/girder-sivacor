@@ -51,6 +51,30 @@ def calculate_duration(start, end):
     return " ".join(parts)
 
 
+def email_urls() -> dict:
+    """Deployment-relative URLs for the mail templates.
+
+    These were hardcoded to ``submit.sivacor.org`` in three separate context
+    dicts, so **every** deployment emailed users a link to production -- a test
+    stack would tell a researcher to go look at the real site. Derived from
+    ``DOMAIN``, which docker-stack.yml already sets on the girder service from
+    ``${domain}``; the default reproduces the old values so production is
+    unchanged.
+
+    ``docs_url`` stays on the apex domain on purpose: there is one docs site, and
+    a test deployment has no docs of its own.
+    """
+    domain = os.environ.get("DOMAIN") or "sivacor.org"
+    base = f"https://submit.{domain}"
+    return {
+        "base_url": base,
+        "docs_url": "https://docs.sivacor.org",
+        "feedback_url": f"https://feedback.{domain}",
+        "logo_url": f"{base}/sivacor_logo_notext_trans.png",
+        "submission_url": f"{base}/",
+    }
+
+
 def _createMessage(subject: str, text_content: str, rendered_html: str, to, bcc):
     # Normalize recipients
     if isinstance(to, str):
@@ -102,11 +126,8 @@ def notify_user(job, submission_folder, success: bool) -> None:
         return
 
     context = {
-        "base_url": "https://submit.sivacor.org",
-        "docs_url": "https://docs.sivacor.org",
-        "feedback_url": "https://feedback.sivacor.org",
+        **email_urls(),
         "current_year": datetime.datetime.now().year,
-        "logo_url": "https://submit.sivacor.org/sivacor_logo_notext_trans.png",
         "user_name": f"{user['firstName']} {user['lastName']}",
         "job_id": str(job["_id"]),
         "is_success": success,
@@ -115,7 +136,6 @@ def notify_user(job, submission_folder, success: bool) -> None:
         "completion_time": format_timestamp(job["updated"]),
         "execution_time": calculate_duration(job["created"], job["updated"]),
         "stages": meta.get("stages", []),
-        "submission_url": "https://submit.sivacor.org/",
     }
 
     # 2. Create the Plain Text version (Very important for spam scores)

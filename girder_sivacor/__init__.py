@@ -20,7 +20,12 @@ from girder_oauth.providers import addProvider
 from girder_oauth.settings import PluginSettings as OAuthSettings
 
 from .auth.orcid import ORCID
-from .notifications import _createMessage, _sendmail, set_submission_status
+from .notifications import (
+    _createMessage,
+    _sendmail,
+    email_urls,
+    set_submission_status,
+)
 from .rest import SIVACOR, get_submission_child_jobs
 from .settings import PluginSettings
 
@@ -132,12 +137,8 @@ def send_approval_email(event: events.Event) -> None:
     user = event.info["user"]
     context = {
         "user": user,
-        "base_url": "https://submit.sivacor.org",
-        "docs_url": "https://docs.sivacor.org",
-        "feedback_url": "https://feedback.sivacor.org",
+        **email_urls(),
         "current_year": datetime.datetime.now().year,
-        "logo_url": "https://submit.sivacor.org/sivacor_logo_notext_trans.png",
-        "submission_url": "https://submit.sivacor.org/",
     }
     text_content = (
         f"Hello Admin,\n\n"
@@ -159,12 +160,8 @@ def send_approved_email(event: events.Event) -> None:
     user = event.info["user"]
     context = {
         "user": user,
-        "base_url": "https://submit.sivacor.org",
-        "docs_url": "https://docs.sivacor.org",
-        "feedback_url": "https://feedback.sivacor.org",
+        **email_urls(),
         "current_year": datetime.datetime.now().year,
-        "logo_url": "https://submit.sivacor.org/sivacor_logo_notext_trans.png",
-        "submission_url": "https://submit.sivacor.org/",
     }
     text_content = (
         f"Hello {user['firstName']} {user['lastName']},\n\n"
