@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 import pathspec
 import posix1e
 import randomname
+from celery.signals import worker_ready
 from girder.constants import AccessType
 from girder_worker.app import app
 from girder_worker.utils import JobStatus
@@ -23,7 +24,12 @@ from tro_utils.tro_utils import TRO
 
 from ..settings import PluginSettings
 from .girder_api import GirderApi, dump_to_zip
-from .lib import get_project_dir, recorded_run, zip_symlink
+from .lib import (
+    get_project_dir,
+    reap_orphaned_containers,
+    recorded_run,
+    zip_symlink,
+)
 from .routing import DISPATCH_QUEUE, LOCAL_QUEUE, pin_chain, worker_queue
 
 IGNORE_DIRS = [".git", "__pycache__"]
@@ -627,6 +633,26 @@ def finalize_job(task, submission):
             status=JobStatus.SUCCESS,
         )
     return submission
+
+
+@worker_ready.connect
+def _sweep_orphaned_containers(sender=None, **kwargs):
+    """Kill analysis containers a previous incarnation of this worker left behind.
+
+    A container is a *sibling* started through the docker socket, so killing the
+    worker -- or losing its VM -- leaves the analysis running with nobody to
+    collect its output. Verified in the P0 kill test: the R container was still
+    burning a core after the job had been failed and the worker had restarted.
+
+    Startup is the one moment when this is unambiguous: a fresh worker process has
+    no task in flight, so any container still bearing its queue label must be a
+    leftover. No Girder query needed, which matters because the worker has neither
+    a database nor a standing credential.
+    """
+    try:
+        reap_orphaned_containers()
+    except Exception:
+        logger.warning("Orphan container sweep failed", exc_info=True)
 
 
 @app.on_after_configure.connect

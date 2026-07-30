@@ -7,6 +7,7 @@ import os
 import queue
 import re
 import shutil
+import socket
 import stat
 import tempfile
 import time
@@ -62,6 +63,71 @@ def decrypt_job_secrets(encrypted_secrets_b64, wrapped_job_key_b64):
 
 def get_project_dir(submission):
     return os.path.join(submission["workspace_dir"], "project")
+
+
+#: Labels stamped on every analysis container so a restarted worker can identify
+#: its own leftovers. Scoped by queue rather than just by job: in a dev setup two
+#: workers can share one docker socket, and a sweep must never touch a container
+#: belonging to the other one.
+ORPHAN_LABEL_QUEUE = "org.sivacor.worker_queue"
+ORPHAN_LABEL_JOB = "org.sivacor.job_id"
+
+
+def worker_queue_name() -> str:
+    """This worker's private queue name, as the deployment sets it.
+
+    Mirrors ``routing.worker_queue`` but without a celery task in hand -- the
+    startup sweep runs before any task exists. Falls back to the hostname, which
+    is what routing derives from the celery node name.
+    """
+    return os.environ.get("SIVACOR_WORKER_QUEUE") or f"sivacor.{socket.gethostname()}"
+
+
+def reap_orphaned_containers() -> list[str]:
+    """Kill analysis containers left behind by a previous incarnation.
+
+    Called once at worker startup. Anything still carrying *this* worker's queue
+    label at that moment is by definition an orphan: a fresh worker process has
+    no task in flight, so it cannot legitimately own a running container. That
+    reasoning is what makes this safe without asking Girder anything -- which
+    matters, because the worker has no database and no standing credential.
+
+    Best-effort by design: a docker daemon that is unreachable, or a container
+    that vanishes mid-sweep, must not stop the worker from starting.
+    """
+    queue = worker_queue_name()
+    reaped: list[str] = []
+    try:
+        cli = docker.from_env()
+        stale = cli.containers.list(
+            all=True, filters={"label": f"{ORPHAN_LABEL_QUEUE}={queue}"}
+        )
+    except Exception:
+        logging.warning("Orphan sweep skipped: docker unavailable", exc_info=True)
+        return reaped
+
+    for container in stale:
+        job_id = (container.labels or {}).get(ORPHAN_LABEL_JOB, "unknown")
+        try:
+            if container.status == "running":
+                logging.warning(
+                    "Killing orphaned analysis container %s (job %s) left by a "
+                    "previous worker incarnation",
+                    container.name,
+                    job_id,
+                )
+                container.kill()
+            container.remove(force=True)
+            reaped.append(container.name)
+        except docker.errors.NotFound:
+            pass
+        except Exception:
+            logging.warning(
+                "Could not reap orphaned container %s", container.name, exc_info=True
+            )
+    if reaped:
+        logging.warning("Orphan sweep reaped %d container(s): %s", len(reaped), reaped)
+    return reaped
 
 
 @functools.lru_cache
@@ -470,6 +536,16 @@ def recorded_run(api, submission, stage, env_vars, task=None):
         "working_dir": os.path.join(target_workspace_dir, "project", sub_dir),
         "user": user,
         "environment": environment,
+        # Analysis containers are siblings started through the docker socket, not
+        # children of this process, so nothing ties their lifetime to the worker.
+        # Kill the worker mid-run and the container keeps going -- burning a core
+        # with no one left to collect its output. These labels are what lets a
+        # restarted worker find and reap its own leftovers; see
+        # :func:`reap_orphaned_containers`.
+        "labels": {
+            ORPHAN_LABEL_QUEUE: worker_queue_name(),
+            ORPHAN_LABEL_JOB: str(submission.get("job_id", "")),
+        },
     }
     container = cli.containers.create(**container_kwargs)
     # redact env in container_kwargs since we dump them later
