@@ -19,7 +19,10 @@ Periodic housekeeping rides Girder core's own :data:`LOCAL_QUEUE`, which the
 co-located worker already has to consume.
 """
 
+import logging
 import os
+
+logger = logging.getLogger(__name__)
 
 #: Shared queue that new submissions are published to.
 DISPATCH_QUEUE = os.environ.get("SIVACOR_DISPATCH_QUEUE", "sivacor")
@@ -78,6 +81,55 @@ def worker_queue(task):
         return queue
     hostname = getattr(task.request, "hostname", None) or "unknown"
     return QUEUE_PREFIX + hostname.split("@")[-1]
+
+
+def is_ephemeral_worker() -> bool:
+    """Whether this worker serves exactly one submission and then goes away.
+
+    Set by the provisioning of an autoscaled instance. The static worker on the
+    manager must NOT set it: it is long-lived and has to keep consuming.
+    """
+    return os.environ.get("SIVACOR_EPHEMERAL_WORKER", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def stop_accepting_submissions(app, task) -> str | None:
+    """Drop this worker's consumer on the shared dispatch queue.
+
+    The keystone of the one-VM-per-submission design. Called as soon as a worker
+    accepts a submission, so it cannot be handed a second one, which is what lets
+    the controller's arithmetic collapse to ``desired instances == queue depth``
+    instead of having to model how many submissions each worker might be holding.
+
+    Returns the node name it was sent to, or ``None`` if this is not an ephemeral
+    worker (the manager's static worker must keep consuming).
+
+    **This narrows the window, it does not close it.** ``cancel_consumer`` is a
+    broadcast over the broker and takes effect asynchronously, and submissions are
+    acked on receipt rather than on completion -- so a worker can be handed a second
+    submission in the gap. ``--concurrency=1 --prefetch-multiplier=1`` keeps that to
+    at most one extra, and the consequence is mild: the second submission's chain is
+    pinned to the same private queue and simply runs after the first. The controller
+    should therefore treat ``desired == depth`` as accurate rather than guaranteed,
+    and P3.3's supervisor must check for *no active tasks* rather than assuming one
+    submission per instance.
+    """
+    if not is_ephemeral_worker():
+        return None
+    node = getattr(task.request, "hostname", None)
+    if not node:
+        # Without a destination this would broadcast to every worker in the fleet
+        # and stop all of them consuming -- refuse rather than guess.
+        logger.warning(
+            "Cannot stop consuming %s: task has no node name", DISPATCH_QUEUE
+        )
+        return None
+    app.control.cancel_consumer(DISPATCH_QUEUE, destination=[node])
+    logger.info("Ephemeral worker %s stopped consuming %s", node, DISPATCH_QUEUE)
+    return node
 
 
 def pin_chain(task, queue):

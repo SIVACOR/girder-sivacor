@@ -30,7 +30,13 @@ from .lib import (
     recorded_run,
     zip_symlink,
 )
-from .routing import DISPATCH_QUEUE, LOCAL_QUEUE, pin_chain, worker_queue
+from .routing import (
+    DISPATCH_QUEUE,
+    LOCAL_QUEUE,
+    pin_chain,
+    stop_accepting_submissions,
+    worker_queue,
+)
 
 IGNORE_DIRS = [".git", "__pycache__"]
 DEFAULT_SIVACOR_IGNORE = [
@@ -239,6 +245,14 @@ def prepare_submission(task, userId, fileId, stages, job_id):
     # rest of the chain for this worker before doing anything else.
     queue = worker_queue(task)
     pin_chain(task, queue)
+    # ...and, if this instance exists only to serve one submission, stop taking new
+    # ones now. Best-effort: failing to cancel the consumer means the controller may
+    # over-count headroom, which is worth a warning but never worth failing a
+    # submission that is otherwise fine.
+    try:
+        stop_accepting_submissions(app, task)
+    except Exception:
+        logger.warning("Failed to stop consuming the dispatch queue", exc_info=True)
     try:
         submission_folder = _create_submission_folder(api, userId)
         # Move file to the submission directory
