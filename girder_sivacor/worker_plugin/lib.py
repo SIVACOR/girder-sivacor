@@ -452,6 +452,112 @@ def _infer_run_command(submission, stage):
     return entrypoint, command, sub_dir, home_dir
 
 
+#: Abort a run when free space on the workspace filesystem drops below this.
+#: Overridable per host with ``SIVACOR_DISK_FLOOR_BYTES``.
+#:
+#: An ephemeral worker has no separate volume, so ``/var/lib/docker`` and the
+#: workspace share one filesystem: a runaway payload does not merely fail its own
+#: run, it wedges the whole VM -- the docker daemon starts failing, celery cannot
+#: write, and the submission has to be cleaned up by the server-side reaper
+#: instead of failing cleanly. Stopping at a floor converts that into one failed
+#: job with an explanatory message.
+DISK_FLOOR_BYTES = int(os.environ.get("SIVACOR_DISK_FLOOR_BYTES", 5 * 1024**3))
+
+
+def disk_shortfall(submission) -> str | None:
+    """Return an explanatory message if the workspace filesystem is nearly full.
+
+    Checked from ``recorded_run``'s existing poll loop rather than by a separate
+    watchdog, so it costs nothing extra. Returns ``None`` while there is room.
+
+    The path checked is inside the worker container, but the numbers are the
+    host's: the workspace is a bind mount, so ``statvfs`` reports the backing
+    filesystem -- the same one holding ``/var/lib/docker``.
+    """
+    path = submission.get("workspace_dir") or "/tmp"
+    try:
+        free = shutil.disk_usage(path).free
+    except OSError:
+        # Never fail a run because the check itself could not run.
+        logging.warning("Could not determine free space for %s", path, exc_info=True)
+        return None
+    if free >= DISK_FLOOR_BYTES:
+        return None
+    return (
+        f"Ran out of disk space: {free / 1024**3:.1f} GiB free on the workspace "
+        f"filesystem, below the {DISK_FLOOR_BYTES / 1024**3:.1f} GiB floor. The "
+        "replication package plus its outputs and the analysis image must fit in "
+        "the worker's disk; this submission needs more room than this worker has."
+    )
+
+
+#: How often to put a progress line in the job log while an image is pulling.
+#: Deliberately much coarser than the heartbeat: each one is an updateJob, which
+#: fires ``jobs.job.update.after`` server-side, whereas the heartbeat writes
+#: straight to the collection.
+PULL_LOG_INTERVAL = 120
+
+
+def pull_image(cli, api, submission, image_reference):
+    """Pull an image while keeping the submission visibly alive.
+
+    ``images.pull()`` blocks and emits nothing. Analysis images are pulled on
+    demand rather than baked into the worker image, and a cold dynare pull is
+    ~15 GB on disk, so that silence can run for many minutes. Meanwhile the
+    server's liveness signal is ``max(meta.heartbeat, job.updated,
+    job.created)`` measured against ``sivacor.heartbeat_timeout`` (default 30
+    min) -- so a large enough pull races the reaper, and losing that race shows
+    up to the researcher as their own submission failing.
+
+    Streaming the low-level API gives progress events to tick the heartbeat on.
+
+    Two traps this deliberately handles:
+
+    * ``cli.api.pull(stream=True)`` does **not** raise on failure the way
+      ``images.pull()`` does -- it yields an event carrying ``error``. Left
+      unchecked, a failed pull would look like success here and resurface as a
+      confusing ImageNotFound from ``containers.create`` further down.
+    * a heartbeat is best-effort; a failed ping must not fail the run, or a
+      transient Girder blip would kill a pull that is going fine.
+    """
+    job_id = submission["job_id"]
+    last_beat = last_log = time.monotonic()
+    error = None
+    layers = set()
+
+    for event in cli.api.pull(image_reference, stream=True, decode=True):
+        if not isinstance(event, dict):
+            continue
+        if event.get("error"):
+            error = event["error"]
+            break
+        if event.get("id"):
+            layers.add(event["id"])
+
+        now = time.monotonic()
+        if now - last_beat >= HEARTBEAT_INTERVAL:
+            last_beat = now
+            try:
+                api.heartbeat(job_id)
+            except Exception:
+                logging.warning("Heartbeat during image pull failed", exc_info=True)
+        if now - last_log >= PULL_LOG_INTERVAL:
+            last_log = now
+            try:
+                api.update_job(
+                    job_id,
+                    log=f"Still pulling {image_reference} ({len(layers)} layers seen)\n",
+                )
+            except Exception:
+                logging.warning("Progress report during image pull failed", exc_info=True)
+
+    if error:
+        # Infrastructure, not user error: a registry timeout or a rate limit must
+        # not read as "your replication package is broken".
+        raise RuntimeError(f"Failed to pull image {image_reference}: {error}")
+    logging.info("Pulled %s (%d layers)", image_reference, len(layers))
+
+
 def recorded_run(api, submission, stage, env_vars, task=None):
     cli = docker.from_env()
     info = cli.info()
@@ -520,7 +626,7 @@ def recorded_run(api, submission, stage, env_vars, task=None):
             )
         )
 
-    cli.images.pull(image_reference)
+    pull_image(cli, api, submission, image_reference)
 
     entrypoint, command, sub_dir, home_dir = _infer_run_command(submission, stage)
     project_dir = get_project_dir(submission)
@@ -607,6 +713,9 @@ def recorded_run(api, submission, stage, env_vars, task=None):
                 if now - last_heartbeat >= HEARTBEAT_INTERVAL:
                     last_heartbeat = now
                     api.heartbeat(submission["job_id"])
+                    if shortfall := disk_shortfall(submission):
+                        stop_container(container)
+                        raise RuntimeError(shortfall)
                 time.sleep(1)
                 container = cli.containers.get(container.id)
         except docker.errors.NotFound:
