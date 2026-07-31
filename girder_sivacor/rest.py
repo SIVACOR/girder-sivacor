@@ -31,6 +31,7 @@ from .worker_plugin.run_submission import (
     prepare_submission,
     prune_workspace,
     run_tro,
+    sign_tro,
     upload_workspace,
 )
 
@@ -229,7 +230,10 @@ class SIVACOR(Resource):
             run_tro.s("prune_performance", len(stages), "is_pruned"),
             "Record workspace prune TRP",
         )
-        workflow |= step(run_tro.s("sign", 0, None), "Sign TRO")
+        # Signing runs on the manager, not on the worker holding the workspace --
+        # sign_tro is declared on LOCAL_QUEUE and is exempt from pin_chain. See
+        # routing.UNPINNED_TASKS.
+        workflow |= step(sign_tro.s(), "Sign TRO")
         workflow |= step(upload_workspace.s(), "Upload Replicated Package")
         workflow |= step(finalize_job.s(), "Finalize Job Submission")
         try:

@@ -47,7 +47,7 @@ def gpg_mock() -> mock.MagicMock:
             # Customize mock for specific test needs
             gpg_mock.sign.return_value = "custom_signature"
 
-            with mock.patch("tro_utils.tro_utils.gnupg.GPG", return_value=gpg_mock):
+            with mock.patch("gnupg.GPG", return_value=gpg_mock):
                 # Your test code here
                 pass
     """
@@ -86,7 +86,15 @@ def patched_gpg(
     The gpg_mock is available as patched_gpg.return_value if you need
     to access or customize it during the test.
     """
-    with mock.patch("tro_utils.tro_utils.gnupg.GPG", return_value=gpg_mock) as patch:
+    # Patch GPG on the `gnupg` module itself, NOT as
+    # "tro_utils.tro_utils.gnupg.GPG". From tro-utils 0.4.6 the `import gnupg`
+    # lives inside TRO._gpg() rather than at module scope, so that attribute no
+    # longer exists on tro_utils.tro_utils and mock.patch falls back to importing
+    # it as a package: "No module named 'tro_utils.tro_utils.gnupg';
+    # 'tro_utils.tro_utils' is not a package" -- 22 fixture errors, none of which
+    # name the real cause. Patching the attribute on `gnupg` is also
+    # import-style-agnostic: it works whether tro-utils imports eagerly or lazily.
+    with mock.patch("gnupg.GPG", return_value=gpg_mock) as patch:
         yield patch
 
 

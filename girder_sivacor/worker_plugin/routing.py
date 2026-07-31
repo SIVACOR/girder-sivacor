@@ -48,6 +48,23 @@ QUEUE_PREFIX = f"{DISPATCH_QUEUE}."
 #: minutes and it re-fires every 10.
 LOCAL_QUEUE = "local"
 
+#: Steps that must NOT be pinned to the submitting worker's private queue,
+#: matched on the last dotted component of the celery task name.
+#:
+#: ``sign_tro`` is declared on :data:`LOCAL_QUEUE` because the manager is the
+#: only host holding the TRS *private* key (see the plan's D2). Left pinned, it
+#: would follow the chain onto the worker and either fail there or -- worse,
+#: during a transition where a worker still has key material -- succeed, which
+#: is a silent regression of the whole point.
+#:
+#: Discrimination is by task *name* on purpose. Skipping links that "already
+#: have a queue" looks equivalent and is not: links arrive carrying
+#: :data:`DISPATCH_QUEUE` (from the task default and the chain's
+#: ``apply_async(queue=...)``), so a presence check would skip every step, pin
+#: nothing, and scatter one submission's chain across workers that do not hold
+#: its workspace.
+UNPINNED_TASKS = frozenset({"sign_tro"})
+
 
 def worker_queue(task):
     """Return the private queue name of the worker running ``task``.
@@ -70,6 +87,11 @@ def pin_chain(task, queue):
     signatures (in reverse order); celery re-reads their ``options`` when it
     publishes each one, so overriding the queue here is enough to redirect
     everything downstream.
+
+    Steps named in :data:`UNPINNED_TASKS` keep whatever queue they were built
+    with. Called once per submission, from the head of the chain.
     """
     for link in getattr(task.request, "chain", None) or []:
+        if link.get("task", "").rsplit(".", 1)[-1] in UNPINNED_TASKS:
+            continue
         link.setdefault("options", {})["queue"] = queue

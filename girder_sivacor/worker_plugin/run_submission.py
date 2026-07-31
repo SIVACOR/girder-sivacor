@@ -326,9 +326,14 @@ def skip_condition(condition, submission):
     return False
 
 
-@app.task(queue=DISPATCH_QUEUE, bind=True)
-@submission_task("Failed to run TRO utilities")
-def run_tro(task, api, submission, action, inumber, condition):
+def _run_tro(task, api, submission, action, inumber, condition):
+    """Body shared by :func:`run_tro` and :func:`sign_tro`.
+
+    Split out so the signing action can be its own celery task on
+    :data:`LOCAL_QUEUE` -- see :data:`~.routing.UNPINNED_TASKS`. Everything here
+    reaches Girder over REST and, for ``action == "sign"``, touches no workspace
+    path, so it runs equally well on the manager or on the worker.
+    """
     report(
         api,
         submission["job_id"],
@@ -343,13 +348,19 @@ def run_tro(task, api, submission, action, inumber, condition):
 
     folder_id = submission["folder_id"]
     submission_folder = api.folder(folder_id)
-    settings = api.settings(
-        [
-            PluginSettings.TRO_PROFILE,
+    # Neither GPG setting is needed unless we are signing. Since tro-utils 0.4.6
+    # the keyring is only touched by attach_public_key(), which runs from
+    # request_timestamp() -- so a non-signing step needs no fingerprint, no
+    # passphrase, and no keyring at all. Asking for them unconditionally would
+    # ship the TRS signing credential to every remote worker, 4 + 2N times per
+    # submission, for nothing.
+    setting_keys = [PluginSettings.TRO_PROFILE]
+    if action == "sign":
+        setting_keys += [
             PluginSettings.TRO_GPG_FINGERPRINT,
             PluginSettings.TRO_GPG_PASSPHRASE,
         ]
-    )
+    settings = api.settings(setting_keys)
 
     tro_file = f"/tmp/tro-{submission['job_id']}.jsonld"
     tro_obj = None
@@ -364,8 +375,11 @@ def run_tro(task, api, submission, action, inumber, condition):
         profile.seek(0)
         tro = TRO(
             filepath=tro_file,
-            gpg_fingerprint=settings[PluginSettings.TRO_GPG_FINGERPRINT],
-            gpg_passphrase=settings[PluginSettings.TRO_GPG_PASSPHRASE],
+            # Both None for every non-signing action. trs_signature() raises a
+            # clear RuntimeError for either one missing, so a mis-routed sign step
+            # fails loudly rather than silently producing an unsigned TRO.
+            gpg_fingerprint=settings.get(PluginSettings.TRO_GPG_FINGERPRINT),
+            gpg_passphrase=settings.get(PluginSettings.TRO_GPG_PASSPHRASE),
             profile=profile.name,
             extra_context={"sivacor": "https://vocabulary.sivacor.org/0.1/"},
             tro_creator="SIVACOR/tro_utils",
@@ -447,6 +461,35 @@ def run_tro(task, api, submission, action, inumber, condition):
     api.set_folder_metadata(folder_id, meta)
 
     return submission
+
+
+@app.task(queue=DISPATCH_QUEUE, bind=True)
+@submission_task("Failed to run TRO utilities")
+def run_tro(task, api, submission, action, inumber, condition):
+    return _run_tro(task, api, submission, action, inumber, condition)
+
+
+@app.task(queue=LOCAL_QUEUE, bind=True)
+@submission_task("Failed to sign TRO")
+def sign_tro(task, api, submission):
+    """Sign and timestamp the declaration -- on the manager, not the worker.
+
+    Signing is the one step that needs the TRS *private* key, so it is the one
+    step that must not run on an ephemeral, fully-automated VM: a compromised
+    worker holding that key could mint TROs indistinguishable from real ones.
+    :data:`LOCAL_QUEUE` is consumed only by the manager's co-located worker,
+    which is where the keyring lives.
+
+    It can run there because the action is workspace-free: it downloads the
+    declaration from Girder like every other ``run_tro`` action, and unlike
+    ``add_arrangement`` it never walks the workspace directory. The chain
+    therefore bounces worker -> manager -> worker, with ``upload_workspace``
+    resuming on the worker that still holds the files.
+
+    :data:`~.routing.UNPINNED_TASKS` is what keeps ``pin_chain`` from dragging
+    this step back onto the worker's private queue.
+    """
+    return _run_tro(task, api, submission, "sign", 0, None)
 
 
 def _performance_attributes(api, folder_id, stage_num):

@@ -17,7 +17,11 @@ requirements = [
     "pylibacl",
     "py-cpuinfo",
     "randomname",
-    "tro-utils>=0.4.5",
+    # >=0.4.6 is load-bearing, not cosmetic: from that release tro-utils only
+    # touches the GPG keyring when signing, which is what lets non-signing hosts
+    # run without key material. Against 0.4.5 a host with no keyring raises
+    # KeyError(<fingerprint>) from TRO's constructor, on the first TRO step.
+    "tro-utils>=0.4.6",
 ]
 
 setup(
