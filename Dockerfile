@@ -95,7 +95,18 @@ RUN python3 -m pip install \
   python3 -m pip check || true
 
 RUN python3 -m pip install --no-cache-dir gunicorn uvicorn[standard] uvicorn-worker
-RUN groupadd -g 1000 girder && groupadd -g 112 docker && useradd -g 1000 -G 112 -u 1000 -m -s /bin/bash girder
+# The baked docker GID is only a fallback, and it is NOT reliable: a fresh JS2
+# Ubuntu 24.04 host came up with 127, not 112. Anything that needs the docker socket
+# must override the group at RUN time, because the group baked here cannot match
+# every host:
+#   docker run   ->  --group-add "$(getent group docker | cut -d: -f3)"
+#   Swarm        ->  user: "1000:<host docker gid>"   (group_add is rejected by
+#                    `docker stack config`, so the primary group is the only lever)
+# Overridable at build time for a host whose GID is known: --build-arg DOCKER_GID=127
+ARG DOCKER_GID=112
+RUN groupadd -g 1000 girder \
+ && groupadd -g "${DOCKER_GID}" docker \
+ && useradd -g 1000 -G "${DOCKER_GID}" -u 1000 -m -s /bin/bash girder
 
 EXPOSE 8080
 
