@@ -107,15 +107,34 @@ def stop_accepting_submissions(app, task) -> str | None:
     Returns the node name it was sent to, or ``None`` if this is not an ephemeral
     worker (the manager's static worker must keep consuming).
 
-    **This narrows the window, it does not close it.** ``cancel_consumer`` is a
-    broadcast over the broker and takes effect asynchronously, and submissions are
-    acked on receipt rather than on completion -- so a worker can be handed a second
-    submission in the gap. ``--concurrency=1 --prefetch-multiplier=1`` keeps that to
-    at most one extra, and the consequence is mild: the second submission's chain is
-    pinned to the same private queue and simply runs after the first. The controller
-    should therefore treat ``desired == depth`` as accurate rather than guaranteed,
-    and P3.3's supervisor must check for *no active tasks* rather than assuming one
-    submission per instance.
+    **This does not close the window, and at worker startup it does not even narrow
+    it.** Measured on a live fleet 2026-08-01 (worker ``43809fad``)::
+
+        22:08:54,634  celery@e0b70779f65f ready.
+        22:08:54,639  Task prepare_submission[332a7e23] received     +5 ms
+        22:08:54,642  Task prepare_submission[7b118611] received     +3 ms
+        22:08:54,693  Ephemeral worker ... stopped consuming sivacor +51 ms too late
+
+    Both messages arrive in the worker's *initial prefetch*, milliseconds after
+    ``ready`` and before any task code exists to call this function. So a faster
+    cancel cannot help: this is not unlucky timing, it is the normal case. Whenever
+    two or more submissions are queued at the moment a worker registers, that worker
+    takes exactly two -- deterministic, and bounded at one extra only by
+    ``--concurrency=1 --prefetch-multiplier=1``.
+
+    What this function still buys is the *steady state*: a worker that has been up a
+    while and finishes its submission will not be handed another.
+
+    The consequence of the extra one is mild -- the second chain is pinned to the same
+    private queue and simply runs after the first -- but it is not rare, so:
+    the controller must treat ``desired == depth`` as accurate rather than guaranteed
+    (one instance per fleet round may end up idle), and P3.3's supervisor must check
+    for *no active tasks* rather than assuming one submission per instance.
+
+    Closing it properly means ``task_acks_late`` on the dispatch-queue task, so the
+    message stays unacked while ``prepare_submission`` runs and prefetch=1 actually
+    binds. See D8 in ``autoscaling_plan.md`` -- not done, and it has a Redis
+    ``visibility_timeout`` interaction that has to be settled first.
     """
     if not is_ephemeral_worker():
         return None
