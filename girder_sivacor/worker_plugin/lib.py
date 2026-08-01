@@ -616,7 +616,22 @@ def recorded_run(api, submission, stage, env_vars, task=None):
             type="bind",
         ),
     ]
-    if stata_license_hostpath := os.environ.get("STATA_LICENSE_HOSTPATH"):
+    # Only Stata images get the license, and only if the file is really there.
+    # Ungated, this mounted the license into *every* container, so a missing
+    # license file failed unrelated images (a dynare run died on
+    # `bind source path does not exist: .../stata.lic.19`). type="bind" does not
+    # auto-create the source the way a legacy -v bind does, so the whole
+    # submission fails at container create. Invisible on the manager, where the
+    # file exists; guaranteed on a fresh ephemeral worker, where it does not.
+    if is_stata(image_reference):
+        stata_license_hostpath = os.environ.get("STATA_LICENSE_HOSTPATH")
+        if not stata_license_hostpath or not os.path.exists(stata_license_hostpath):
+            # Fail here rather than let Stata start unlicensed: it exits non-zero
+            # inside the container and the real reason never reaches the user.
+            raise ValueError(
+                "Stata image requested but no license available on this worker: "
+                f"STATA_LICENSE_HOSTPATH={stata_license_hostpath!r}"
+            )
         mounts.append(
             docker.types.Mount(
                 target="/usr/local/stata/stata.lic",
