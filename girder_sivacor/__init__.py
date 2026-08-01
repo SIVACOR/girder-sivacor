@@ -65,6 +65,7 @@ def _validate_reaper_thresholds(doc):
         PluginSettings.EDITORS_GROUP_NAME,
         PluginSettings.TRO_GPG_FINGERPRINT,
         PluginSettings.TRO_GPG_PASSPHRASE,
+        PluginSettings.STATA_LICENSE,
     }
 )
 def _validate_string_settings(doc):

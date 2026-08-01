@@ -341,6 +341,56 @@ def is_matlab(image_reference: str) -> bool:
     return image_reference.startswith("dynare")
 
 
+def stata_license_mount_source(api, submission, host_tmp_root: str) -> str:
+    """Host path to bind at ``/usr/local/stata/stata.lic``, materializing it if needed.
+
+    Two deployments, two answers:
+
+    * ``STATA_LICENSE_HOSTPATH`` set (the manager, dev boxes, the test suite) --
+      return it untouched. The host has the file; this is the long-standing
+      behaviour and nothing about it changes.
+    * unset (an ephemeral worker) -- fetch the license from the
+      ``sivacor.stata_license`` setting using the admin-scoped token already on
+      this task, write it into the submission's tmp dir, and return the
+      corresponding *host* path.
+
+    **Do not "improve" this by checking ``os.path.exists`` on the env var.** That
+    path names the *host* filesystem, and this code runs inside the worker
+    container, which does not mount it -- on the manager the same directory is
+    visible as ``/srv/data``, on a worker not at all. So the check would report
+    False on a perfectly licensed manager and break Stata there. Only the docker
+    daemon resolves the bind source, which is exactly why a missing file surfaces
+    as a container-create 400 rather than anything catchable here.
+
+    The license lands in ``tmp_dir``, never ``workspace_dir``: arrangements are
+    built by walking the workspace, so writing it there would hash a vendor
+    license into the TRO composition and ship it inside the researcher's
+    replication package.
+    """
+    if configured := os.environ.get("STATA_LICENSE_HOSTPATH"):
+        return configured
+
+    from ..settings import PluginSettings
+
+    settings = api.settings([PluginSettings.STATA_LICENSE])
+    license_text = (settings.get(PluginSettings.STATA_LICENSE) or "").strip()
+    if not license_text:
+        raise ValueError(
+            "A Stata image was requested but this deployment has no Stata "
+            f"license: set the '{PluginSettings.STATA_LICENSE}' Girder setting, "
+            "or STATA_LICENSE_HOSTPATH on the worker."
+        )
+
+    # tmp_dir is a path inside THIS container; host_tmp_root translates it for
+    # the docker daemon. Same two-view trick as the mounts in recorded_run.
+    container_path = os.path.join(submission["tmp_dir"], "stata.lic")
+    with open(container_path, "w") as fp:
+        fp.write(license_text if license_text.endswith("\n") else license_text + "\n")
+    os.chmod(container_path, 0o644)  # read-only mount, but the container's uid must read it
+    logging.info("Materialized Stata license for submission %s", submission["job_id"])
+    return os.path.join(host_tmp_root, container_path.lstrip("/"))
+
+
 def stata_error(log_content: str) -> str | None:
     # if any of the lines contains r([0-9]+); return True
     regex = r"r\(\d+\);"
@@ -616,22 +666,17 @@ def recorded_run(api, submission, stage, env_vars, task=None):
             type="bind",
         ),
     ]
-    # Only Stata images get the license, and only if the file is really there.
-    # Ungated, this mounted the license into *every* container, so a missing
-    # license file failed unrelated images (a dynare run died on
-    # `bind source path does not exist: .../stata.lic.19`). type="bind" does not
-    # auto-create the source the way a legacy -v bind does, so the whole
+    # Only Stata images get the license. Ungated, this mounted it into *every*
+    # container, so a missing license file failed unrelated images (a dynare run
+    # died on `bind source path does not exist: .../stata.lic.19`). type="bind"
+    # does not auto-create the source the way a legacy -v bind does, so the whole
     # submission fails at container create. Invisible on the manager, where the
-    # file exists; guaranteed on a fresh ephemeral worker, where it does not.
+    # file exists; guaranteed on a fresh ephemeral worker, where it does not --
+    # see stata_license_mount_source for how a worker gets one.
     if is_stata(image_reference):
-        stata_license_hostpath = os.environ.get("STATA_LICENSE_HOSTPATH")
-        if not stata_license_hostpath or not os.path.exists(stata_license_hostpath):
-            # Fail here rather than let Stata start unlicensed: it exits non-zero
-            # inside the container and the real reason never reaches the user.
-            raise ValueError(
-                "Stata image requested but no license available on this worker: "
-                f"STATA_LICENSE_HOSTPATH={stata_license_hostpath!r}"
-            )
+        stata_license_hostpath = stata_license_mount_source(
+            api, submission, host_tmp_root
+        )
         mounts.append(
             docker.types.Mount(
                 target="/usr/local/stata/stata.lic",
