@@ -103,6 +103,27 @@ class GirderApi:
             logger.warning("Heartbeat failed for job %s", job_id, exc_info=True)
             return False
 
+    def claim(self, job_id, queue):
+        """Record server-side that ``queue``'s worker has taken this submission.
+
+        The autoscaler reads this to tell a *spent* worker from an available one
+        (D8). Best effort, like the heartbeat: failing to record it means the
+        controller keeps counting this instance as capacity, which delays the next
+        submission -- bad, but never worth failing a submission that is otherwise
+        fine. The next tick self-corrects if a later call succeeds.
+        """
+        try:
+            self.client.post(
+                f"sivacor/claim/{job_id}", parameters={"queue": queue}
+            )
+            return True
+        except Exception:
+            logger.warning(
+                "Could not record worker queue %s for job %s", queue, job_id,
+                exc_info=True,
+            )
+            return False
+
     # -- collections, groups and access -----------------------------------
 
     def _find_collection(self, name):

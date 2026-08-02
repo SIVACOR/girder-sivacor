@@ -245,6 +245,11 @@ def prepare_submission(task, userId, fileId, stages, job_id):
     # rest of the chain for this worker before doing anything else.
     queue = worker_queue(task)
     pin_chain(task, queue)
+    # Tell the server this worker is now spent, BEFORE the slow work below. The
+    # autoscaler counts instances that have not claimed anything as available
+    # capacity, so every second this goes unrecorded is a second it may refuse to
+    # create the instance the next submission needs (D8 / P3.5).
+    api.claim(job_id, queue)
     # ...and, if this instance exists only to serve one submission, stop taking new
     # ones now. Best-effort: failing to cancel the consumer means the controller may
     # over-count headroom, which is worth a warning but never worth failing a

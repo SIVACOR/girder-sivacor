@@ -104,6 +104,7 @@ class SIVACOR(Resource):
         self.route("POST", ("cleanup",), self.cleanup_submissions)
         self.route("POST", ("reap",), self.reap_submissions)
         self.route("POST", ("heartbeat", ":id"), self.heartbeat)
+        self.route("POST", ("claim", ":id"), self.claim)
         self.route("GET", ("image_tags",), self.get_image_tags)
         self.route("DELETE", ("submission", ":id"), self.delete_submission)
 
@@ -333,6 +334,38 @@ class SIVACOR(Resource):
             {"_id": job["_id"]}, {"$set": {"meta.heartbeat": now}}
         )
         return {"heartbeat": now}
+
+    @access.admin
+    @autoDescribeRoute(
+        Description("Record which worker queue a submission was claimed by.")
+        .notes(
+            "Called once by prepare_submission, right after the chain is pinned. "
+            "This is what lets the autoscaler tell a *spent* worker from an "
+            "available one: an ephemeral worker stops consuming the dispatch "
+            "queue the moment it claims a submission, so counting it as capacity "
+            "makes the controller refuse to create the instance the next "
+            "submission needs. See D8 in autoscaling_plan.md.\n\n"
+            "Deliberately recorded server-side rather than read back over the "
+            "broker: 'celery inspect active_queues' would answer the same "
+            "question, but a worker whose broker connection has died cannot "
+            "answer it -- and that is exactly the case where the number matters."
+        )
+        .modelParam(
+            "id",
+            "The ID of the submission job.",
+            model=Job,
+            force=True,
+            required=True,
+        )
+        .param("queue", "The worker's private queue name.", required=True)
+    )
+    def claim(self, job, queue):
+        # Same reasoning as heartbeat: bypass updateJob() so this cannot trigger
+        # the status handler's folder write and email.
+        Job().collection.update_one(
+            {"_id": job["_id"]}, {"$set": {"meta.worker_queue": queue}}
+        )
+        return {"worker_queue": queue}
 
     @access.admin
     @autoDescribeRoute(
