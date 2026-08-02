@@ -25,6 +25,7 @@ from tro_utils.tro_utils import TRO
 from ..settings import PluginSettings
 from .girder_api import GirderApi, dump_to_zip
 from .lib import (
+    _redis_client_sync,
     get_project_dir,
     reap_orphaned_containers,
     recorded_run,
@@ -33,6 +34,8 @@ from .lib import (
 from .routing import (
     DISPATCH_QUEUE,
     LOCAL_QUEUE,
+    configured_worker_queue,
+    instance_id_of,
     pin_chain,
     stop_accepting_submissions,
     worker_queue,
@@ -715,6 +718,79 @@ def _sweep_orphaned_containers(sender=None, **kwargs):
         reap_orphaned_containers()
     except Exception:
         logger.warning("Orphan container sweep failed", exc_info=True)
+
+
+#: How long a readiness marker outlives the worker that wrote it. Only garbage
+#: collection: it must stay comfortably above the controller's ``max_lifetime``
+#: (30 h) so a marker can never expire out from under an instance that is still
+#: running, which would make a healthy worker look like it never provisioned.
+READY_MARKER_TTL_SECONDS = 48 * 60 * 60
+
+#: Redis key prefix for readiness markers, read by ``sivacor-autoscaler``.
+READY_KEY_PREFIX = "sivacor:ready:"
+
+
+@worker_ready.connect
+def _announce_ready(sender=None, **kwargs):
+    """Record that this instance got far enough to consume work (plan D9).
+
+    The controller classifies a live instance as *spent* (has claimed a
+    submission) or *available* (has not). A VM that boots but fails to provision
+    lands in the second bucket permanently: it never claims, never serves, and so
+    absorbs a submission's worth of capacity forever, while being unable to
+    reclaim itself because the self-shutdown supervisor is written by the same
+    script that failed. Observed 2026-08-02: ``unattended-upgrades`` held the dpkg
+    lock, ``worker-cloud-init.sh`` aborted under ``set -e``, and the instance sat
+    ACTIVE and useless for an entire run.
+
+    Absence of a marker past a boot deadline is what lets the controller tell that
+    apart from "still booting" and from "healthy and idle".
+
+    **Written here, from ``worker_ready``, rather than at the end of cloud-init**,
+    because this fires only once celery has actually started *and* connected to the
+    broker. A cloud-init marker would prove the script ran, which is strictly
+    weaker: a wrong docker GID (P1.3 finding 3, and GID 127 vs the baked 112) or a
+    bad broker password produces a completed script and a dead worker -- the
+    phantom, with a readiness marker on it.
+
+    **Redis rather than Girder**, unlike the sibling ``claim`` marker, because a
+    worker holds no Girder credential until an admin-scoped token arrives with a
+    task; ``worker.env`` deliberately omits one (see P2.4). It carries the broker
+    password from boot. This is not the broadcast D8 rejected: the marker is a
+    durable write-once fact, so nothing needs to be reachable afterwards for it to
+    stay true.
+
+    **Not gated on ``is_ephemeral_worker()`` deliberately.** A hand-made debug VM
+    launched with ``EPHEMERAL_WORKER=0`` still carries the ``sivacor-worker`` tag
+    and so is still visible to the controller's sweep; gating would leave it
+    unmarked and get it deleted. Writing unconditionally also puts a harmless
+    ``sivacor:ready:static-01`` on the manager, matching how the spent-worker
+    signal already treats that name.
+
+    Best effort, like the heartbeat: a worker that cannot write this is still a
+    worker, and failing startup over it would turn a Redis blip into a lost VM.
+    """
+    queue = configured_worker_queue()
+    instance = instance_id_of(queue) if queue else None
+    if not instance:
+        # Nothing to announce: no configured queue means no stable identity the
+        # controller could match against an OpenStack instance.
+        logger.debug("No configured worker queue; skipping readiness marker")
+        return
+    try:
+        _redis_client_sync().set(
+            f"{READY_KEY_PREFIX}{instance}",
+            datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            ex=READY_MARKER_TTL_SECONDS,
+        )
+        logger.info("Announced worker readiness for instance %s", instance)
+    except Exception:
+        logger.warning(
+            "Could not announce readiness for instance %s; the controller may "
+            "treat this instance as failed once its boot deadline passes",
+            instance,
+            exc_info=True,
+        )
 
 
 @app.on_after_configure.connect

@@ -69,6 +69,34 @@ LOCAL_QUEUE = "local"
 UNPINNED_TASKS = frozenset({"sign_tro"})
 
 
+def configured_worker_queue() -> str | None:
+    """The private queue name from the environment, or ``None`` if unset.
+
+    Split out of :func:`worker_queue` because startup-time code has no task to
+    derive a node name from -- see :func:`~.run_submission._announce_ready`, which
+    runs on ``worker_ready``. ``worker-cloud-init.sh`` always writes
+    ``SIVACOR_WORKER_QUEUE`` into ``worker.env``, so on a fleet instance this is
+    populated well before the first task arrives.
+    """
+    return os.environ.get("SIVACOR_WORKER_QUEUE") or None
+
+
+def instance_id_of(queue: str) -> str | None:
+    """The OpenStack instance id embedded in a private queue name.
+
+    A fleet worker's queue is ``sivacor.<instance-uuid>``
+    (``worker-cloud-init.sh`` derives it from the metadata service), so the queue
+    name *is* the instance name -- the same identity the autoscaler recovers from
+    the ``claim`` marker. Returns ``None`` for a queue that carries no prefix.
+
+    Names that carry the prefix but are not instance ids -- ``sivacor.static-01``
+    on the manager -- come back as ``static-01``, which never matches an OpenStack
+    id and so is inert on the controller side. Documented rather than filtered,
+    exactly as the autoscaler documents it for spent workers.
+    """
+    return queue[len(QUEUE_PREFIX):] if queue.startswith(QUEUE_PREFIX) else None
+
+
 def worker_queue(task):
     """Return the private queue name of the worker running ``task``.
 
@@ -77,7 +105,7 @@ def worker_queue(task):
     agrees with us without extra configuration. ``SIVACOR_WORKER_QUEUE`` wins
     if the deployment names its queues some other way.
     """
-    if queue := os.environ.get("SIVACOR_WORKER_QUEUE"):
+    if queue := configured_worker_queue():
         return queue
     hostname = getattr(task.request, "hostname", None) or "unknown"
     return QUEUE_PREFIX + hostname.split("@")[-1]
