@@ -106,6 +106,7 @@ class SIVACOR(Resource):
         self.route("POST", ("heartbeat", ":id"), self.heartbeat)
         self.route("POST", ("claim", ":id"), self.claim)
         self.route("GET", ("image_tags",), self.get_image_tags)
+        self.route("GET", ("workflow_schema",), self.get_workflow_schema)
         self.route("DELETE", ("submission", ":id"), self.delete_submission)
 
     @access.user
@@ -473,6 +474,19 @@ class SIVACOR(Resource):
     def get_image_tags(self):
         tags = self._get_tags()
         return tags
+
+    @access.public
+    @autoDescribeRoute(
+        Description(
+            "Get the JSON schema a replication workflow definition must satisfy."
+        ).notes(
+            "The same schema submit_job validates its body against, so clients "
+            "(e.g. the submission UI importing a workflow from a YAML/JSON file) "
+            "can check a definition before submitting it."
+        )
+    )
+    def get_workflow_schema(self):
+        return stage_schema
 
     @staticmethod
     def _get_tags():
