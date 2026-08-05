@@ -413,3 +413,30 @@ def test_duration_calculation_in_email(
         assert (
             "second" in message_str or "minute" in message_str or "hour" in message_str
         )
+
+
+def test_email_urls_follow_the_deployment_domain(monkeypatch):
+    """Emails must not point a test deployment's users at production.
+
+    All three mail contexts hardcoded submit.sivacor.org, so the test stack sent
+    "View details here: https://submit.sivacor.org/" to a real researcher. The
+    URLs now derive from DOMAIN, which docker-stack.yml already sets from
+    ${domain}.
+    """
+    from girder_sivacor.notifications import email_urls
+
+    monkeypatch.setenv("DOMAIN", "test.sivacor.org")
+    urls = email_urls()
+    assert urls["submission_url"] == "https://submit.test.sivacor.org/"
+    assert urls["base_url"] == "https://submit.test.sivacor.org"
+    assert urls["feedback_url"] == "https://feedback.test.sivacor.org"
+    assert urls["logo_url"].startswith("https://submit.test.sivacor.org/")
+    # One docs site for every deployment; a test stack has none of its own.
+    assert urls["docs_url"] == "https://docs.sivacor.org"
+
+    # Unset DOMAIN must reproduce the previous production values exactly.
+    monkeypatch.delenv("DOMAIN", raising=False)
+    prod = email_urls()
+    assert prod["submission_url"] == "https://submit.sivacor.org/"
+    assert prod["base_url"] == "https://submit.sivacor.org"
+    assert prod["feedback_url"] == "https://feedback.sivacor.org"

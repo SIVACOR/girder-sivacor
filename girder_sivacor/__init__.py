@@ -20,12 +20,14 @@ from girder_oauth.providers import addProvider
 from girder_oauth.settings import PluginSettings as OAuthSettings
 
 from .auth.orcid import ORCID
+from .notifications import (
+    _createMessage,
+    _sendmail,
+    email_urls,
+    set_submission_status,
+)
 from .rest import SIVACOR, get_submission_child_jobs
 from .settings import PluginSettings
-from .worker_plugin import (
-    _createMessage,
-    _sendmail
-)
 
 logger = logging.getLogger(__name__)
 
@@ -46,11 +48,24 @@ def _validate_retention_days(doc):
 
 
 @setting_utilities.validator(
+    {PluginSettings.HEARTBEAT_TIMEOUT, PluginSettings.MAX_RUNTIME}
+)
+def _validate_reaper_thresholds(doc):
+    value = doc.get("value")
+    # Zero would fail every running submission on the next sweep, so unlike
+    # the retention window these have to be strictly positive.
+    if not isinstance(value, float) or value <= 0.0:
+        raise ValidationException("This setting must be a positive number.")
+    return value
+
+
+@setting_utilities.validator(
     {
         PluginSettings.SUBMISSION_COLLECTION_NAME,
         PluginSettings.EDITORS_GROUP_NAME,
         PluginSettings.TRO_GPG_FINGERPRINT,
         PluginSettings.TRO_GPG_PASSPHRASE,
+        PluginSettings.STATA_LICENSE,
     }
 )
 def _validate_string_settings(doc):
@@ -123,12 +138,8 @@ def send_approval_email(event: events.Event) -> None:
     user = event.info["user"]
     context = {
         "user": user,
-        "base_url": "https://submit.sivacor.org",
-        "docs_url": "https://docs.sivacor.org",
-        "feedback_url": "https://feedback.sivacor.org",
+        **email_urls(),
         "current_year": datetime.datetime.now().year,
-        "logo_url": "https://submit.sivacor.org/sivacor_logo_notext_trans.png",
-        "submission_url": "https://submit.sivacor.org/",
     }
     text_content = (
         f"Hello Admin,\n\n"
@@ -150,12 +161,8 @@ def send_approved_email(event: events.Event) -> None:
     user = event.info["user"]
     context = {
         "user": user,
-        "base_url": "https://submit.sivacor.org",
-        "docs_url": "https://docs.sivacor.org",
-        "feedback_url": "https://feedback.sivacor.org",
+        **email_urls(),
         "current_year": datetime.datetime.now().year,
-        "logo_url": "https://submit.sivacor.org/sivacor_logo_notext_trans.png",
-        "submission_url": "https://submit.sivacor.org/",
     }
     text_content = (
         f"Hello {user['firstName']} {user['lastName']},\n\n"
@@ -270,6 +277,9 @@ class SIVACORPlugin(GirderPlugin):
         info["apiRoot"].sivacor = SIVACOR()
         getPlugin("jobs").load(info)
         events.bind("jobs.cancel", "sivacor", cancel_jobs)
+        # Workers report progress over REST, so this fires here rather than in
+        # the worker process as it used to.
+        events.bind("jobs.job.update.after", "sivacor", set_submission_status)
         info["apiRoot"].job.route("GET", (":id", "children"), get_submission_child_jobs)
 
         FolderResource.find.description.param(

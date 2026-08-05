@@ -1,12 +1,13 @@
 import base64
 import functools
-import io
 import json
 import logging
 import math
 import os
 import queue
 import re
+import shutil
+import socket
 import stat
 import tempfile
 import time
@@ -21,14 +22,6 @@ import numpy as np
 import pandas as pd
 import redis
 import requests
-from girder.models.file import File
-from girder.models.folder import Folder
-from girder.models.item import Item
-from girder.models.setting import Setting
-from girder.models.upload import Upload
-from girder.models.user import User
-from girder.settings import SettingKey
-from girder.utility import RequestBodyStream
 
 MASTER_KEY_HEX = os.environ.get(
     "MASTER_KEY_HEX", "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
@@ -36,6 +29,10 @@ MASTER_KEY_HEX = os.environ.get(
 _master_key = bytes.fromhex(MASTER_KEY_HEX)
 MASTER_AES = AESGCM(_master_key)
 MASK = "***SECRET_REDACTED***"
+
+#: Seconds between liveness pings while a user's container runs. Cheap enough
+#: to be frequent; the server's staleness threshold is a large multiple of it.
+HEARTBEAT_INTERVAL = 60
 
 
 class NpEncoder(json.JSONEncoder):
@@ -64,49 +61,73 @@ def decrypt_job_secrets(encrypted_secrets_b64, wrapped_job_key_b64):
     return json.loads(decrypted_json.decode("utf-8"))
 
 
-def annotate_item_type(file_obj: dict, item_type: str) -> None:
-    item = Item().load(file_obj["itemId"], force=True)
-    if "type" not in item["meta"]:
-        Item().setMetadata(item, {"type": item_type})
-
-
 def get_project_dir(submission):
     return os.path.join(submission["workspace_dir"], "project")
 
 
-def _update_file_from_path(file, path, user):
-    size = os.path.getsize(path)
-    upload = Upload().createUploadToFile(
-        file=file, user=user, size=size, reference=None, assetstore=None
-    )
-    if size == 0:
-        return Upload().finalizeUpload(upload)
+#: Labels stamped on every analysis container so a restarted worker can identify
+#: its own leftovers. Scoped by queue rather than just by job: in a dev setup two
+#: workers can share one docker socket, and a sweep must never touch a container
+#: belonging to the other one.
+ORPHAN_LABEL_QUEUE = "org.sivacor.worker_queue"
+ORPHAN_LABEL_JOB = "org.sivacor.job_id"
 
-    chunkSize = Upload()._getChunkSize()
-    with open(path, "rb") as f:
-        while True:
-            data = f.read(chunkSize)
-            if not data:
-                break
-            upload = Upload().handleChunk(
-                upload, RequestBodyStream(io.BytesIO(data), len(data))
+
+def worker_queue_name() -> str:
+    """This worker's private queue name, as the deployment sets it.
+
+    Mirrors ``routing.worker_queue`` but without a celery task in hand -- the
+    startup sweep runs before any task exists. Falls back to the hostname, which
+    is what routing derives from the celery node name.
+    """
+    return os.environ.get("SIVACOR_WORKER_QUEUE") or f"sivacor.{socket.gethostname()}"
+
+
+def reap_orphaned_containers() -> list[str]:
+    """Kill analysis containers left behind by a previous incarnation.
+
+    Called once at worker startup. Anything still carrying *this* worker's queue
+    label at that moment is by definition an orphan: a fresh worker process has
+    no task in flight, so it cannot legitimately own a running container. That
+    reasoning is what makes this safe without asking Girder anything -- which
+    matters, because the worker has no database and no standing credential.
+
+    Best-effort by design: a docker daemon that is unreachable, or a container
+    that vanishes mid-sweep, must not stop the worker from starting.
+    """
+    queue = worker_queue_name()
+    reaped: list[str] = []
+    try:
+        cli = docker.from_env()
+        stale = cli.containers.list(
+            all=True, filters={"label": f"{ORPHAN_LABEL_QUEUE}={queue}"}
+        )
+    except Exception:
+        logging.warning("Orphan sweep skipped: docker unavailable", exc_info=True)
+        return reaped
+
+    for container in stale:
+        job_id = (container.labels or {}).get(ORPHAN_LABEL_JOB, "unknown")
+        try:
+            if container.status == "running":
+                logging.warning(
+                    "Killing orphaned analysis container %s (job %s) left by a "
+                    "previous worker incarnation",
+                    container.name,
+                    job_id,
+                )
+                container.kill()
+            container.remove(force=True)
+            reaped.append(container.name)
+        except docker.errors.NotFound:
+            pass
+        except Exception:
+            logging.warning(
+                "Could not reap orphaned container %s", container.name, exc_info=True
             )
-    return upload
-
-
-def _dump_from_fileobj(in_f, out_f, is_zip=False, arcname=None):
-    chunk_size = Setting().get(SettingKey.FILEHANDLE_MAX_SIZE)
-    while True:
-        chunk = in_f.read(chunk_size)
-        if not chunk:
-            break
-        if is_zip:
-            if arcname:
-                out_f.writestr(arcname, chunk)
-            else:
-                out_f.writestr(in_f._file["name"], chunk)
-        else:
-            out_f.write(chunk)
+    if reaped:
+        logging.warning("Orphan sweep reaped %d container(s): %s", len(reaped), reaped)
+    return reaped
 
 
 @functools.lru_cache
@@ -158,6 +179,9 @@ class DockerStatsCollectorThread(Thread):
         self.daemon = True
         self.container = container
         self.output_path = output_path
+        #: Readings actually recorded. ``recorded_run`` uses this to say *why* a
+        #: metric is missing instead of silently emitting NaN.
+        self.samples = 0
 
     def container_finished(self, ts):
         try:
@@ -174,39 +198,59 @@ class DockerStatsCollectorThread(Thread):
                 "Block IO Read,Block IO Write,PIDs\n"
             )
             fp.write(header)
-        while True:
-            try:
-                d = self.container.stats(stream=False)
-            except docker.errors.NotFound:
-                break
-            ts = d["read"]
+        # stream=True yields its first reading within milliseconds; stream=False
+        # blocks 1-2s because it waits for the two CPU readings a delta needs. That
+        # delay meant a container finishing inside the window was never sampled at
+        # all -- measured: a 1s container produced zero rows, 3s produced one. So
+        # any submission whose stage was quick got no metrics and, worse, an empty
+        # CSV that made the aggregation emit NaN into a signed TRO artifact.
+        #
+        # The tradeoff is that the first reading has no precpu baseline, so its
+        # CPU% is 0.0 -- exactly what `docker stats` prints on its first line.
+        # Memory, network and block IO are all real from the very first sample.
+        try:
+            stream = self.container.stats(stream=True, decode=True)
+        except docker.errors.NotFound:
+            return
+        for d in stream:
+            # Metrics are best-effort: a malformed reading must not raise in a
+            # daemon thread, where it would surface only as an unhandled-exception
+            # warning and silently stop collection for the rest of the run.
+            if not isinstance(d, dict):
+                logging.warning("Ignoring unexpected docker stats payload: %r", type(d))
+                continue
+            ts = d.get("read")
 
-            if self.container_finished(ts):
-                break
+            # Readings after the container exits keep arriving on a ~1s cadence
+            # with the zero timestamp and empty payloads, so the stream ending is
+            # not a reliable stop signal -- check the container itself.
+            if not ts or ts == "0001-01-01T00:00:00Z":
+                if self.container_finished(ts):
+                    break
+                continue
 
-            if ts != "0001-01-01T00:00:00Z":
-                mem_usage, mem_limit = self.calculate_memory(d)
-                bytes_in, bytes_out = self.calculate_network_bytes(d)
-                blkio_rd, blkio_wr = self.calculate_blkio_bytes(d)
-                cpu_percent = self.calculate_cpu_percent(d)
-                line = (
-                    f"{ts} - {cpu_percent:.2f}%, {mem_usage} / {mem_limit},"
-                    f" {bytes_in} / {bytes_out}, {blkio_rd} / {blkio_wr},"
-                    f" {d.get('pids_stats', {}).get('current', 0)}\n"
+            self.samples += 1
+            mem_usage, mem_limit = self.calculate_memory(d)
+            bytes_in, bytes_out = self.calculate_network_bytes(d)
+            blkio_rd, blkio_wr = self.calculate_blkio_bytes(d)
+            cpu_percent = self.calculate_cpu_percent(d)
+            line = (
+                f"{ts} - {cpu_percent:.2f}%, {mem_usage} / {mem_limit},"
+                f" {bytes_in} / {bytes_out}, {blkio_rd} / {blkio_wr},"
+                f" {d.get('pids_stats', {}).get('current', 0)}\n"
+            )
+            with open(self.output_path, mode="a") as fp:
+                fp.write(line)
+            with open(self.output_path + ".csv", mode="a") as fp:
+                mem_usage, mem_limit = self.calculate_memory(d, convert=False)
+                bytes_in, bytes_out = self.calculate_network_bytes(d, convert=False)
+                blkio_rd, blkio_wr = self.calculate_blkio_bytes(d, convert=False)
+                csv_line = (
+                    f'"{ts}",{cpu_percent:.2f},{mem_usage},{mem_limit},'
+                    f"{bytes_in},{bytes_out},{blkio_rd},{blkio_wr},"
+                    f"{d.get('pids_stats', {}).get('current', 0)}\n"
                 )
-                with open(self.output_path, mode="a") as fp:
-                    fp.write(line)
-                with open(self.output_path + ".csv", mode="a") as fp:
-                    mem_usage, mem_limit = self.calculate_memory(d, convert=False)
-                    bytes_in, bytes_out = self.calculate_network_bytes(d, convert=False)
-                    blkio_rd, blkio_wr = self.calculate_blkio_bytes(d, convert=False)
-                    csv_line = (
-                        f'"{ts}",{cpu_percent:.2f},{mem_usage},{mem_limit},'
-                        f"{bytes_in},{bytes_out},{blkio_rd},{blkio_wr},"
-                        f"{d.get('pids_stats', {}).get('current', 0)}\n"
-                    )
-                    fp.write(csv_line)
-            time.sleep(5)
+                fp.write(csv_line)
 
     @staticmethod
     def convert_size(size_bytes, binary=True):
@@ -295,6 +339,56 @@ def is_stata(image_reference: str) -> bool:
 
 def is_matlab(image_reference: str) -> bool:
     return image_reference.startswith("dynare")
+
+
+def stata_license_mount_source(api, submission, host_tmp_root: str) -> str:
+    """Host path to bind at ``/usr/local/stata/stata.lic``, materializing it if needed.
+
+    Two deployments, two answers:
+
+    * ``STATA_LICENSE_HOSTPATH`` set (the manager, dev boxes, the test suite) --
+      return it untouched. The host has the file; this is the long-standing
+      behaviour and nothing about it changes.
+    * unset (an ephemeral worker) -- fetch the license from the
+      ``sivacor.stata_license`` setting using the admin-scoped token already on
+      this task, write it into the submission's tmp dir, and return the
+      corresponding *host* path.
+
+    **Do not "improve" this by checking ``os.path.exists`` on the env var.** That
+    path names the *host* filesystem, and this code runs inside the worker
+    container, which does not mount it -- on the manager the same directory is
+    visible as ``/srv/data``, on a worker not at all. So the check would report
+    False on a perfectly licensed manager and break Stata there. Only the docker
+    daemon resolves the bind source, which is exactly why a missing file surfaces
+    as a container-create 400 rather than anything catchable here.
+
+    The license lands in ``tmp_dir``, never ``workspace_dir``: arrangements are
+    built by walking the workspace, so writing it there would hash a vendor
+    license into the TRO composition and ship it inside the researcher's
+    replication package.
+    """
+    if configured := os.environ.get("STATA_LICENSE_HOSTPATH"):
+        return configured
+
+    from ..settings import PluginSettings
+
+    settings = api.settings([PluginSettings.STATA_LICENSE])
+    license_text = (settings.get(PluginSettings.STATA_LICENSE) or "").strip()
+    if not license_text:
+        raise ValueError(
+            "A Stata image was requested but this deployment has no Stata "
+            f"license: set the '{PluginSettings.STATA_LICENSE}' Girder setting, "
+            "or STATA_LICENSE_HOSTPATH on the worker."
+        )
+
+    # tmp_dir is a path inside THIS container; host_tmp_root translates it for
+    # the docker daemon. Same two-view trick as the mounts in recorded_run.
+    container_path = os.path.join(submission["tmp_dir"], "stata.lic")
+    with open(container_path, "w") as fp:
+        fp.write(license_text if license_text.endswith("\n") else license_text + "\n")
+    os.chmod(container_path, 0o644)  # read-only mount, but the container's uid must read it
+    logging.info("Materialized Stata license for submission %s", submission["job_id"])
+    return os.path.join(host_tmp_root, container_path.lstrip("/"))
 
 
 def stata_error(log_content: str) -> str | None:
@@ -408,7 +502,113 @@ def _infer_run_command(submission, stage):
     return entrypoint, command, sub_dir, home_dir
 
 
-def recorded_run(submission, stage, env_vars, task=None):
+#: Abort a run when free space on the workspace filesystem drops below this.
+#: Overridable per host with ``SIVACOR_DISK_FLOOR_BYTES``.
+#:
+#: An ephemeral worker has no separate volume, so ``/var/lib/docker`` and the
+#: workspace share one filesystem: a runaway payload does not merely fail its own
+#: run, it wedges the whole VM -- the docker daemon starts failing, celery cannot
+#: write, and the submission has to be cleaned up by the server-side reaper
+#: instead of failing cleanly. Stopping at a floor converts that into one failed
+#: job with an explanatory message.
+DISK_FLOOR_BYTES = int(os.environ.get("SIVACOR_DISK_FLOOR_BYTES", 5 * 1024**3))
+
+
+def disk_shortfall(submission) -> str | None:
+    """Return an explanatory message if the workspace filesystem is nearly full.
+
+    Checked from ``recorded_run``'s existing poll loop rather than by a separate
+    watchdog, so it costs nothing extra. Returns ``None`` while there is room.
+
+    The path checked is inside the worker container, but the numbers are the
+    host's: the workspace is a bind mount, so ``statvfs`` reports the backing
+    filesystem -- the same one holding ``/var/lib/docker``.
+    """
+    path = submission.get("workspace_dir") or "/tmp"
+    try:
+        free = shutil.disk_usage(path).free
+    except OSError:
+        # Never fail a run because the check itself could not run.
+        logging.warning("Could not determine free space for %s", path, exc_info=True)
+        return None
+    if free >= DISK_FLOOR_BYTES:
+        return None
+    return (
+        f"Ran out of disk space: {free / 1024**3:.1f} GiB free on the workspace "
+        f"filesystem, below the {DISK_FLOOR_BYTES / 1024**3:.1f} GiB floor. The "
+        "replication package plus its outputs and the analysis image must fit in "
+        "the worker's disk; this submission needs more room than this worker has."
+    )
+
+
+#: How often to put a progress line in the job log while an image is pulling.
+#: Deliberately much coarser than the heartbeat: each one is an updateJob, which
+#: fires ``jobs.job.update.after`` server-side, whereas the heartbeat writes
+#: straight to the collection.
+PULL_LOG_INTERVAL = 120
+
+
+def pull_image(cli, api, submission, image_reference):
+    """Pull an image while keeping the submission visibly alive.
+
+    ``images.pull()`` blocks and emits nothing. Analysis images are pulled on
+    demand rather than baked into the worker image, and a cold dynare pull is
+    ~15 GB on disk, so that silence can run for many minutes. Meanwhile the
+    server's liveness signal is ``max(meta.heartbeat, job.updated,
+    job.created)`` measured against ``sivacor.heartbeat_timeout`` (default 30
+    min) -- so a large enough pull races the reaper, and losing that race shows
+    up to the researcher as their own submission failing.
+
+    Streaming the low-level API gives progress events to tick the heartbeat on.
+
+    Two traps this deliberately handles:
+
+    * ``cli.api.pull(stream=True)`` does **not** raise on failure the way
+      ``images.pull()`` does -- it yields an event carrying ``error``. Left
+      unchecked, a failed pull would look like success here and resurface as a
+      confusing ImageNotFound from ``containers.create`` further down.
+    * a heartbeat is best-effort; a failed ping must not fail the run, or a
+      transient Girder blip would kill a pull that is going fine.
+    """
+    job_id = submission["job_id"]
+    last_beat = last_log = time.monotonic()
+    error = None
+    layers = set()
+
+    for event in cli.api.pull(image_reference, stream=True, decode=True):
+        if not isinstance(event, dict):
+            continue
+        if event.get("error"):
+            error = event["error"]
+            break
+        if event.get("id"):
+            layers.add(event["id"])
+
+        now = time.monotonic()
+        if now - last_beat >= HEARTBEAT_INTERVAL:
+            last_beat = now
+            try:
+                api.heartbeat(job_id)
+            except Exception:
+                logging.warning("Heartbeat during image pull failed", exc_info=True)
+        if now - last_log >= PULL_LOG_INTERVAL:
+            last_log = now
+            try:
+                api.update_job(
+                    job_id,
+                    log=f"Still pulling {image_reference} ({len(layers)} layers seen)\n",
+                )
+            except Exception:
+                logging.warning("Progress report during image pull failed", exc_info=True)
+
+    if error:
+        # Infrastructure, not user error: a registry timeout or a rate limit must
+        # not read as "your replication package is broken".
+        raise RuntimeError(f"Failed to pull image {image_reference}: {error}")
+    logging.info("Pulled %s (%d layers)", image_reference, len(layers))
+
+
+def recorded_run(api, submission, stage, env_vars, task=None):
     cli = docker.from_env()
     info = cli.info()
     cpu_info = cpuinfo.get_cpu_info()
@@ -441,10 +641,11 @@ def recorded_run(submission, stage, env_vars, task=None):
     log_queue = queue.Queue()
     logging.info("Starting recorded run")
 
-    submission_folder = Folder().load(submission["folder_id"], force=True)
-    creator_id = submission_folder["meta"]["creator_id"]
-    stage_num = submission_folder["meta"]["stages"].index(stage) + 1
-    admin = User().findOne({"admin": True})
+    submission_folder = api.folder(submission["folder_id"])
+    folder_id = submission_folder["_id"]
+    folder_meta = submission_folder.get("meta", {})
+    creator_id = folder_meta["creator_id"]
+    stage_num = folder_meta["stages"].index(stage) + 1
 
     image_reference = stage["image_name"] + ":" + stage["image_tag"]
     host_tmp_root = os.environ.get("DOCKER_HOST_TMP_ROOT", "/")
@@ -465,7 +666,17 @@ def recorded_run(submission, stage, env_vars, task=None):
             type="bind",
         ),
     ]
-    if stata_license_hostpath := os.environ.get("STATA_LICENSE_HOSTPATH"):
+    # Only Stata images get the license. Ungated, this mounted it into *every*
+    # container, so a missing license file failed unrelated images (a dynare run
+    # died on `bind source path does not exist: .../stata.lic.19`). type="bind"
+    # does not auto-create the source the way a legacy -v bind does, so the whole
+    # submission fails at container create. Invisible on the manager, where the
+    # file exists; guaranteed on a fresh ephemeral worker, where it does not --
+    # see stata_license_mount_source for how a worker gets one.
+    if is_stata(image_reference):
+        stata_license_hostpath = stata_license_mount_source(
+            api, submission, host_tmp_root
+        )
         mounts.append(
             docker.types.Mount(
                 target="/usr/local/stata/stata.lic",
@@ -475,7 +686,7 @@ def recorded_run(submission, stage, env_vars, task=None):
             )
         )
 
-    cli.images.pull(image_reference)
+    pull_image(cli, api, submission, image_reference)
 
     entrypoint, command, sub_dir, home_dir = _infer_run_command(submission, stage)
     project_dir = get_project_dir(submission)
@@ -514,6 +725,16 @@ def recorded_run(submission, stage, env_vars, task=None):
         "working_dir": os.path.join(target_workspace_dir, "project", sub_dir),
         "user": user,
         "environment": environment,
+        # Analysis containers are siblings started through the docker socket, not
+        # children of this process, so nothing ties their lifetime to the worker.
+        # Kill the worker mid-run and the container keeps going -- burning a core
+        # with no one left to collect its output. These labels are what lets a
+        # restarted worker find and reap its own leftovers; see
+        # :func:`reap_orphaned_containers`.
+        "labels": {
+            ORPHAN_LABEL_QUEUE: worker_queue_name(),
+            ORPHAN_LABEL_JOB: str(submission.get("job_id", "")),
+        },
     }
     container = cli.containers.create(**container_kwargs)
     # redact env in container_kwargs since we dump them later
@@ -537,12 +758,24 @@ def recorded_run(submission, stage, env_vars, task=None):
 
         try:
             container = cli.containers.get(container.id)
+            last_heartbeat = 0.0
             while container.status == "running":
                 while not log_queue.empty():
                     print(log_queue.get_nowait(), flush=True)
                 if task.canceled:
                     stop_container(container)
                     break
+                # A replication can run for hours without writing a line, and
+                # the job log is the only thing that otherwise touches the job.
+                # This is the sole reason the server can tell a slow run from a
+                # dead worker.
+                now = time.monotonic()
+                if now - last_heartbeat >= HEARTBEAT_INTERVAL:
+                    last_heartbeat = now
+                    api.heartbeat(submission["job_id"])
+                    if shortfall := disk_shortfall(submission):
+                        stop_container(container)
+                        raise RuntimeError(shortfall)
                 time.sleep(1)
                 container = cli.containers.get(container.id)
         except docker.errors.NotFound:
@@ -574,23 +807,31 @@ def recorded_run(submission, stage, env_vars, task=None):
         performance_data.update({"DockerRunArgs": json.dumps(container_kwargs)})
         if os.path.isfile(dstats_tmppath + ".csv"):
             df = pd.read_csv(dstats_tmppath + ".csv")
-            performance_data.update(
-                {
-                    "MaxCPUPercent": df["CPU %"].max(),
-                    "MaxMemoryUsage": df["Memory Usage"].max(),
-                }
-            )
-        pdata = io.BytesIO(json.dumps(performance_data, cls=NpEncoder).encode("utf-8"))
-        fobj = Upload().uploadFromFile(
-            pdata,
-            pdata.getbuffer().nbytes,
+            # The header is written when the collector starts, so the file exists
+            # even when no reading was ever taken. Aggregating that empty frame
+            # yields NaN, and json.dumps happily writes a bare `NaN` literal --
+            # invalid JSON, inside a file that gets hashed into a signed TRO and
+            # read back by strict parsers years later. Say what is missing instead.
+            if df.empty:
+                performance_data["MetricsUnavailable"] = (
+                    "container exited before Docker emitted a stats reading"
+                )
+            else:
+                performance_data.update(
+                    {
+                        "MaxCPUPercent": float(df["CPU %"].max()),
+                        "MaxMemoryUsage": int(df["Memory Usage"].max()),
+                    }
+                )
+        api.upload_bytes(
+            folder_id,
+            # allow_nan=False is a tripwire: a non-finite float here would be
+            # written as an invalid JSON literal rather than rejected.
+            json.dumps(performance_data, cls=NpEncoder, allow_nan=False).encode("utf-8"),
             f"performance_data_stage_{stage_num}.json",
-            parentType="folder",
-            parent=submission_folder,
-            user=admin,
-            mimeType="text/plain",
+            mime_type="text/plain",
+            item_type="performance_data",
         )
-        annotate_item_type(fobj, "performance_data")
         logging.info("Performance data collected and uploaded.")
 
         # Dump run std{out,err} and entrypoint used.
@@ -634,7 +875,7 @@ def recorded_run(submission, stage, env_vars, task=None):
                         with open(os.path.join(root, file), "rb") as fp:
                             with open(target_file, "ab") as out_f:
                                 out_f.write(msg.encode("utf-8"))
-                                _dump_from_fileobj(fp, out_f)
+                                shutil.copyfileobj(fp, out_f)
                             if is_stata(image_reference):
                                 fp.seek(0)
                                 log_content = fp.read()
@@ -667,13 +908,9 @@ def recorded_run(submission, stage, env_vars, task=None):
             os.replace(target_file + ".tmp", target_file)
 
             log_file = f"/tmp/{key}-{submission['job_id']}"
-            log_obj = None
-            meta_key = f"{key}_file_id"
-            if submission_folder["meta"].get(meta_key) is not None:
-                log_obj = File().load(submission_folder["meta"][meta_key], force=True)
-                with File().open(log_obj) as f:
-                    with open(log_file, "wb") as out_f:
-                        _dump_from_fileobj(f, out_f)
+            log_obj = api.file(folder_meta.get(f"{key}_file_id"))
+            if log_obj:
+                api.download_file(log_obj["_id"], log_file)
 
             stage_stamp = f"\n\n===== Stage {stage_num} Output =====\n\n"
             with open(target_file, "rb") as fp:
@@ -682,27 +919,21 @@ def recorded_run(submission, stage, env_vars, task=None):
                 )
                 with open(log_file, "ab") as out_f:
                     out_f.write(stage_stamp.encode("utf-8"))
-                    _dump_from_fileobj(fp, out_f)
+                    shutil.copyfileobj(fp, out_f)
 
-            with open(log_file, "rb") as fp:
-                log_files[key] = target_file
-                if not log_obj:
-                    fobj = Upload().uploadFromFile(
-                        fp,
-                        os.path.getsize(fp.name),
-                        os.path.basename(fp.name),
-                        parentType="folder",
-                        parent=submission_folder,
-                        user=admin,
-                        mimeType="text/plain",
-                    )
-                    Folder().setMetadata(
-                        submission_folder, {key + "_file_id": str(fobj["_id"])}
-                    )
-                    annotate_item_type(fobj, key)
-                else:
-                    _update_file_from_path(log_obj, log_file, admin)
-                    annotate_item_type(log_obj, key)
+            log_files[key] = target_file
+            if log_obj:
+                api.replace_file(log_obj["_id"], log_file)
+                api.annotate_item_type(log_obj, key)
+            else:
+                # Keep the job-stamped basename; upload_workspace pulls these
+                # into the zip under the name Girder knows them by.
+                fobj = api.upload_file(
+                    folder_id, log_file, mime_type="text/plain", item_type=key
+                )
+                api.set_folder_metadata(
+                    folder_id, {f"{key}_file_id": str(fobj["_id"])}
+                )
             os.remove(log_file)
 
     try:

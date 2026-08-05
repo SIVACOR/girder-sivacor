@@ -3,11 +3,35 @@ from typing import Any, Generator
 import os
 import mock
 import pytest
+from girder.models.api_key import ApiKey
 from girder.models.collection import Collection
 from girder.models.folder import Folder
 from girder.models.setting import Setting
 from girder.models.upload import Upload
+from girder_plugin_worker.constants import PluginSettings as WorkerSettings
 from girder_sivacor.settings import PluginSettings
+
+
+@pytest.fixture
+def server(boundServer, admin, monkeypatch):
+    """A listening server, overriding pytest-girder's in-process ``server``.
+
+    Submission tasks reach Girder over HTTP now, so a test that runs the
+    pipeline needs a real socket to connect back to. Eager tasks also skip
+    celery's publish path entirely -- that is where ``submit_job``'s
+    ``girder_api_url``/``girder_client_token`` headers would be attached -- so
+    stand in for them with the environment fallback that ``GirderApi.for_task``
+    also uses for the periodic retention sweep.
+
+    ``boundServer`` exposes the same ``request()`` helper, so tests use it the
+    same way they used ``server``.
+    """
+    api_url = f"http://127.0.0.1:{boundServer.boundPort}/api/v1"
+    Setting().set(WorkerSettings.API_URL, api_url)
+    api_key = ApiKey().createApiKey(admin, name="sivacor-test-worker")
+    monkeypatch.setenv("GIRDER_API_URL", api_url)
+    monkeypatch.setenv("GIRDER_API_KEY", api_key["key"])
+    yield boundServer
 
 
 @pytest.fixture
@@ -23,7 +47,7 @@ def gpg_mock() -> mock.MagicMock:
             # Customize mock for specific test needs
             gpg_mock.sign.return_value = "custom_signature"
 
-            with mock.patch("tro_utils.tro_utils.gnupg.GPG", return_value=gpg_mock):
+            with mock.patch("gnupg.GPG", return_value=gpg_mock):
                 # Your test code here
                 pass
     """
@@ -62,7 +86,15 @@ def patched_gpg(
     The gpg_mock is available as patched_gpg.return_value if you need
     to access or customize it during the test.
     """
-    with mock.patch("tro_utils.tro_utils.gnupg.GPG", return_value=gpg_mock) as patch:
+    # Patch GPG on the `gnupg` module itself, NOT as
+    # "tro_utils.tro_utils.gnupg.GPG". From tro-utils 0.4.6 the `import gnupg`
+    # lives inside TRO._gpg() rather than at module scope, so that attribute no
+    # longer exists on tro_utils.tro_utils and mock.patch falls back to importing
+    # it as a package: "No module named 'tro_utils.tro_utils.gnupg';
+    # 'tro_utils.tro_utils' is not a package" -- 22 fixture errors, none of which
+    # name the real cause. Patching the attribute on `gnupg` is also
+    # import-style-agnostic: it works whether tro-utils imports eagerly or lazily.
+    with mock.patch("gnupg.GPG", return_value=gpg_mock) as patch:
         yield patch
 
 

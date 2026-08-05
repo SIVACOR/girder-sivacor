@@ -76,8 +76,8 @@ jobs:
         DOCKER_HOST: unix:///var/run/docker.sock
         GIRDER_MONGO_URI: mongodb://localhost:27017/girder
         GIRDER_HOST: 0.0.0.0
-        GIRDER_WORKER_BROKER: redis://locahost/
-        GIRDER_WORKER_BACKEND: redis://locahost/
+        GIRDER_WORKER_BROKER: redis://localhost/
+        GIRDER_WORKER_BACKEND: redis://localhost/
         GIRDER_NOTIFICATION_REDIS_URL: redis://localhost:6379/
         GIRDER_MAX_CURSOR_TIMEOUT_MS: 60000
         STATA_LICENSE_HOSTPATH: /tmp/licenses/stata.lic.19

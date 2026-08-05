@@ -15,29 +15,30 @@ from zoneinfo import ZoneInfo
 import pathspec
 import posix1e
 import randomname
+from celery.signals import worker_ready
 from girder.constants import AccessType
-from girder.models.collection import Collection
-from girder.models.file import File
-from girder.models.folder import Folder
-from girder.models.group import Group
-from girder.models.item import Item
-from girder.models.setting import Setting
-from girder.models.upload import Upload
-from girder.models.user import User
-from girder_jobs.constants import JobStatus
-from girder_jobs.models.job import Job
 from girder_worker.app import app
+from girder_worker.utils import JobStatus
 from tro_utils import TRPAttribute
 from tro_utils.tro_utils import TRO
 
 from ..settings import PluginSettings
+from .girder_api import GirderApi, dump_to_zip
 from .lib import (
-    _dump_from_fileobj,
-    _update_file_from_path,
-    annotate_item_type,
+    _redis_client_sync,
     get_project_dir,
+    reap_orphaned_containers,
     recorded_run,
     zip_symlink,
+)
+from .routing import (
+    DISPATCH_QUEUE,
+    LOCAL_QUEUE,
+    configured_worker_queue,
+    instance_id_of,
+    pin_chain,
+    stop_accepting_submissions,
+    worker_queue,
 )
 
 IGNORE_DIRS = [".git", "__pycache__"]
@@ -76,18 +77,73 @@ def timestamp():
     return f"[{datetime.datetime.now().astimezone(zone).replace(microsecond=0).isoformat()}]"
 
 
-def job_check(task):
-    @wraps(task)
-    def inner(self, *args, **kwargs):
-        if len(args) > 0 and isinstance(args[0], dict) and args[0].get("job_id"):
-            job = Job().load(args[0]["job_id"], force=True)
-            if job["status"] != JobStatus.RUNNING:
-                if self.request.chain:
-                    self.request.chain = None
-                return {"job_id": str(args[0]["job_id"])}
-        return task(self, *args, **kwargs)
+def report(api, job_id, message, status=JobStatus.RUNNING):
+    """Append a timestamped line to the submission's Girder job log."""
+    api.update_job(job_id, log=f"{timestamp()} {message}\n", status=status)
 
-    return inner
+
+def report_failure(api, job_id, failure, exc):
+    """Mark the job failed, without letting that replace ``exc``.
+
+    Reporting is itself a REST call and has its own ways to fail -- most
+    routinely, a job the user cancelled rejects the transition to ERROR. The
+    original exception is the one worth propagating.
+    """
+    try:
+        report(api, job_id, f"{failure}: \n\t{exc}", status=JobStatus.ERROR)
+    except Exception:
+        logger.exception("Could not mark job %s as failed", job_id)
+
+
+def discard_workspace(submission):
+    """Delete the scratch directories of a submission that will not continue.
+
+    While the worker shared Girder's database this was a side effect of the
+    ``jobs.job.update.after`` handler. That handler now runs on the server,
+    which cannot see these paths, so every exit from the pipeline has to do it
+    itself.
+    """
+    for key in ("tmp_dir", "workspace_dir"):
+        if path := submission.get(key):
+            shutil.rmtree(path, ignore_errors=True)
+
+
+def submission_task(failure):
+    """Wrap a pipeline step in its Girder job bookkeeping.
+
+    Each step used to open with a job lookup and close with a near-identical
+    ``except`` clause that logged ``failure`` and re-raised. Doing it once here
+    also gives the two exits from a submission -- a job that is no longer
+    running, and a step that raised -- a single place to drop the workspace.
+
+    The wrapped function is called as ``func(task, api, submission, ...)``.
+    """
+
+    def decorator(func):
+        @wraps(func)
+        def inner(task, submission, *args, **kwargs):
+            api = GirderApi.for_task(task)
+            job_id = submission["job_id"]
+            if api.job(job_id)["status"] != JobStatus.RUNNING:
+                return abandon(task, submission)
+            try:
+                return func(task, api, submission, *args, **kwargs)
+            except Exception as exc:
+                report_failure(api, job_id, failure, exc)
+                discard_workspace(submission)
+                raise
+
+        return inner
+
+    return decorator
+
+
+def abandon(task, submission):
+    """Drop the rest of the chain and clean up after a cancelled submission."""
+    if task.request.chain:
+        task.request.chain = None
+    discard_workspace(submission)
+    return {"job_id": str(submission["job_id"])}
 
 
 def safe_tar_extract(tar, path):
@@ -103,42 +159,30 @@ def safe_tar_extract(tar, path):
     tar.extractall(root, members=tar.getmembers(), filter="data")
 
 
-def _create_submission_folder(user):
+def _create_submission_folder(api, user_id):
     # Logic to create submission directory based on fileId and image_tag
-    admin = User().findOne({"admin": True})
-    root_collection = Collection().createCollection(
-        Setting().get(PluginSettings.SUBMISSION_COLLECTION_NAME),
-        creator=admin,
-        public=True,
-        reuseExisting=True,
+    settings = api.settings(
+        [
+            PluginSettings.SUBMISSION_COLLECTION_NAME,
+            PluginSettings.EDITORS_GROUP_NAME,
+        ]
     )
-    editors_group_name = Setting().get(PluginSettings.EDITORS_GROUP_NAME)
-    editors_group = Group().findOne({"name": editors_group_name})
-    if editors_group is None:
-        editors_group = Group().createGroup(editors_group_name, admin, public=True)
+    root_collection = api.find_or_create_collection(
+        settings[PluginSettings.SUBMISSION_COLLECTION_NAME]
+    )
+    editors_group = api.find_or_create_group(
+        settings[PluginSettings.EDITORS_GROUP_NAME]
+    )
+    api.grant_group_access(
+        root_collection["_id"], editors_group["_id"], AccessType.READ
+    )
 
-    Collection().setGroupAccess(
-        root_collection, editors_group, AccessType.READ, save=True, currentUser=admin
+    submission_folder = api.create_folder(
+        root_collection["_id"], randomname.get_name(), public=False
     )
-
-    submission_folder = Folder().createFolder(
-        root_collection,
-        randomname.get_name(),
-        parentType="collection",
-        public=False,
-        creator=admin,
-        reuseExisting=False,
-    )
-    submission_folder = Folder().setMetadata(
-        submission_folder,
-        {"creator_id": str(user["_id"])},
-    )
-    return Folder().setUserAccess(
-        submission_folder,
-        user,
-        AccessType.READ,
-        save=True,
-    )
+    api.set_folder_metadata(submission_folder["_id"], {"creator_id": str(user_id)})
+    api.grant_user_access(submission_folder["_id"], user_id, AccessType.READ)
+    return submission_folder
 
 
 def _matlab_perms(target_path, uid=1001):
@@ -196,89 +240,81 @@ def _matlab_perms(target_path, uid=1001):
             raise
 
 
-@app.task(queue="local", bind=True)
-@job_check
+@app.task(queue=DISPATCH_QUEUE, bind=True)
 def prepare_submission(task, userId, fileId, stages, job_id):
     # Create a submission directory
-    job = Job().load(job_id, force=True)
+    api = GirderApi.for_task(task)
+    # Every later step works out of a directory on this machine, so claim the
+    # rest of the chain for this worker before doing anything else.
+    queue = worker_queue(task)
+    pin_chain(task, queue)
+    # Tell the server this worker is now spent, BEFORE the slow work below. The
+    # autoscaler counts instances that have not claimed anything as available
+    # capacity, so every second this goes unrecorded is a second it may refuse to
+    # create the instance the next submission needs (D8 / P3.5).
+    api.claim(job_id, queue)
+    # ...and, if this instance exists only to serve one submission, stop taking new
+    # ones now. Best-effort: failing to cancel the consumer means the controller may
+    # over-count headroom, which is worth a warning but never worth failing a
+    # submission that is otherwise fine.
     try:
-        user = User().load(userId, force=True)
-        submission_folder = _create_submission_folder(user)
+        stop_accepting_submissions(app, task)
+    except Exception:
+        logger.warning("Failed to stop consuming the dispatch queue", exc_info=True)
+    try:
+        submission_folder = _create_submission_folder(api, userId)
         # Move file to the submission directory
-        fobj = File().load(fileId, user=user, level=AccessType.READ)
-        annotate_item_type(fobj, "submission_file")
-        item = Item().load(fobj["itemId"], user=user, level=AccessType.READ)
-        Item().move(item, submission_folder)
-        Folder().setMetadata(
-            submission_folder,
+        fobj = api.file(fileId)
+        api.annotate_item_type(fobj, "submission_file")
+        api.move_item(fobj["itemId"], submission_folder["_id"])
+        api.set_folder_metadata(
+            submission_folder["_id"],
             {
                 "stages": stages,
                 "status": "submitted",
-                "job_id": str(job["_id"]),
+                "job_id": str(job_id),
             },
         )
-        Job().updateJob(
-            job,
-            f"{timestamp()} New submission: '"
-            + submission_folder["name"]
-            + "' created.\n",
-            status=JobStatus.RUNNING,
-        )
+        report(api, job_id, f"New submission: '{submission_folder['name']}' created.")
         return {
             "folder_id": str(submission_folder["_id"]),
             "file_id": str(fobj["_id"]),
             "job_id": str(job_id),
             "stages": stages,
+            "queue": queue,
         }
     except Exception as exc:
-        Job().updateJob(
-            job,
-            f"{timestamp()} Failed to prepare submission: \n\t" + str(exc) + "\n",
-            status=JobStatus.ERROR,
-        )
-        raise exc
-    return {
-        "folder_id": None,
-        "file_id": None,
-        "stages": None,
-        "job_id": str(job_id),
-    }
+        report_failure(api, job_id, "Failed to prepare submission", exc)
+        raise
 
 
-@app.task(queue="local", bind=True)
-@job_check
-def create_workspace(task, submission):
-    job = Job().load(submission["job_id"], force=True)
-    job = Job().updateJob(
-        job,
-        f"{timestamp()} Creating workspace from source folder.\n",
-        status=JobStatus.RUNNING,
-    )
+@app.task(queue=DISPATCH_QUEUE, bind=True)
+@submission_task("Failed to create workspace")
+def create_workspace(task, api, submission):
+    report(api, submission["job_id"], "Creating workspace from source folder.")
 
+    submission["tmp_dir"] = f"/tmp/tmp-{submission['folder_id']}"
+    os.makedirs(submission["tmp_dir"], exist_ok=False)
+    # add sticky bit to tmp_dir
+    os.chmod(submission["tmp_dir"], 0o1777)
+
+    workspace_dir = f"/tmp/workspace-{submission['folder_id']}"
+    submission["workspace_dir"] = workspace_dir
+    project_dir = get_project_dir(submission)
+    os.makedirs(project_dir, exist_ok=False)
+    # Give read/write/execute permissions to myself
+    _matlab_perms(project_dir, uid=os.getuid())
+    # Give read/write/execute permissions to Matlab user
+    _matlab_perms(project_dir, uid=1001)
+    # Ensure R library directory for user install.packages exists
+    for stage in submission.get("stages", []):
+        if stage["image_name"].startswith("rocker/"):
+            os.makedirs(os.path.join(workspace_dir, "R", "library"), exist_ok=True)
+
+    fobj = api.file(submission["file_id"])
+    temp_filename = os.path.join(workspace_dir, fobj["name"])
     try:
-        submission["tmp_dir"] = f"/tmp/tmp-{submission['folder_id']}"
-        os.makedirs(submission["tmp_dir"], exist_ok=False)
-        # add sticky bit to tmp_dir
-        os.chmod(submission["tmp_dir"], 0o1777)
-
-        workspace_dir = f"/tmp/workspace-{submission['folder_id']}"
-        submission["workspace_dir"] = workspace_dir
-        project_dir = get_project_dir(submission)
-        os.makedirs(project_dir, exist_ok=False)
-        # Give read/write/execute permissions to myself
-        _matlab_perms(project_dir, uid=os.getuid())
-        # Give read/write/execute permissions to Matlab user
-        _matlab_perms(project_dir, uid=1001)
-        # Ensure R library directory for user install.packages exists
-        for stage in submission.get("stages", []):
-            if stage["image_name"].startswith("rocker/"):
-                os.makedirs(os.path.join(workspace_dir, "R", "library"), exist_ok=True)
-
-        fobj = File().load(submission["file_id"], force=True)
-        temp_filename = os.path.join(workspace_dir, fobj["name"])
-        with File().open(fobj) as f:
-            with open(temp_filename, "wb") as out_f:
-                _dump_from_fileobj(f, out_f)
+        api.download_file(fobj["_id"], temp_filename)
         # File is either a zip or tar archive; extract accordingly
         extracted = False
         try:
@@ -299,17 +335,10 @@ def create_workspace(task, submission):
         except tarfile.TarError as e:
             print(f"Not a tar file either... Reason: {e}")
             raise ValueError("Unsupported file format for workspace creation.")
+    finally:
+        if os.path.exists(temp_filename):
+            os.remove(temp_filename)
 
-    except Exception as exc:
-        os.remove(temp_filename)
-        Job().updateJob(
-            job,
-            f"{timestamp()} Failed to create workspace: \n\t" + str(exc) + "\n",
-            status=JobStatus.ERROR,
-        )
-        raise exc
-
-    os.remove(temp_filename)
     return submission
 
 
@@ -319,14 +348,18 @@ def skip_condition(condition, submission):
     return False
 
 
-@app.task(queue="local", bind=True)
-@job_check
-def run_tro(task, submission, action, inumber, condition):
-    job = Job().load(submission["job_id"], force=True)
-    job = Job().updateJob(
-        job,
-        f"{timestamp()} Running TRO utilities in the workspace. ({action})\n",
-        status=JobStatus.RUNNING,
+def _run_tro(task, api, submission, action, inumber, condition):
+    """Body shared by :func:`run_tro` and :func:`sign_tro`.
+
+    Split out so the signing action can be its own celery task on
+    :data:`LOCAL_QUEUE` -- see :data:`~.routing.UNPINNED_TASKS`. Everything here
+    reaches Girder over REST and, for ``action == "sign"``, touches no workspace
+    path, so it runs equally well on the manager or on the worker.
+    """
+    report(
+        api,
+        submission["job_id"],
+        f"Running TRO utilities in the workspace. ({action})",
     )
     if skip_condition(condition, submission):
         logger.info(
@@ -334,200 +367,205 @@ def run_tro(task, submission, action, inumber, condition):
             f"due to condition '{condition}'."
         )
         return submission
-    try:
-        admin = User().findOne({"admin": True})
-        submission_folder = Folder().load(submission["folder_id"], force=True)
-        tro_file = f"/tmp/tro-{submission['job_id']}.jsonld"
-        tro_obj = None
-        if submission.get("troId") is not None:
-            tro_obj = File().load(submission["troId"], force=True)
-            with File().open(tro_obj) as f:
-                with open(tro_file, "wb") as out_f:
-                    _dump_from_fileobj(f, out_f)
 
-        with tempfile.NamedTemporaryFile(delete=True) as profile:
-            trs_profile = Setting().get(PluginSettings.TRO_PROFILE)
-            trs_profile["sivacor:stackVersion"] = version("girder_sivacor")
-            profile.write(json.dumps(trs_profile).encode())
-            profile.seek(0)
-            tro = TRO(
-                filepath=tro_file,
-                gpg_fingerprint=Setting().get(PluginSettings.TRO_GPG_FINGERPRINT),
-                gpg_passphrase=Setting().get(PluginSettings.TRO_GPG_PASSPHRASE),
-                profile=profile.name,
-                extra_context={"sivacor": "https://vocabulary.sivacor.org/0.1/"},
-                tro_creator="SIVACOR/tro_utils",
-                tro_name=submission_folder["name"],
-                tro_description="SIVACOR Run",
-            )
-
-        meta = {}
-        project_dir = get_project_dir(submission)
-        if action == "add_arrangement":
-            arrangements = tro.list_arrangements()
-            if not arrangements:
-                tro.add_arrangement(
-                    project_dir,
-                    comment="Before executing workflow",
-                    ignore_dirs=IGNORE_DIRS,
-                )
-            else:
-                tro.add_arrangement(
-                    project_dir,
-                    comment=f"After executing workflow step {inumber}",
-                    ignore_dirs=IGNORE_DIRS,
-                    resolve_symlinks=False,
-                )
-        elif action == "prune_performance":
-            runs = submission.get("runs", [])
-            run = runs[-1] if runs else {}
-            tro.add_performance(
-                datetime.datetime.fromisoformat(run["run_start_time"]),
-                datetime.datetime.fromisoformat(run["run_end_time"]),
-                comment="SIVACOR Workspace pruning step",
-                accessed_arrangement=(f"arrangement/{inumber}", "/workspace"),
-                modified_arrangement=(f"arrangement/{inumber + 1}", "/workspace"),
-                attrs=run.get("run_attrs", []),
-            )
-        elif action == "add_performance":
-            stages = submission.get("stages", [])
-            main_file = stages[inumber].get("main_file", "unknown")
-            runs = submission.get("runs", [])
-            run = runs[-1] if runs else {}
-            extra_attributes = None
-            for item in Folder().childItems(
-                submission_folder,
-                filters={"name": f"performance_data_stage_{inumber + 1}.json"},
-                limit=1,
-            ):
-                with Item().childFiles(item) as files:
-                    for fobj in files:
-                        with File().open(fobj) as f:
-                            extra_attributes = json.load(f)
-
-            if extra_attributes:
-                extra_attributes = {
-                    f"sivacor:{key}": value
-                    for key, value in extra_attributes.items()
-                    if ":" not in key
-                }
-
-            tro.add_performance(
-                datetime.datetime.fromisoformat(run["run_start_time"]),
-                datetime.datetime.fromisoformat(run["run_end_time"]),
-                comment=f"SIVACOR workflow execution ({main_file}) step {inumber + 1}",
-                accessed_arrangement=(f"arrangement/{inumber}", "/workspace"),
-                modified_arrangement=(f"arrangement/{inumber + 1}", "/workspace"),
-                attrs=run.get("run_attrs", []),
-                extra_attributes=extra_attributes,
-            )
-        elif action == "sign":
-            tro.request_timestamp()
-
-            for meta_key, filename, nice_name in zip(
-                ("sig_file_id", "tsr_file_id"),
-                (tro.sig_filename, tro.tsr_filename),
-                ("tro_signature", "tro_timestamp"),
-            ):
-                with open(filename, "rb") as f:
-                    fobj = Upload().uploadFromFile(
-                        f,
-                        os.path.getsize(filename),
-                        os.path.basename(filename),
-                        parentType="folder",
-                        parent=submission_folder,
-                        user=admin,
-                        mimeType="text/plain",
-                    )
-                    annotate_item_type(fobj, nice_name)
-                    meta[meta_key] = str(fobj["_id"])
-                os.remove(filename)
-
-        tro.save()
-        if tro_obj:
-            _update_file_from_path(tro_obj, tro.tro_filename, admin)
-        else:
-            tro_obj = Upload().uploadFromFile(
-                open(tro.tro_filename, "rb"),
-                os.path.getsize(tro.tro_filename),
-                os.path.basename(tro.tro_filename),
-                parentType="folder",
-                parent=submission_folder,
-                user=admin,
-                mimeType="application/ld+json",
-            )
-            annotate_item_type(tro_obj, "tro_declaration")
-            submission["troId"] = str(tro_obj["_id"])
-        os.remove(tro.tro_filename)
-        meta["tro_file_id"] = str(tro_obj["_id"])
-        Folder().setMetadata(submission_folder, meta)
-    except Exception as exc:
-        Job().updateJob(
-            job,
-            f"{timestamp()} Failed to run TRO utilities: \n\t" + str(exc) + "\n",
-            status=JobStatus.ERROR,
-        )
-        raise exc
-
-    return submission
-
-
-@app.task(queue="local", bind=True)
-@job_check
-def execute_workflow(task, submission, stage, env_vars):
-    job = Job().load(submission["job_id"], force=True)
-    job = Job().updateJob(
-        job,
-        f"{timestamp()} Executing workflow on workspace.\n",
-        status=JobStatus.RUNNING,
-    )
-    try:
-        # Placeholder for actual workflow execution logic
-
-        start_time = datetime.datetime.now()
-        ret = recorded_run(submission, stage, env_vars, task=task)
-        if ret["StatusCode"] == -123:
-            print("Termination requested, stopping execution.")
-            if task.request.chain:
-                task.request.chain = None
-            return {"job_id": submission["job_id"]}
-
-        if ret["StatusCode"] != 0:
-            raise RuntimeError(
-                f"Workflow execution failed with code {ret['StatusCode']}"
-            )
-        end_time = datetime.datetime.now()
-
-        if submission.get("runs") is None:
-            submission["runs"] = []
-        attrs = [
-            TRPAttribute.ENV_ISOLATION.value,
-            TRPAttribute.NON_INTERACTIVE.value,
-            TRPAttribute.MACHINE_ENFORCEMENT.value,
+    folder_id = submission["folder_id"]
+    submission_folder = api.folder(folder_id)
+    # Neither GPG setting is needed unless we are signing. Since tro-utils 0.4.6
+    # the keyring is only touched by attach_public_key(), which runs from
+    # request_timestamp() -- so a non-signing step needs no fingerprint, no
+    # passphrase, and no keyring at all. Asking for them unconditionally would
+    # ship the TRS signing credential to every remote worker, 4 + 2N times per
+    # submission, for nothing.
+    setting_keys = [PluginSettings.TRO_PROFILE]
+    if action == "sign":
+        setting_keys += [
+            PluginSettings.TRO_GPG_FINGERPRINT,
+            PluginSettings.TRO_GPG_PASSPHRASE,
         ]
-        if stage.get("network_isolation", False):
-            attrs.append(TRPAttribute.NET_ISOLATION.value)
-        submission["runs"].append(
-            {
-                "run_start_time": start_time.isoformat(),
-                "run_end_time": end_time.isoformat(),
-                "run_attrs": attrs,
-            }
+    settings = api.settings(setting_keys)
+
+    tro_file = f"/tmp/tro-{submission['job_id']}.jsonld"
+    tro_obj = None
+    if submission.get("troId") is not None:
+        tro_obj = api.file(submission["troId"])
+        api.download_file(tro_obj["_id"], tro_file)
+
+    with tempfile.NamedTemporaryFile(delete=True) as profile:
+        trs_profile = settings[PluginSettings.TRO_PROFILE]
+        trs_profile["sivacor:stackVersion"] = version("girder_sivacor")
+        profile.write(json.dumps(trs_profile).encode())
+        profile.seek(0)
+        tro = TRO(
+            filepath=tro_file,
+            # Both None for every non-signing action. trs_signature() raises a
+            # clear RuntimeError for either one missing, so a mis-routed sign step
+            # fails loudly rather than silently producing an unsigned TRO.
+            gpg_fingerprint=settings.get(PluginSettings.TRO_GPG_FINGERPRINT),
+            gpg_passphrase=settings.get(PluginSettings.TRO_GPG_PASSPHRASE),
+            profile=profile.name,
+            extra_context={"sivacor": "https://vocabulary.sivacor.org/0.1/"},
+            tro_creator="SIVACOR/tro_utils",
+            tro_name=submission_folder["name"],
+            tro_description="SIVACOR Run",
         )
-    except Exception as exc:
-        Job().updateJob(
-            job,
-            f"{timestamp()} Failed to execute workflow: \n\t" + str(exc) + "\n",
-            status=JobStatus.ERROR,
+
+    meta = {}
+    project_dir = get_project_dir(submission)
+    if action == "add_arrangement":
+        arrangements = tro.list_arrangements()
+        if not arrangements:
+            tro.add_arrangement(
+                project_dir,
+                comment="Before executing workflow",
+                ignore_dirs=IGNORE_DIRS,
+            )
+        else:
+            tro.add_arrangement(
+                project_dir,
+                comment=f"After executing workflow step {inumber}",
+                ignore_dirs=IGNORE_DIRS,
+                resolve_symlinks=False,
+            )
+    elif action == "prune_performance":
+        runs = submission.get("runs", [])
+        run = runs[-1] if runs else {}
+        tro.add_performance(
+            datetime.datetime.fromisoformat(run["run_start_time"]),
+            datetime.datetime.fromisoformat(run["run_end_time"]),
+            comment="SIVACOR Workspace pruning step",
+            accessed_arrangement=(f"arrangement/{inumber}", "/workspace"),
+            modified_arrangement=(f"arrangement/{inumber + 1}", "/workspace"),
+            attrs=run.get("run_attrs", []),
         )
-        raise exc
+    elif action == "add_performance":
+        stages = submission.get("stages", [])
+        main_file = stages[inumber].get("main_file", "unknown")
+        runs = submission.get("runs", [])
+        run = runs[-1] if runs else {}
+        extra_attributes = _performance_attributes(api, folder_id, inumber + 1)
+
+        tro.add_performance(
+            datetime.datetime.fromisoformat(run["run_start_time"]),
+            datetime.datetime.fromisoformat(run["run_end_time"]),
+            comment=f"SIVACOR workflow execution ({main_file}) step {inumber + 1}",
+            accessed_arrangement=(f"arrangement/{inumber}", "/workspace"),
+            modified_arrangement=(f"arrangement/{inumber + 1}", "/workspace"),
+            attrs=run.get("run_attrs", []),
+            extra_attributes=extra_attributes,
+        )
+    elif action == "sign":
+        tro.request_timestamp()
+
+        for meta_key, filename, nice_name in zip(
+            ("sig_file_id", "tsr_file_id"),
+            (tro.sig_filename, tro.tsr_filename),
+            ("tro_signature", "tro_timestamp"),
+        ):
+            fobj = api.upload_file(
+                folder_id, filename, mime_type="text/plain", item_type=nice_name
+            )
+            meta[meta_key] = str(fobj["_id"])
+            os.remove(filename)
+
+    tro.save()
+    if tro_obj:
+        api.replace_file(tro_obj["_id"], tro.tro_filename)
+    else:
+        tro_obj = api.upload_file(
+            folder_id,
+            tro.tro_filename,
+            mime_type="application/ld+json",
+            item_type="tro_declaration",
+        )
+        submission["troId"] = str(tro_obj["_id"])
+    os.remove(tro.tro_filename)
+    meta["tro_file_id"] = str(tro_obj["_id"])
+    api.set_folder_metadata(folder_id, meta)
 
     return submission
 
 
-@app.task(queue="local", bind=True)
-@job_check
-def prune_workspace(task, submission):
+@app.task(queue=DISPATCH_QUEUE, bind=True)
+@submission_task("Failed to run TRO utilities")
+def run_tro(task, api, submission, action, inumber, condition):
+    return _run_tro(task, api, submission, action, inumber, condition)
+
+
+@app.task(queue=LOCAL_QUEUE, bind=True)
+@submission_task("Failed to sign TRO")
+def sign_tro(task, api, submission):
+    """Sign and timestamp the declaration -- on the manager, not the worker.
+
+    Signing is the one step that needs the TRS *private* key, so it is the one
+    step that must not run on an ephemeral, fully-automated VM: a compromised
+    worker holding that key could mint TROs indistinguishable from real ones.
+    :data:`LOCAL_QUEUE` is consumed only by the manager's co-located worker,
+    which is where the keyring lives.
+
+    It can run there because the action is workspace-free: it downloads the
+    declaration from Girder like every other ``run_tro`` action, and unlike
+    ``add_arrangement`` it never walks the workspace directory. The chain
+    therefore bounces worker -> manager -> worker, with ``upload_workspace``
+    resuming on the worker that still holds the files.
+
+    :data:`~.routing.UNPINNED_TASKS` is what keeps ``pin_chain`` from dragging
+    this step back onto the worker's private queue.
+    """
+    return _run_tro(task, api, submission, "sign", 0, None)
+
+
+def _performance_attributes(api, folder_id, stage_num):
+    """Read back the performance data recorded_run uploaded for a stage."""
+    item = api.find_child_item(folder_id, f"performance_data_stage_{stage_num}.json")
+    if not item:
+        return None
+    files = api.item_files(item["_id"])
+    if not files:
+        return None
+    data = json.loads(b"".join(api.file_chunks(files[0]["_id"])))
+    # Namespace the bare keys; anything already prefixed is left alone.
+    return {f"sivacor:{key}": value for key, value in data.items() if ":" not in key}
+
+
+@app.task(queue=DISPATCH_QUEUE, bind=True)
+@submission_task("Failed to execute workflow")
+def execute_workflow(task, api, submission, stage, env_vars):
+    report(api, submission["job_id"], "Executing workflow on workspace.")
+
+    # Placeholder for actual workflow execution logic
+    start_time = datetime.datetime.now()
+    ret = recorded_run(api, submission, stage, env_vars, task=task)
+    if ret["StatusCode"] == -123:
+        print("Termination requested, stopping execution.")
+        return abandon(task, submission)
+
+    if ret["StatusCode"] != 0:
+        raise RuntimeError(f"Workflow execution failed with code {ret['StatusCode']}")
+    end_time = datetime.datetime.now()
+
+    if submission.get("runs") is None:
+        submission["runs"] = []
+    attrs = [
+        TRPAttribute.ENV_ISOLATION.value,
+        TRPAttribute.NON_INTERACTIVE.value,
+        TRPAttribute.MACHINE_ENFORCEMENT.value,
+    ]
+    if stage.get("network_isolation", False):
+        attrs.append(TRPAttribute.NET_ISOLATION.value)
+    submission["runs"].append(
+        {
+            "run_start_time": start_time.isoformat(),
+            "run_end_time": end_time.isoformat(),
+            "run_attrs": attrs,
+        }
+    )
+
+    return submission
+
+
+@app.task(queue=DISPATCH_QUEUE, bind=True)
+@submission_task("Failed to prune workspace")
+def prune_workspace(task, api, submission):
     logger.info(f"Pruning workspace for submission {submission['folder_id']}")
     start_time = datetime.datetime.now()
     project_dir = pathlib.Path(get_project_dir(submission))
@@ -588,137 +626,280 @@ def prune_workspace(task, submission):
     return submission
 
 
-@app.task(queue="local", bind=True)
-@job_check
-def upload_workspace(task, submission):
+@app.task(queue=DISPATCH_QUEUE, bind=True)
+@submission_task("Failed to upload executed replication package")
+def upload_workspace(task, api, submission):
     # Upload the modified workspace back to Girder as a zip file
     # called 'executed_replication_package.zip'
-    job = Job().load(submission["job_id"], force=True)
-    job = Job().updateJob(
-        job,
-        f"{timestamp()} Uploading executed replication package to Girder.\n",
-        status=JobStatus.RUNNING,
+    report(
+        api,
+        submission["job_id"],
+        "Uploading executed replication package to Girder.",
     )
-    try:
-        admin = User().findOne({"admin": True})
-        submission_folder = Folder().load(submission["folder_id"], force=True)
 
-        submission_fobj = File().load(submission["file_id"], force=True)
-        zip_basename = (
-            pathlib.Path(submission_fobj["name"]).stem + f"-{submission['job_id']}.zip"
-        )
-        project_dir = get_project_dir(submission)
+    folder_id = submission["folder_id"]
+    folder_meta = api.folder(folder_id).get("meta", {})
 
-        zip_path = os.path.join(submission["workspace_dir"], zip_basename)
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-            for root, dirs, files in os.walk(project_dir):
-                # ignore contents of dirs from IGNORE_DIRS
-                dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
-                for file in files:
-                    if file == zip_basename:
-                        continue
-                    file_path = os.path.join(root, file)
-                    arcname = os.path.relpath(file_path, submission["workspace_dir"])
-                    if os.path.islink(file_path):
-                        zip_symlink(zipf, file_path, arcname=arcname)
-                    else:
-                        zipf.write(file_path, arcname)
+    submission_fobj = api.file(submission["file_id"])
+    zip_basename = (
+        pathlib.Path(submission_fobj["name"]).stem + f"-{submission['job_id']}.zip"
+    )
+    project_dir = get_project_dir(submission)
 
-            # Store TRO files in a separate 'tro/' directory within the zip
-            for key in ("tro_file_id", "sig_file_id", "tsr_file_id"):
-                if fobj := File().load(
-                    submission_folder.get("meta", {}).get(key), force=True
-                ):
-                    with File().open(fobj) as fp:  # TODO: use _dump_from_fileobj?
-                        _dump_from_fileobj(
-                            fp, zipf, is_zip=True, arcname="tro/" + fobj["name"]
-                        )
+    zip_path = os.path.join(submission["workspace_dir"], zip_basename)
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for root, dirs, files in os.walk(project_dir):
+            # ignore contents of dirs from IGNORE_DIRS
+            dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+            for file in files:
+                if file == zip_basename:
+                    continue
+                file_path = os.path.join(root, file)
+                arcname = os.path.relpath(file_path, submission["workspace_dir"])
+                if os.path.islink(file_path):
+                    zip_symlink(zipf, file_path, arcname=arcname)
+                else:
+                    zipf.write(file_path, arcname)
 
-            for ext in (".jsonld", ".sig", ".tsr"):
-                basename = f"tro-{submission['job_id']}.{ext}"
-                tro_file_path = os.path.join("/tmp", basename)
-                arcname = "tro/" + basename
-                if os.path.exists(tro_file_path):
-                    zipf.write(tro_file_path, arcname)
+        # Store TRO files in a separate 'tro/' directory within the zip
+        for key in ("tro_file_id", "sig_file_id", "tsr_file_id"):
+            if fobj := api.file(folder_meta.get(key)):
+                dump_to_zip(
+                    api.file_chunks(fobj["_id"]), zipf, "tro/" + fobj["name"]
+                )
 
-            # Store stdout and stderr logs
-            for key in ("stderr_file_id", "stdout_file_id"):
-                if fobj := File().load(
-                    submission_folder.get("meta", {}).get(key), force=True
-                ):
-                    with File().open(fobj) as fp:
-                        _dump_from_fileobj(fp, zipf, is_zip=True)
+        # Store stdout and stderr logs
+        for key in ("stderr_file_id", "stdout_file_id"):
+            if fobj := api.file(folder_meta.get(key)):
+                dump_to_zip(api.file_chunks(fobj["_id"]), zipf, fobj["name"])
 
-        with open(zip_path, "rb") as f:
-            fobj = Upload().uploadFromFile(
-                f,
-                os.path.getsize(zip_path),
-                zip_basename,
-                parentType="folder",
-                parent=submission_folder,
-                user=admin,
-                mimeType="application/zip",
-            )
-            annotate_item_type(fobj, "replicated_package")
-        os.remove(zip_path)
-        Folder().setMetadata(submission_folder, {"replpack_file_id": str(fobj["_id"])})
-        submission["replpack_file_id"] = str(fobj["_id"])
-    except Exception as exc:
-        Job().updateJob(
-            job,
-            f"{timestamp()} Failed to upload executed replication package: \n\t"
-            + str(exc)
-            + "\n",
-            status=JobStatus.ERROR,
-        )
-        raise exc
+    fobj = api.upload_file(
+        folder_id,
+        zip_path,
+        mime_type="application/zip",
+        item_type="replicated_package",
+    )
+    os.remove(zip_path)
+    api.set_folder_metadata(folder_id, {"replpack_file_id": str(fobj["_id"])})
+    submission["replpack_file_id"] = str(fobj["_id"])
 
     return submission
 
 
-@app.task(queue="local")
-def finalize_job(submission):
-    shutil.rmtree(submission["tmp_dir"], ignore_errors=True)
-    shutil.rmtree(submission["workspace_dir"], ignore_errors=True)
-    job = Job().load(submission["job_id"], force=True)
-    if job["status"] == JobStatus.RUNNING:
-        job = Job().updateJob(
-            job,
-            f"{timestamp()} Submission job finalized successfully.\n",
+@app.task(queue=DISPATCH_QUEUE, bind=True)
+def finalize_job(task, submission):
+    api = GirderApi.for_task(task)
+    discard_workspace(submission)
+    if api.job(submission["job_id"])["status"] == JobStatus.RUNNING:
+        report(
+            api,
+            submission["job_id"],
+            "Submission job finalized successfully.",
             status=JobStatus.SUCCESS,
         )
     return submission
 
 
+@worker_ready.connect
+def _sweep_orphaned_containers(sender=None, **kwargs):
+    """Kill analysis containers a previous incarnation of this worker left behind.
+
+    A container is a *sibling* started through the docker socket, so killing the
+    worker -- or losing its VM -- leaves the analysis running with nobody to
+    collect its output. Verified in the P0 kill test: the R container was still
+    burning a core after the job had been failed and the worker had restarted.
+
+    Startup is the one moment when this is unambiguous: a fresh worker process has
+    no task in flight, so any container still bearing its queue label must be a
+    leftover. No Girder query needed, which matters because the worker has neither
+    a database nor a standing credential.
+    """
+    try:
+        reap_orphaned_containers()
+    except Exception:
+        logger.warning("Orphan container sweep failed", exc_info=True)
+
+
+#: How long a readiness marker outlives the worker that wrote it. Only garbage
+#: collection: it must stay comfortably above the controller's ``max_lifetime``
+#: (30 h) so a marker can never expire out from under an instance that is still
+#: running, which would make a healthy worker look like it never provisioned.
+READY_MARKER_TTL_SECONDS = 48 * 60 * 60
+
+#: Redis key prefix for readiness markers, read by ``sivacor-autoscaler``.
+READY_KEY_PREFIX = "sivacor:ready:"
+
+
+@worker_ready.connect
+def _announce_ready(sender=None, **kwargs):
+    """Record that this instance got far enough to consume work (plan D9).
+
+    The controller classifies a live instance as *spent* (has claimed a
+    submission) or *available* (has not). A VM that boots but fails to provision
+    lands in the second bucket permanently: it never claims, never serves, and so
+    absorbs a submission's worth of capacity forever, while being unable to
+    reclaim itself because the self-shutdown supervisor is written by the same
+    script that failed. Observed 2026-08-02: ``unattended-upgrades`` held the dpkg
+    lock, ``worker-cloud-init.sh`` aborted under ``set -e``, and the instance sat
+    ACTIVE and useless for an entire run.
+
+    Absence of a marker past a boot deadline is what lets the controller tell that
+    apart from "still booting" and from "healthy and idle".
+
+    **Written here, from ``worker_ready``, rather than at the end of cloud-init**,
+    because this fires only once celery has actually started *and* connected to the
+    broker. A cloud-init marker would prove the script ran, which is strictly
+    weaker: a wrong docker GID (P1.3 finding 3, and GID 127 vs the baked 112) or a
+    bad broker password produces a completed script and a dead worker -- the
+    phantom, with a readiness marker on it.
+
+    **Redis rather than Girder**, unlike the sibling ``claim`` marker, because a
+    worker holds no Girder credential until an admin-scoped token arrives with a
+    task; ``worker.env`` deliberately omits one (see P2.4). It carries the broker
+    password from boot. This is not the broadcast D8 rejected: the marker is a
+    durable write-once fact, so nothing needs to be reachable afterwards for it to
+    stay true.
+
+    **Not gated on ``is_ephemeral_worker()`` deliberately.** A hand-made debug VM
+    launched with ``EPHEMERAL_WORKER=0`` still carries the ``sivacor-worker`` tag
+    and so is still visible to the controller's sweep; gating would leave it
+    unmarked and get it deleted. Writing unconditionally also puts a harmless
+    ``sivacor:ready:static-01`` on the manager, matching how the spent-worker
+    signal already treats that name.
+
+    Best effort, like the heartbeat: a worker that cannot write this is still a
+    worker, and failing startup over it would turn a Redis blip into a lost VM.
+    """
+    queue = configured_worker_queue()
+    instance = instance_id_of(queue) if queue else None
+    if not instance:
+        # Nothing to announce: no configured queue means no stable identity the
+        # controller could match against an OpenStack instance.
+        logger.debug("No configured worker queue; skipping readiness marker")
+        return
+    try:
+        _redis_client_sync().set(
+            f"{READY_KEY_PREFIX}{instance}",
+            datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            ex=READY_MARKER_TTL_SECONDS,
+        )
+        logger.info("Announced worker readiness for instance %s", instance)
+    except Exception:
+        logger.warning(
+            "Could not announce readiness for instance %s; the controller may "
+            "treat this instance as failed once its boot deadline passes",
+            instance,
+            exc_info=True,
+        )
+
+
 @app.on_after_configure.connect
 def setup_periodic_tasks(sender, **kwargs):
+    # ``add_periodic_task`` builds the message itself, so the queue has to be
+    # named here too -- the task's own default only applies to ``apply_async``.
     sender.add_periodic_task(
         12 * 60 * 60,
         cleanup_submissions.s(),
         name="Clean up old submissions",
+        options={"queue": LOCAL_QUEUE},
+    )
+    sender.add_periodic_task(
+        10 * 60,
+        reap_stranded_submissions.s(),
+        name="Reap stranded submissions",
+        options={"queue": LOCAL_QUEUE},
     )
 
 
-@app.task
+def _local_admin_token():
+    """Mint a short-lived admin token through the model layer.
+
+    Only the co-located worker consumes ``sivacor.maintenance``, and that
+    worker has ``GIRDER_MONGO_URI`` and the model layer -- so it can issue its
+    own credential instead of being handed a standing API key. Nothing is
+    persisted beyond the token itself, which is scoped to a single day because
+    it is used for exactly one POST.
+
+    Returns ``None`` on any failure. This is a *fallback*, and the whole point
+    of the REST conversion was that a worker need not reach MongoDB: a remote
+    worker importing this must degrade to a skip, not raise.
+    """
+    try:
+        from girder.models.token import Token
+        from girder.models.user import User
+
+        # Sorted so a multi-admin deployment attributes the sweeps to the same
+        # account every time, which matters when reading the job log later.
+        admin = User().findOne({"admin": True}, sort=[("created", 1)])
+        if admin is None:
+            return None
+        return Token().createToken(admin, days=1)["_id"]
+    except Exception:
+        logger.debug("No local Girder model layer for maintenance", exc_info=True)
+        return None
+
+
+def _maintenance_api():
+    """Client for a task that has no submission to inherit a token from.
+
+    Periodic tasks arrive without ``girder_client_token`` headers, so the
+    credential has to come from somewhere else. Prefer an explicit
+    ``GIRDER_API_KEY``; failing that, mint one locally. The caller reports
+    having neither as a skip rather than a failure.
+    """
+    api_url = os.environ.get("GIRDER_API_URL")
+    if not api_url:
+        return None
+    if api_key := os.environ.get("GIRDER_API_KEY"):
+        return GirderApi(api_url, api_key=api_key)
+    if token := _local_admin_token():
+        return GirderApi(api_url, token=token)
+    return None
+
+
+@app.task(queue=LOCAL_QUEUE)
 def cleanup_submissions():
-    root_collection = Collection().findOne(
-        {"name": Setting().get(PluginSettings.SUBMISSION_COLLECTION_NAME)}
-    )
-    if not root_collection:
-        return
+    """Trigger the retention sweep.
 
-    admin = User().findOne({"admin": True})
-    cutoff_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
-        days=Setting().get(PluginSettings.RETENTION_DAYS)
-    )
-    for folder in Folder().childFolders(root_collection, "collection", user=admin):
-        if folder["created"] > cutoff_time:
-            continue
-        if job_id := folder.get("meta", {}).get("job_id"):
-            main_job = Job().load(job_id, force=True)
-            Job().remove(main_job)
-            Job().collection.delete_many({"args.0.job_id": job_id})
+    The sweep itself runs on the Girder server: it removes jobs by query, which
+    has no REST equivalent.
+    """
+    if not (api := _maintenance_api()):
         logger.info(
-            f"Cleaning up submission folder {folder['_id']} created at {folder['created']}"
+            "Skipping submission retention sweep: set GIRDER_API_URL on a "
+            "worker (plus GIRDER_API_KEY, unless it can reach MongoDB) to "
+            "enable it."
         )
-        Folder().remove(folder)
+        return
+    api.client.post("sivacor/cleanup")
+
+
+@app.task(queue=LOCAL_QUEUE)
+def reap_stranded_submissions():
+    """Ask Girder to fail submissions whose worker went away.
+
+    Same shape as :func:`cleanup_submissions`, and for the same reason: the
+    sweep is a query over the job collection. It has to be driven from outside
+    the submission it might be failing, so it cannot live on the chain.
+
+    .. note::
+
+       This stays an HTTP call even though the only consumer of
+       :data:`~.routing.LOCAL_QUEUE` has the model layer and could sweep
+       in-process. Failing a submission works by ``updateJob()`` firing
+       ``jobs.job.update.after``, and that handler is bound in
+       ``SIVACORPlugin.load()`` -- which runs in the Girder *server*, not here:
+       a celery worker loads ``girder_worker_plugins`` entry points only, so in
+       this process the topic has zero handlers. Sweeping locally would
+       transition the job and silently skip the folder status update and the
+       user's failure email. The test suite cannot catch that, because
+       ``pytest-girder`` loads the full plugin in-process.
+    """
+    if not (api := _maintenance_api()):
+        logger.info(
+            "Skipping stranded-submission reap: set GIRDER_API_URL on a "
+            "worker (plus GIRDER_API_KEY, unless it can reach MongoDB) to "
+            "enable it."
+        )
+        return
+    api.client.post("sivacor/reap")

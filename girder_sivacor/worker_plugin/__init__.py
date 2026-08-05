@@ -1,235 +1,100 @@
-import datetime
-import logging
-import os
-import shutil
-from email.message import EmailMessage
-from email.policy import SMTP
-from pathlib import Path
+import socket
 
-from girder import events
-from girder.models.collection import Collection
-from girder.models.folder import Folder
-from girder.models.setting import Setting
-from girder.models.user import User
-from girder.settings import SettingKey
-from girder.utility import mail_utils
-from girder_jobs.constants import JobStatus
-from girder_jobs.models.job import Job
 from girder_worker import GirderWorkerPluginABC
 
-logger = logging.getLogger(__name__)
-_HERE = Path(__file__).parent
 
+def _keepalive_transport_options() -> dict:
+    """Broker/backend socket settings that let a dead peer actually be noticed.
 
-def format_timestamp(timestamp):
-    """Format timestamp for display"""
-    # Implement based on your timestamp format
-    return timestamp.strftime("%Y-%m-%d %H:%M:%S EST")
+    **The problem this solves cost a VM 30 h of allocation on 2026-08-01.** A
+    worker finished its submissions, sat idle ~13 min, and its Redis connection
+    went half-open -- the flow was dropped somewhere in the path (NAT, security
+    group, or Redis's own ``timeout``) with no FIN/RST. Nothing noticed:
 
+    * A *fresh* connection worked fine (``redis-cli ping`` -> ``NOAUTH``), so the
+      network was healthy; only celery's established socket was a zombie.
+    * The worker never logged again, never retried, and could not answer control
+      broadcasts -- so ``celery inspect`` timed out forever, the self-shutdown
+      supervisor read that as "busy", and the instance became immortal.
+    * Even ``kill -QUIT`` hung: the process handles signals fine, it is blocked
+      in ``recv()`` on a socket the kernel still believes is ESTABLISHED.
 
-def calculate_duration(start, end):
-    """Calculate human-readable duration"""
-    duration = end - start
-    hours, remainder = divmod(int(duration.total_seconds()), 3600)
-    minutes, seconds = divmod(remainder, 60)
+    kombu already sets ``health_check_interval`` (default 25 s), and that is not
+    enough on its own: redis-py health-checks a connection when it is *taken from
+    the pool*, but the consumer connection is parked in a blocking read and is
+    never taken from anywhere. Only TCP keepalive probes an idle-but-open socket,
+    and kombu leaves ``socket_keepalive`` at ``None`` -- off.
 
-    parts = []
-    if hours > 0:
-        parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
-    if minutes > 0:
-        parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
-    if seconds > 0 or not parts:
-        parts.append(f"{seconds} second{'s' if seconds != 1 else ''}")
+    With these settings the kernel starts probing after 60 s idle and gives up
+    after 3 x 10 s, so a dead peer surfaces as a normal connection error in ~90 s
+    and kombu reconnects, instead of hanging indefinitely.
 
-    return " ".join(parts)
-
-
-def _createMessage(subject: str, text_content: str, rendered_html: str, to, bcc):
-    # Normalize recipients
-    if isinstance(to, str):
-        to = [to]
-    if isinstance(bcc, str):
-        bcc = [bcc]
-    elif bcc is None:
-        bcc = []
-
-    if not to and not bcc:
-        raise ValueError("At least one recipient (to or bcc) must be specified.")
-    if not subject:
-        raise ValueError("Email subject cannot be empty.")
-
-    # 1. Create the modern EmailMessage object with SMTP policy
-    # The SMTP policy automatically uses Quoted-Printable for UTF-8/long lines
-    msg = EmailMessage(policy=SMTP)
-
-    msg["Subject"] = subject
-    msg["From"] = Setting().get(SettingKey.EMAIL_FROM_ADDRESS)
-    if to:
-        msg["To"] = ", ".join(to)
-    if bcc:
-        msg["Bcc"] = ", ".join(bcc)
-
-    # 2. Set the plain text as the main content
-    msg.set_content(text_content)
-
-    # 3. Add the HTML version as an alternative
-    # EmailMessage handles the 'alternative' container creation for you
-    msg.add_alternative(rendered_html, subtype="html")
-
-    recipients = list(set(to) | set(bcc))
-    return msg, recipients
-
-
-def notify_user(job, submission_folder, success: bool) -> None:
-    job = Job().load(job["_id"], includeLog=True, force=True)
-    meta = submission_folder.get("meta", {})
-    if not meta.get("creator_id"):
-        logger.error(
-            "Submission folder %s has no creator_id in metadata.",
-            str(submission_folder["_id"]),
-        )
-        return
-    user = User().load(meta["creator_id"], force=True)
-    if not user:
-        logger.error("User with ID %s not found.", str(meta["creator_id"]))
-        return
-
-    context = {
-        "base_url": "https://submit.sivacor.org",
-        "docs_url": "https://docs.sivacor.org",
-        "feedback_url": "https://feedback.sivacor.org",
-        "current_year": datetime.datetime.now().year,
-        "logo_url": "https://submit.sivacor.org/sivacor_logo_notext_trans.png",
-        "user_name": f"{user['firstName']} {user['lastName']}",
-        "job_id": str(job["_id"]),
-        "is_success": success,
-        "status_text": "SUCCESS" if success else "FAILED",
-        "submission_time": format_timestamp(job["created"]),
-        "completion_time": format_timestamp(job["updated"]),
-        "execution_time": calculate_duration(job["created"], job["updated"]),
-        "stages": meta.get("stages", []),
-        "submission_url": "https://submit.sivacor.org/",
+    Worth being clear about the stakes: both wedges observed so far happened
+    *after* the work was done, so they only cost SUs. Nothing prevents a worker
+    going deaf mid-chain, and that would strand a live submission until the
+    reaper -- which is why this is a correctness fix, not a tidiness one.
+    """
+    options: dict = {
+        "socket_keepalive": True,
+        # Only bites if a socket timeout is ever configured -- redis-py raises
+        # TimeoutError, and this retries instead of failing the operation. Inert
+        # today (no socket_timeout is set) and kept as a deliberate default for
+        # whoever adds one. `socket_timeout` is *not* set here on purpose: the
+        # consumer parks in a blocking read, and a timeout there causes spurious
+        # errors. Keepalive is the correct mechanism for a dead peer.
+        "retry_on_timeout": True,
     }
-
-    # 2. Create the Plain Text version (Very important for spam scores)
-    text_content = (
-        f"Hello {context['user_name']},\n\n"
-        f"Your SIVACOR job {context['job_id']} has finished with "
-        f"status {context['status_text']}.\n"
-        f"View details here: {context['submission_url']}"
-    )
-
-    if not success:
-        context["error_message"] = "".join(
-            job.get("log", ["No error message available."])
+    # Linux names; guarded because these constants are absent or spelled
+    # differently on other platforms and the test suite is not Linux-only.
+    keepalive_options = {
+        getattr(socket, name): value
+        for name, value in (
+            ("TCP_KEEPIDLE", 60),
+            ("TCP_KEEPINTVL", 10),
+            ("TCP_KEEPCNT", 3),
         )
-
-    subject = (
-        "Your SIVACOR submission has completed successfully"
-        if success
-        else "Your SIVACOR submission has failed"
-    )
-
-    rendered_html = mail_utils.renderTemplate("submission_notification.mako", context)
-    msg, recipients = _createMessage(
-        subject, text_content, rendered_html, [user["email"]], None
-    )
-    events.trigger("_sendmail", info={"message": msg, "recipients": recipients})
+        if hasattr(socket, name)
+    }
+    if keepalive_options:
+        options["socket_keepalive_options"] = keepalive_options
+    return options
 
 
-def _sendmail(event):
-    msg = event.info["message"]
-    recipients = event.info["recipients"]
-    _submitEmail(msg, recipients)
+def _apply_transport_options(sender, **kwargs):
+    """Merge the keepalive settings into an app whose config is already loaded.
 
+    Merged rather than assigned: girder_worker or another plugin may have put
+    something here, and silently dropping broker settings is exactly the class of
+    bug this exists to fix.
 
-def _submitEmail(msg, recipients):
-    if os.environ.get("GIRDER_EMAIL_TO_CONSOLE"):
-        print("[sivacor] Redirecting email to console:")
-        print(msg.as_string())
-        return
-
-    setting = Setting()
-    smtp = mail_utils._SMTPConnection(
-        host=setting.get(SettingKey.SMTP_HOST),
-        port=setting.get(SettingKey.SMTP_PORT),
-        encryption=setting.get(SettingKey.SMTP_ENCRYPTION),
-        username=setting.get(SettingKey.SMTP_USERNAME),
-        password=setting.get(SettingKey.SMTP_PASSWORD),
-    )
-
-    logger.info("Sending email to %s through %s", ", ".join(recipients), smtp.host)
-
-    with smtp:
-        smtp.send(msg["From"], recipients, msg.as_bytes())
-
-
-def set_submission_status(event: events.Event) -> None:
-    from ..settings import PluginSettings
-
-    job = event.info.get("job")
-    if not job or job.get("type") != "sivacor_submission":
-        return
-
-    root_collection = Collection().findOne(
-        {"name": Setting().get(PluginSettings.SUBMISSION_COLLECTION_NAME)}
-    )
-    if not root_collection:
-        logger.error(
-            "Submission collection '%s' not found.",
-            Setting().get(PluginSettings.SUBMISSION_COLLECTION_NAME),
-        )
-        return
-
-    submission_folder = Folder().findOne(
-        {
-            "parentId": root_collection["_id"],
-            "parentCollection": "collection",
-            "meta.job_id": str(job["_id"]),
-        }
-    )
-    if not submission_folder:
-        logger.error("!!! Submission folder for job %s not found.", str(job["_id"]))
-        return
-
-    status = job.get("status")
-    if status == JobStatus.SUCCESS:
-        submission_status = "completed"
-        try:
-            notify_user(job, submission_folder, success=True)
-        except Exception as e:
-            logger.exception(
-                "Failed to send success notification for job %s: %s",
-                str(job["_id"]),
-                str(e),
-            )
-    elif status in (JobStatus.ERROR, JobStatus.CANCELED):
-        submission_status = "failed"
-        try:
-            notify_user(job, submission_folder, success=False)
-        except Exception as e:
-            logger.exception(
-                "Failed to send failure notification for job %s: %s",
-                str(job["_id"]),
-                str(e),
-            )
-        shutil.rmtree(f"/tmp/workspace-{submission_folder['_id']}", ignore_errors=True)
-        shutil.rmtree(f"/tmp/tmp-{submission_folder['_id']}", ignore_errors=True)
-    else:
-        submission_status = "processing"
-    Folder().collection.update_one(
-        {"_id": submission_folder["_id"]},
-        {"$set": {"meta.status": submission_status}},
-    )
+    Both connections get it. The result backend is the same Redis and parks
+    connections just as long, so a half-open backend socket would hang a chain
+    *mid-flight* rather than at rest -- the worse of the two failures.
+    """
+    keepalive = _keepalive_transport_options()
+    for setting in ("broker_transport_options", "result_backend_transport_options"):
+        options = dict(getattr(sender.conf, setting, None) or {})
+        options.update(keepalive)
+        setattr(sender.conf, setting, options)
 
 
 class SIVACORWorkerPlugin(GirderWorkerPluginABC):
     def __init__(self, app, *args, **kwargs):
         self.app = app
-        mail_utils.addTemplateDirectory((_HERE.parent / "mail_templates").as_posix())
-        events.bind("jobs.job.update.after", "sivacor", set_submission_status)
-        events.unbind("_sendmail", "core.email")
-        events.bind("_sendmail", "sivacor", _sendmail)
+
+        # MUST be deferred to the signal; setting app.conf here does not stick.
+        # girder_worker's app.py instantiates plugins via discover_tasks(app) and
+        # only *then* calls app.config_from_object(..., force=True), which discards
+        # anything already on app.conf. Verified against the deployed image: the
+        # options apply correctly to a bare Celery() instance, yet the imported
+        # girder_worker.app shows broker_transport_options == {}.
+        #
+        # on_after_configure fires once the config source has been applied, so our
+        # merge lands on top of it rather than under it -- and it fires for clients
+        # as well as workers, so the Girder server's publishing connection is
+        # covered too. weak=False because the only reference to this receiver is
+        # the connection itself.
+        app.on_after_configure.connect(_apply_transport_options, weak=False)
 
     def task_imports(self):
         return [

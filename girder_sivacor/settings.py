@@ -13,6 +13,18 @@ class PluginSettings:
     RETENTION_DAYS = "sivacor.retention_days"  # in days
     BANNER_ENABLED = "sivacor.banner_enabled"
     BANNER_MESSAGE = "sivacor.banner_message"
+    HEARTBEAT_TIMEOUT = "sivacor.heartbeat_timeout"  # in minutes
+    MAX_RUNTIME = "sivacor.max_runtime"  # in hours
+    #: Contents of ``stata.lic``, served to workers that run a Stata image.
+    #:
+    #: Ephemeral workers are stock VMs with no license on disk (D7: nothing
+    #: provider-specific, so no baked image and no cloud secret manager), and
+    #: cloud-init has no Girder credential -- the admin-scoped token only
+    #: arrives with the task. So the license is fetched at run time, by the one
+    #: step that needs it, using the token already in hand. Deliberately NOT in
+    #: user-data: that would persist a vendor license in Nova's DB and put it on
+    #: every worker rather than only the ones running Stata.
+    STATA_LICENSE = "sivacor.stata_license"
 
 
 SettingDefault.defaults.update(
@@ -23,6 +35,15 @@ SettingDefault.defaults.update(
         PluginSettings.RETENTION_DAYS: 7,
         PluginSettings.BANNER_ENABLED: False,
         PluginSettings.BANNER_MESSAGE: "",
+        # Generous relative to the one-minute heartbeat: only the container run
+        # ticks it, so the quiet stretches are whole pipeline steps -- zipping
+        # and uploading a multi-gigabyte package chief among them. Better to
+        # notice a dead worker late than to fail a live submission.
+        PluginSettings.HEARTBEAT_TIMEOUT: 30.0,
+        PluginSettings.MAX_RUNTIME: 24.0,
+        # Empty by default: a deployment with no Stata license set simply cannot
+        # run Stata images, and says so at container-create time.
+        PluginSettings.STATA_LICENSE: "",
         PluginSettings.IMAGE_TAGS: {
             "dataeditors/stata15": ["latest", "2023-01-27"],
             "dataeditors/stata16": ["latest", "2023-06-13", "2022-10-14"],
