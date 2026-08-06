@@ -23,6 +23,8 @@ import pandas as pd
 import redis
 import requests
 
+from ..errors import FailureCode, SubmissionError
+
 MASTER_KEY_HEX = os.environ.get(
     "MASTER_KEY_HEX", "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
 )
@@ -375,10 +377,11 @@ def stata_license_mount_source(api, submission, host_tmp_root: str) -> str:
     settings = api.settings([PluginSettings.STATA_LICENSE])
     license_text = (settings.get(PluginSettings.STATA_LICENSE) or "").strip()
     if not license_text:
-        raise ValueError(
+        raise SubmissionError(
+            FailureCode.NO_STATA_LICENSE,
             "A Stata image was requested but this deployment has no Stata "
             f"license: set the '{PluginSettings.STATA_LICENSE}' Girder setting, "
-            "or STATA_LICENSE_HOSTPATH on the worker."
+            "or STATA_LICENSE_HOSTPATH on the worker.",
         )
 
     # tmp_dir is a path inside THIS container; host_tmp_root translates it for
@@ -405,6 +408,35 @@ def stata_error(log_content: str) -> str | None:
         return "Cannot find license file"
     elif "Your license has expired" in log_content:
         return "License has expired"
+
+
+#: The fixed diagnoses :func:`stata_error` can return that are not an ``r(NNN)``.
+#: They are our own strings, so they are safe to keep in a permanent record
+#: verbatim -- unlike the numeric case, whose message carries the failing line.
+_STATA_FIXED_DIAGNOSES = (
+    "License is invalid",
+    "Cannot find license file",
+    "License has expired",
+)
+
+
+def stata_error_code(stata_err: str | None) -> str | None:
+    """Reduce a :func:`stata_error` message to something safe to keep forever.
+
+    The numeric case is the reason this exists. ``stata_error`` prepends the
+    *line before* ``r(NNN);``, which is generally the failing command -- often
+    a ``use`` of the researcher's dataset, complete with its path. That belongs
+    in the job log, where the researcher can act on it, and nowhere else. The
+    return code alone is the part that aggregates, and Stata's return codes are
+    a documented, finite set.
+    """
+    if not stata_err:
+        return None
+    if match := re.search(r"r\(\d+\)", stata_err):
+        return match.group(0)
+    if stata_err in _STATA_FIXED_DIAGNOSES:
+        return stata_err
+    return None
 
 
 def stop_container(container: docker.models.containers.Container):
@@ -447,7 +479,10 @@ def _infer_run_command(submission, stage):
         entrypoint = ["/usr/local/bin/matlab", "-batch"]
         home_dir = "/home/matlab"
     else:
-        raise ValueError("Cannot infer the entrypoint for submission")
+        raise SubmissionError(
+            FailureCode.NO_ENTRYPOINT,
+            "Cannot infer the entrypoint for submission",
+        )
 
     # Find the main file, by walking into subdirectories if needed
     base_path = Path(project_dir).resolve()
@@ -465,13 +500,20 @@ def _infer_run_command(submission, stage):
             renv_paths.append(relative_renv_path)
 
     if len(relative_paths) == 0:
-        raise ValueError(
-            f"Cannot infer run command for submission. No {stage['main_file']} found."
+        raise SubmissionError(
+            FailureCode.MAIN_FILE_MISSING,
+            f"Cannot infer run command for submission. No {stage['main_file']} found.",
         )
     elif len(relative_paths) > 1:
-        raise ValueError(
-            f"Cannot infer run command for submission. Multiple {stage['main_file']} "
-            "files found: {relative_paths}"
+        # The paths are what makes this actionable -- the researcher has to know
+        # which copies to remove -- so they stay in the message. Only the count
+        # is kept in the permanent record.
+        found = ", ".join(str(path) for path in sorted(relative_paths))
+        raise SubmissionError(
+            FailureCode.MAIN_FILE_AMBIGUOUS,
+            f"Cannot infer run command for submission. Multiple "
+            f"{stage['main_file']} files found: {found}",
+            detail=len(relative_paths),
         )
 
     sub_dir = ""
@@ -512,6 +554,74 @@ def _infer_run_command(submission, stage):
 #: instead of failing cleanly. Stopping at a floor converts that into one failed
 #: job with an explanatory message.
 DISK_FLOOR_BYTES = int(os.environ.get("SIVACOR_DISK_FLOOR_BYTES", 5 * 1024**3))
+
+
+def directory_usage(*paths) -> int:
+    """Bytes actually occupied on disk by everything under ``paths``.
+
+    ``st_blocks``, not ``st_size``: the question this answers is "how much room
+    did this run need", so a sparse file should count what it costs, and the
+    per-file rounding up to a block matters for a package of many small files.
+    This is what ``du`` reports, and deliberately not what the uploaded-package
+    size bucket reports -- that one is the archive's apparent size.
+
+    Hardlinked files are counted once, again matching ``du``. The inode set is
+    only populated for files with more than one link, which in a replication
+    package is almost none of them.
+
+    Never raises: this runs inside the poll loop of a job that is otherwise
+    fine, and a file vanishing mid-walk (the analysis is writing to this tree
+    as we read it) is expected, not exceptional.
+    """
+    total = 0
+    seen_inodes = set()
+    stack = []
+
+    # Directories occupy blocks of their own, and ``du`` charges for them. A
+    # package of many small directories is measurably bigger than the sum of
+    # its files, so counting only files under-reports exactly the shape of
+    # payload most likely to fill a disk.
+    for path in paths:
+        if not path:
+            continue
+        try:
+            stat_result = os.stat(path, follow_symlinks=False)
+        except OSError:
+            continue
+        total += stat_result.st_blocks * 512
+        if stat.S_ISDIR(stat_result.st_mode):
+            stack.append(path)
+
+    while stack:
+        try:
+            with os.scandir(stack.pop()) as entries:
+                for entry in entries:
+                    try:
+                        # A symlink is charged for its own inode -- which is
+                        # what it costs, and what ``du`` reports -- but never
+                        # followed: one pointing at an ancestor would not
+                        # terminate, and one pointing into the tree would be
+                        # counted twice.
+                        is_dir = entry.is_dir(follow_symlinks=False)
+                        stat_result = entry.stat(follow_symlinks=False)
+                        if stat_result.st_nlink > 1:
+                            inode = (stat_result.st_dev, stat_result.st_ino)
+                            if inode in seen_inodes:
+                                continue
+                            seen_inodes.add(inode)
+                        total += stat_result.st_blocks * 512
+                        if is_dir:
+                            stack.append(entry.path)
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return total
+
+
+def workspace_usage(submission) -> int:
+    """Disk occupied by one submission's scratch directories."""
+    return directory_usage(submission.get("workspace_dir"), submission.get("tmp_dir"))
 
 
 def disk_shortfall(submission) -> str | None:
@@ -604,7 +714,13 @@ def pull_image(cli, api, submission, image_reference):
     if error:
         # Infrastructure, not user error: a registry timeout or a rate limit must
         # not read as "your replication package is broken".
-        raise RuntimeError(f"Failed to pull image {image_reference}: {error}")
+        # The registry's own text is free-form and goes no further than the job
+        # log; the record keeps the image reference, which is allow-listed.
+        raise SubmissionError(
+            FailureCode.IMAGE_PULL_FAILED,
+            f"Failed to pull image {image_reference}: {error}",
+            detail=image_reference,
+        )
     logging.info("Pulled %s (%d layers)", image_reference, len(layers))
 
 
@@ -621,6 +737,13 @@ def recorded_run(api, submission, stage, env_vars, task=None):
         "MemTotal": info.get("MemTotal"),
         "NCPU": info.get("NCPU"),
         "Processor": cpu_info.get("brand_raw"),
+    }
+    # Machine shape for the execution record. Kept as a capability class, not
+    # an identity: no hostname, no queue name, nothing naming this instance.
+    submission["telemetry_worker"] = {
+        "arch": info.get("Architecture"),
+        "ncpu": info.get("NCPU"),
+        "mem_total_bytes": info.get("MemTotal"),
     }
     user_env = {
         _["key"]: _["value"]
@@ -756,6 +879,7 @@ def recorded_run(api, submission, stage, env_vars, task=None):
         logging_thread.start()
         publisher.start()
 
+        peak_disk = 0
         try:
             container = cli.containers.get(container.id)
             last_heartbeat = 0.0
@@ -773,13 +897,22 @@ def recorded_run(api, submission, stage, env_vars, task=None):
                 if now - last_heartbeat >= HEARTBEAT_INTERVAL:
                     last_heartbeat = now
                     api.heartbeat(submission["job_id"])
+                    # Sampled on the heartbeat tick rather than every second:
+                    # the walk is ~0.4s over a 100k-file tree, which is nothing
+                    # once a minute and a busy loop at 1Hz.
+                    peak_disk = max(peak_disk, workspace_usage(submission))
                     if shortfall := disk_shortfall(submission):
                         stop_container(container)
-                        raise RuntimeError(shortfall)
+                        raise SubmissionError(FailureCode.OUT_OF_DISK, shortfall)
                 time.sleep(1)
                 container = cli.containers.get(container.id)
         except docker.errors.NotFound:
             pass
+
+        # A run shorter than one heartbeat never sampled above, and would report
+        # nothing at all. This also catches output written right at the end,
+        # which is when a replication package is usually at its largest.
+        peak_disk = max(peak_disk, workspace_usage(submission))
 
         stats_thread.join()
         while not log_queue.empty():
@@ -805,6 +938,16 @@ def recorded_run(api, submission, stage, env_vars, task=None):
             }
         )
         performance_data.update({"DockerRunArgs": json.dumps(container_kwargs)})
+        # The two halves of "how much disk did this run need": the workspace it
+        # grew, and the image it had to have on the machine first. Kept apart
+        # because only the first is the researcher's to control, and a Stata
+        # image alone is several GiB -- reporting the sum would make every
+        # Stata run look like a storage hog.
+        performance_data["MaxDiskUsage"] = peak_disk
+        try:
+            performance_data["ImageSize"] = cli.images.get(image_reference).attrs["Size"]
+        except Exception:
+            logging.warning("Could not determine size of %s", image_reference, exc_info=True)
         if os.path.isfile(dstats_tmppath + ".csv"):
             df = pd.read_csv(dstats_tmppath + ".csv")
             # The header is written when the collector starts, so the file exists
@@ -823,6 +966,21 @@ def recorded_run(api, submission, stage, env_vars, task=None):
                         "MaxMemoryUsage": int(df["Memory Usage"].max()),
                     }
                 )
+        # Same numbers, kept where finalize_job can still reach them. The
+        # performance_data file itself lives in the submission folder and is
+        # deleted with it, which is precisely the gap the record fills.
+        submission.setdefault("telemetry_stages", []).append(
+            {
+                "image_name": stage.get("image_name"),
+                "image_tag": stage.get("image_tag"),
+                "network_isolation": bool(stage.get("network_isolation", False)),
+                "exit_code": ret.get("StatusCode"),
+                "max_cpu_percent": performance_data.get("MaxCPUPercent"),
+                "max_memory_bytes": performance_data.get("MaxMemoryUsage"),
+                "max_disk_bytes": performance_data.get("MaxDiskUsage"),
+                "image_size_bytes": performance_data.get("ImageSize"),
+            }
+        )
         api.upload_bytes(
             folder_id,
             # allow_nan=False is a tripwire: a non-finite float here would be
@@ -943,12 +1101,19 @@ def recorded_run(api, submission, stage, env_vars, task=None):
 
     if not task.canceled:
         if ret["StatusCode"] != 0:
-            raise ValueError(
-                "Error executing recorded run. Check stdout/stderr for details."
+            raise SubmissionError(
+                FailureCode.NONZERO_EXIT,
+                "Error executing recorded run. Check stdout/stderr for details.",
+                detail=ret["StatusCode"],
             )
         elif is_stata(image_reference) and stata_err:
-            raise ValueError(
-                f"Stata returned an error ({stata_err}). Check stdout/stderr for details."
+            # Stata can fail while still exiting 0, which is why this is a
+            # separate branch. The message keeps the failing line for the
+            # researcher; the record keeps only the return code.
+            raise SubmissionError(
+                FailureCode.STATA_ERROR,
+                f"Stata returned an error ({stata_err}). Check stdout/stderr for details.",
+                detail=stata_error_code(stata_err),
             )
 
     return ret

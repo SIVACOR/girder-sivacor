@@ -14,6 +14,7 @@ Every test here covers one of those, plus the two traps in the implementation
 
 import mock
 import pytest
+from girder_sivacor.errors import FailureCode, SubmissionError
 from girder_sivacor.worker_plugin.lib import (
     DISK_FLOOR_BYTES,
     HEARTBEAT_INTERVAL,
@@ -100,12 +101,16 @@ def test_failed_pull_raises_rather_than_looking_like_success():
     )
     api = mock.MagicMock()
 
-    with pytest.raises(RuntimeError, match="rate limit exceeded") as exc:
+    with pytest.raises(SubmissionError, match="rate limit exceeded") as exc:
         pull_image(cli, api, {"job_id": "job-1"}, IMAGE)
 
     # The message must name the image, so a registry problem is not mistaken for
     # a broken replication package.
     assert IMAGE in str(exc.value)
+    # Classified as infrastructure, and the image reference -- unlike the
+    # registry's own error text -- is safe to keep in the execution record.
+    assert exc.value.code is FailureCode.IMAGE_PULL_FAILED
+    assert exc.value.detail == IMAGE
 
 
 def test_heartbeat_failure_does_not_abort_a_healthy_pull():

@@ -1,5 +1,6 @@
 import pytest
 from pathlib import Path
+from girder_sivacor.errors import FailureCode, SubmissionError
 from girder_sivacor.worker_plugin.lib import _infer_run_command, get_project_dir
 
 
@@ -12,7 +13,7 @@ def submission_dir(tmp_path):
 
 def test_infer_run_command_unknown_image(submission_dir):
     """
-    Test that _infer_run_command raises a ValueError for an unknown image.
+    Test that _infer_run_command rejects an unknown image.
     """
     project_dir = get_project_dir({"workspace_dir": str(submission_dir)})
     (Path(project_dir) / "main.do").touch()
@@ -20,27 +21,33 @@ def test_infer_run_command_unknown_image(submission_dir):
     submission = {"workspace_dir": str(submission_dir)}
     stage = {"image_name": "unknown/image", "main_file": "main.do"}
 
-    with pytest.raises(ValueError, match="Cannot infer the entrypoint for submission"):
+    with pytest.raises(
+        SubmissionError, match="Cannot infer the entrypoint for submission"
+    ) as raised:
         _infer_run_command(submission, stage)
+    assert raised.value.code is FailureCode.NO_ENTRYPOINT
 
 
 def test_infer_run_command_main_file_not_found(submission_dir):
     """
-    Test that _infer_run_command raises a ValueError when the main file is not found.
+    Test that _infer_run_command reports a missing main file.
     """
     submission = {"workspace_dir": str(submission_dir)}
     stage = {"image_name": "dataeditors/stata", "main_file": "nonexistent.do"}
 
     with pytest.raises(
-        ValueError,
+        SubmissionError,
         match="Cannot infer run command for submission. No nonexistent.do found.",
-    ):
+    ) as raised:
         _infer_run_command(submission, stage)
+    assert raised.value.code is FailureCode.MAIN_FILE_MISSING
+    # The filename is the researcher's, so it stays out of the permanent record.
+    assert raised.value.detail is None
 
 
 def test_infer_run_command_multiple_main_files_found(submission_dir):
     """
-    Test that _infer_run_command raises a ValueError when multiple main files are found.
+    Test that _infer_run_command reports an ambiguous main file, and says where.
     """
     project_dir = get_project_dir({"workspace_dir": str(submission_dir)})
     (Path(project_dir) / "main.R").touch()
@@ -51,10 +58,17 @@ def test_infer_run_command_multiple_main_files_found(submission_dir):
     stage = {"image_name": "rocker/r-ver", "main_file": "main.R"}
 
     with pytest.raises(
-        ValueError,
+        SubmissionError,
         match="Cannot infer run command for submission. Multiple main.R files found",
-    ):
+    ) as raised:
         _infer_run_command(submission, stage)
+    assert raised.value.code is FailureCode.MAIN_FILE_AMBIGUOUS
+    # Which copies they are is the actionable part, and used to be emitted as
+    # the literal text "{relative_paths}" -- the second half of the message was
+    # not an f-string.
+    assert "subdir/main.R" in str(raised.value)
+    # Only the count is kept forever.
+    assert raised.value.detail == 2
 
 
 def test_infer_run_command_with_space_in_filename(submission_dir):

@@ -79,11 +79,39 @@ tests really do build and run containers; the suite is Docker-bound, not CPU-bou
 
 Fuller detail, including the CI workflow and required secrets, is in `CI_SETUP.md`.
 
+## Execution records — the one store that outlives a submission
+
+`models/execution_record.py` holds anonymous per-run telemetry that survives
+both user deletion and the retention sweep. It is kept indefinitely, and that is
+only defensible because it is not personal data.
+
+`telemetry.py::sanitize_record` is the boundary that guarantees it: an
+allow-list that rebuilds the document field by field on the server, with the
+failure `detail` validated **per error code** rather than by charset. A charset
+loose enough for `rocker/r-ver:4.6.1` is also loose enough for
+`/home/jane/thesis.dta`, which is why that distinction exists. Treat
+`tests/test_execution_records.py` as boundary tests: they assert what must *not*
+survive.
+
+`errors.py` is the other half. `SubmissionError` carries a researcher-facing
+message (free to quote their filenames and Stata log lines — it goes to the job
+log, which is deleted with the submission) *and* a `code`/`detail` pair that is
+safe to keep forever. Unclassified exceptions keep only their class name.
+
+Do not add an identifier "just for debugging". There is deliberately no key
+joining a record to a user, job or folder, and that absence is what keeps these
+out of scope for erasure requests. While a submission exists its job log has the
+full story.
+
+The rationale is written up for review in
+`../aea-sivacor/LEGITIMATE_INTERESTS_ASSESSMENT.md`.
+
 ## Scratch files — not part of the plugin
 
-`models/volume.py` is dead code (imports nonexistent modules, 0% coverage). Root
-`aaa.py` / `ddd.py` / `debug.py` / `ala.py` / `foobar/`, the `*.patch` files,
-`auth/orcid.bak`, and non-`.mako` files in `mail_templates/` are all scratch.
+Root `aaa.py` / `ddd.py` / `debug.py` / `ala.py` / `foobar/`, the `*.patch`
+files, `auth/orcid.bak`, and non-`.mako` files in `mail_templates/` are all
+scratch. (`models/volume.py`, previously listed here as dead code, was deleted
+on 2026-08-06.)
 
 `tro_utils.patch` patches the *installed* `tro-utils` so `sha256_for_file`
 tolerates symlinks and missing files.

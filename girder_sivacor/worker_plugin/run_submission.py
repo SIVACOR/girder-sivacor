@@ -22,7 +22,9 @@ from girder_worker.utils import JobStatus
 from tro_utils import TRPAttribute
 from tro_utils.tro_utils import TRO
 
+from ..errors import FailureCode, SubmissionError, classify
 from ..settings import PluginSettings
+from ..telemetry import size_bucket
 from .girder_api import GirderApi, dump_to_zip
 from .lib import (
     _redis_client_sync,
@@ -95,6 +97,60 @@ def report_failure(api, job_id, failure, exc):
         logger.exception("Could not mark job %s as failed", job_id)
 
 
+def build_execution_record(submission, status, step=None, exc=None):
+    """Assemble the anonymous record of how this submission went.
+
+    Deliberately derived only from what the pipeline accumulated in
+    ``submission`` under ``telemetry_*`` keys. Nothing is read back off the
+    job or folder here, because everything on those is either an identifier or
+    reachable from one, and the whole value of these records is that they hold
+    neither. The server re-filters this against an allow-list before storing
+    it -- see :func:`girder_sivacor.telemetry.sanitize_record`.
+    """
+    record = {
+        "status": status,
+        "stack_version": _stack_version(),
+        "stages": submission.get("telemetry_stages") or [],
+        "package_size_bucket": size_bucket(submission.get("telemetry_package_bytes")),
+        "worker": submission.get("telemetry_worker") or {},
+        "total_duration_seconds": _elapsed_since(submission.get("telemetry_started")),
+    }
+    if exc is not None:
+        code, detail = classify(exc)
+        record["error"] = {"step": step, "code": code.value, "detail": detail}
+    return record
+
+
+def _stack_version():
+    try:
+        return version("girder_sivacor")
+    except Exception:
+        return None
+
+
+def _elapsed_since(started_iso):
+    if not started_iso:
+        return None
+    try:
+        started = datetime.datetime.fromisoformat(started_iso)
+    except ValueError:
+        return None
+    return (datetime.datetime.now(datetime.timezone.utc) - started).total_seconds()
+
+
+def record_execution(api, submission, status, step=None, exc=None):
+    """Send the execution record to the server. Never fails the submission.
+
+    Best effort on the same grounds as the heartbeat: this is reporting data,
+    and losing one record is not a reason to turn a finished run into a failed
+    one -- least of all on the path that is *already* handling a failure.
+    """
+    try:
+        api.record_execution(build_execution_record(submission, status, step, exc))
+    except Exception:
+        logger.warning("Could not record execution telemetry", exc_info=True)
+
+
 def discard_workspace(submission):
     """Delete the scratch directories of a submission that will not continue.
 
@@ -130,6 +186,10 @@ def submission_task(failure):
                 return func(task, api, submission, *args, **kwargs)
             except Exception as exc:
                 report_failure(api, job_id, failure, exc)
+                # func.__name__ rather than the `failure` prose: the step name
+                # is kept forever, so it has to be a stable identifier we chose,
+                # not a sentence someone may reword later.
+                record_execution(api, submission, "failed", func.__name__, exc)
                 discard_workspace(submission)
                 raise
 
@@ -151,10 +211,18 @@ def safe_tar_extract(tar, path):
     for member in tar.getmembers():
         target = os.path.abspath(os.path.join(root, member.name))
         if not target.startswith(root):
-            raise Exception("Attempted Path Traversal in Tar File: " + member.name)
+            raise SubmissionError(
+                FailureCode.UNSAFE_ARCHIVE,
+                "Attempted Path Traversal in Tar File: " + member.name,
+                detail="path_traversal",
+            )
 
         if member.issym() or member.islnk():
-            raise Exception("Tar File contains unsafe links: " + member.name)
+            raise SubmissionError(
+                FailureCode.UNSAFE_ARCHIVE,
+                "Tar File contains unsafe links: " + member.name,
+                detail="unsafe_link",
+            )
 
     tar.extractall(root, members=tar.getmembers(), filter="data")
 
@@ -261,10 +329,16 @@ def prepare_submission(task, userId, fileId, stages, job_id):
         stop_accepting_submissions(app, task)
     except Exception:
         logger.warning("Failed to stop consuming the dispatch queue", exc_info=True)
+    # Everything the execution record needs that is known before the run
+    # starts. Carried on the submission dict so each step hands it to the next.
+    telemetry = {
+        "telemetry_started": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
     try:
         submission_folder = _create_submission_folder(api, userId)
         # Move file to the submission directory
         fobj = api.file(fileId)
+        telemetry["telemetry_package_bytes"] = fobj.get("size")
         api.annotate_item_type(fobj, "submission_file")
         api.move_item(fobj["itemId"], submission_folder["_id"])
         api.set_folder_metadata(
@@ -282,9 +356,11 @@ def prepare_submission(task, userId, fileId, stages, job_id):
             "job_id": str(job_id),
             "stages": stages,
             "queue": queue,
+            **telemetry,
         }
     except Exception as exc:
         report_failure(api, job_id, "Failed to prepare submission", exc)
+        record_execution(api, telemetry, "failed", "prepare_submission", exc)
         raise
 
 
@@ -334,7 +410,10 @@ def create_workspace(task, api, submission):
                 print("Extracted as a tar file.")
         except tarfile.TarError as e:
             print(f"Not a tar file either... Reason: {e}")
-            raise ValueError("Unsupported file format for workspace creation.")
+            raise SubmissionError(
+                FailureCode.UNSUPPORTED_ARCHIVE,
+                "Unsupported file format for workspace creation.",
+            )
     finally:
         if os.path.exists(temp_filename):
             os.remove(temp_filename)
@@ -540,8 +619,16 @@ def execute_workflow(task, api, submission, stage, env_vars):
         return abandon(task, submission)
 
     if ret["StatusCode"] != 0:
-        raise RuntimeError(f"Workflow execution failed with code {ret['StatusCode']}")
+        raise SubmissionError(
+            FailureCode.NONZERO_EXIT,
+            f"Workflow execution failed with code {ret['StatusCode']}",
+            detail=ret["StatusCode"],
+        )
     end_time = datetime.datetime.now()
+    # recorded_run appended this stage's metrics; only it knows the wall-clock
+    # span including the image pull.
+    if telemetry_stages := submission.get("telemetry_stages"):
+        telemetry_stages[-1]["duration_seconds"] = (end_time - start_time).total_seconds()
 
     if submission.get("runs") is None:
         submission["runs"] = []
@@ -697,6 +784,10 @@ def finalize_job(task, submission):
             "Submission job finalized successfully.",
             status=JobStatus.SUCCESS,
         )
+        # Only on the transition we just made. A job that was already out of
+        # RUNNING was cancelled or reaped, and the reaper writes its own record
+        # -- recording here too would double-count it.
+        record_execution(api, submission, "completed")
     return submission
 
 
