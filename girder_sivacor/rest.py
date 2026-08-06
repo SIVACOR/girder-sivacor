@@ -21,7 +21,10 @@ from girder_jobs.constants import REST_CREATE_JOB_TOKEN_SCOPE, JobStatus
 from girder_jobs.models.job import Job
 from girder_plugin_worker.utils import getWorkerApiUrl
 
+from .errors import FailureCode
+from .models.execution_record import ExecutionRecord
 from .settings import PluginSettings
+from .telemetry import sanitize_record
 from .utils import encrypt_job_secrets
 from .worker_plugin.routing import DISPATCH_QUEUE
 from .worker_plugin.run_submission import (
@@ -105,6 +108,9 @@ class SIVACOR(Resource):
         self.route("POST", ("reap",), self.reap_submissions)
         self.route("POST", ("heartbeat", ":id"), self.heartbeat)
         self.route("POST", ("claim", ":id"), self.claim)
+        self.route("POST", ("execution_record",), self.record_execution)
+        self.route("GET", ("execution_record",), self.list_execution_records)
+        self.route("GET", ("execution_record", "summary"), self.summarise_execution_records)
         self.route("GET", ("image_tags",), self.get_image_tags)
         self.route("GET", ("workflow_schema",), self.get_workflow_schema)
         self.route("DELETE", ("submission", ":id"), self.delete_submission)
@@ -370,6 +376,176 @@ class SIVACOR(Resource):
 
     @access.admin
     @autoDescribeRoute(
+        Description("Store an anonymous record of how a submission executed.")
+        .notes(
+            "Called once by the worker when a submission reaches a terminal "
+            "state. These records outlive the submission -- they are what the "
+            "deployment can still report on after the user deletes their data "
+            "or the retention sweep does.\n\n"
+            "Nothing stored here identifies a person: no user, job or folder "
+            "id, no filename, no worker instance. The body is not stored as "
+            "sent -- it is rebuilt field by field from an allow-list, so a "
+            "worker cannot widen what is kept by sending more."
+        )
+        .jsonParam(
+            "record",
+            "The execution record, as built by the worker.",
+            paramType="body",
+            requireObject=True,
+        )
+    )
+    def record_execution(self, record):
+        return self.store_execution_record(record)
+
+    @staticmethod
+    def store_execution_record(payload):
+        """Filter and persist one execution record. Returns what was stored."""
+        # The date is stamped here, not taken from the payload, and is
+        # deliberately only a date: at pilot scale a wall-clock submission time
+        # is close enough to an identifier to undo the rest of this.
+        today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+        document = sanitize_record(payload, today)
+        ExecutionRecord().save(document)
+        return document
+
+    @access.admin
+    @autoDescribeRoute(
+        Description("List anonymous execution records.")
+        .notes(
+            "Admin-only. Not because the records are sensitive -- they contain "
+            "no personal data -- but because they are operational reporting "
+            "data with no meaning to a researcher, and an endpoint nobody needs "
+            "publicly is better closed."
+        )
+        .param("status", "Only records in this terminal state.", required=False)
+        .param("errorCode", "Only failures with this code.", required=False)
+        .param("imageName", "Only runs that used this image.", required=False)
+        .param("since", "Earliest date to include (YYYY-MM-DD).", required=False)
+        .param("until", "Latest date to include (YYYY-MM-DD).", required=False)
+        .pagingParams(defaultSort="date", defaultSortDir=-1)
+    )
+    def list_execution_records(self, status, errorCode, imageName, since, until, limit, offset, sort):
+        query = self._execution_record_query(status, errorCode, imageName, since, until)
+        cursor = ExecutionRecord().find(query, limit=limit, offset=offset, sort=sort)
+        return {
+            # The total is what makes the table's paging honest; a page of
+            # results says nothing about how much matched.
+            "count": ExecutionRecord().collection.count_documents(query),
+            "records": list(cursor),
+        }
+
+    @access.admin
+    @autoDescribeRoute(
+        Description("Summarise execution records for reporting.")
+        .notes(
+            "The aggregation the browse view opens with. Computed in Mongo "
+            "rather than by paging every record into the client, which stops "
+            "working the moment there are more records than one page."
+        )
+        .param("status", "Only records in this terminal state.", required=False)
+        .param("errorCode", "Only failures with this code.", required=False)
+        .param("imageName", "Only runs that used this image.", required=False)
+        .param("since", "Earliest date to include (YYYY-MM-DD).", required=False)
+        .param("until", "Latest date to include (YYYY-MM-DD).", required=False)
+    )
+    def summarise_execution_records(self, status, errorCode, imageName, since, until):
+        query = self._execution_record_query(status, errorCode, imageName, since, until)
+        collection = ExecutionRecord().collection
+
+        def grouped(pipeline):
+            return list(collection.aggregate([{"$match": query}] + pipeline))
+
+        durations = grouped(
+            [
+                {
+                    "$group": {
+                        "_id": None,
+                        "avg": {"$avg": "$total_duration_seconds"},
+                        "max": {"$max": "$total_duration_seconds"},
+                    }
+                }
+            ]
+        )
+        return {
+            "total": collection.count_documents(query),
+            "byStatus": grouped(
+                [{"$group": {"_id": "$status", "count": {"$sum": 1}}}, {"$sort": {"count": -1}}]
+            ),
+            "byErrorCode": grouped(
+                [
+                    {"$match": {"error.code": {"$ne": None}}},
+                    {"$group": {"_id": "$error.code", "count": {"$sum": 1}}},
+                    {"$sort": {"count": -1}},
+                ]
+            ),
+            # One record can have several stages, so unwind first -- otherwise a
+            # two-stage run counts once against whichever image happens to be
+            # first, and the totals quietly disagree with byStatus.
+            "byImage": grouped(
+                [
+                    {"$unwind": "$stages"},
+                    {
+                        "$group": {
+                            "_id": {
+                                "$concat": [
+                                    {"$ifNull": ["$stages.image_name", "unknown"]},
+                                    ":",
+                                    {"$ifNull": ["$stages.image_tag", "unknown"]},
+                                ]
+                            },
+                            "count": {"$sum": 1},
+                            "failed": {
+                                "$sum": {"$cond": [{"$eq": ["$status", "completed"]}, 0, 1]}
+                            },
+                        }
+                    },
+                    {"$sort": {"count": -1}},
+                ]
+            ),
+            "byDate": grouped(
+                [
+                    {
+                        "$group": {
+                            "_id": "$date",
+                            "count": {"$sum": 1},
+                            "failed": {
+                                "$sum": {"$cond": [{"$eq": ["$status", "completed"]}, 0, 1]}
+                            },
+                        }
+                    },
+                    {"$sort": {"_id": 1}},
+                ]
+            ),
+            # Deliberately mean and max rather than percentiles: $percentile
+            # needs MongoDB 7, and this deployment runs 4.4.
+            "duration": {
+                "avg": durations[0]["avg"] if durations else None,
+                "max": durations[0]["max"] if durations else None,
+            },
+        }
+
+    @staticmethod
+    def _execution_record_query(status, errorCode, imageName, since, until):
+        query = {}
+        if status:
+            query["status"] = status
+        if errorCode:
+            query["error.code"] = errorCode
+        if imageName:
+            query["stages.image_name"] = imageName
+        # 'date' is stored as a YYYY-MM-DD string, which orders lexicographically
+        # the same way it orders chronologically -- so a plain range works.
+        if since or until:
+            bounds = {}
+            if since:
+                bounds["$gte"] = since
+            if until:
+                bounds["$lte"] = until
+            query["date"] = bounds
+        return query
+
+    @access.admin
+    @autoDescribeRoute(
         Description("Fail submissions whose worker stopped reporting.").notes(
             "Called periodically by the celery worker. A chain publishes each "
             "step only after the previous one returns, so a worker that dies "
@@ -416,19 +592,59 @@ class SIVACOR(Resource):
                     f"exceeded the maximum runtime of {max_runtime}; "
                     "started at " + created.isoformat()
                 )
+                code = FailureCode.REAPED_MAX_RUNTIME
             elif now - last_seen > stale_after:
                 reason = (
                     f"no sign of life for {now - last_seen}; the worker "
                     "running it is presumed lost"
                 )
+                code = FailureCode.REAPED_NO_HEARTBEAT
             else:
                 continue
 
             logger.warning("Reaping stranded submission %s: %s", job["_id"], reason)
             self._fail_stranded(job, reason)
+            self._record_reaped(job, code, now - created)
             reaped.append(str(job["_id"]))
 
         return {"reaped": reaped}
+
+    @classmethod
+    def _record_reaped(cls, job, code, elapsed):
+        """Write the execution record for a submission the worker lost.
+
+        The worker records its own outcome, but a reaped submission is by
+        definition one whose worker is not coming back -- so a run that died
+        this way would otherwise be the one kind of failure missing from the
+        reporting data, which is the opposite of what you want.
+        """
+        stages = []
+        folder = Folder().findOne({"meta.job_id": str(job["_id"])})
+        for stage in (folder or {}).get("meta", {}).get("stages", []) or []:
+            stages.append(
+                {
+                    "image_name": stage.get("image_name"),
+                    "image_tag": stage.get("image_tag"),
+                    "network_isolation": bool(stage.get("network_isolation", False)),
+                }
+            )
+        try:
+            cls.store_execution_record(
+                {
+                    "status": "reaped",
+                    "stages": stages,
+                    "total_duration_seconds": elapsed.total_seconds(),
+                    "error": {"step": "reaper", "code": code.value},
+                }
+            )
+        except Exception:
+            # Same call as the worker's: reporting data is never worth failing
+            # the sweep that is cleaning up after a lost worker.
+            logger.warning(
+                "Could not record execution telemetry for reaped job %s",
+                job["_id"],
+                exc_info=True,
+            )
 
     @staticmethod
     def _fail_stranded(job, reason):

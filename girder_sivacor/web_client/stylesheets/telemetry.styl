@@ -1,0 +1,135 @@
+// Styles for the admin execution-telemetry page. Girder's own client is
+// Bootstrap 3, so the form controls and buttons reuse its classes and only the
+// layout specific to this page is defined here.
+
+.g-sivacor-telemetry
+  padding 10px 0
+
+  h3
+    margin-top 0
+
+  .g-sivacor-lede
+    color #666
+    max-width 60em
+    margin-bottom 18px
+
+  .g-sivacor-filter-form
+    margin-bottom 20px
+
+    .form-control
+      margin-right 6px
+      margin-bottom 6px
+
+  // A pending request dims the page rather than replacing it: swapping in a
+  // spinner makes the whole table disappear on every filter change, which is
+  // far more disorienting than a moment of stale numbers.
+  &.g-sivacor-loading
+    .g-sivacor-tiles, .g-sivacor-panels, .g-sivacor-records, .g-sivacor-paging
+      opacity 0.45
+      transition opacity 120ms ease-in
+
+.g-sivacor-tiles
+  display flex
+  flex-wrap wrap
+  gap 10px
+  margin-bottom 20px
+
+.g-sivacor-tile
+  flex 1 1 120px
+  border 1px solid #ddd
+  border-radius 4px
+  padding 10px 14px
+  background #fafafa
+
+  &.g-sivacor-ok .g-sivacor-tile-value
+    color #3c763d
+
+  &.g-sivacor-bad .g-sivacor-tile-value
+    color #a94442
+
+.g-sivacor-tile-value
+  font-size 24px
+  font-weight 300
+  line-height 1.2
+
+.g-sivacor-tile-label
+  font-size 12px
+  text-transform uppercase
+  letter-spacing 0.04em
+  color #777
+
+.g-sivacor-panels
+  display flex
+  flex-wrap wrap
+  gap 16px
+  margin-bottom 24px
+
+  .g-sivacor-panel
+    flex 1 1 260px
+    min-width 260px
+
+    h4
+      font-size 14px
+      font-weight 600
+      margin 0 0 8px
+
+.g-sivacor-table
+  width 100%
+  border-collapse collapse
+  font-size 13px
+
+  th, td
+    text-align left
+    padding 5px 8px
+    border-bottom 1px solid #eee
+    vertical-align top
+
+  th
+    font-weight 600
+    color #555
+    border-bottom 2px solid #ddd
+    white-space nowrap
+
+  code
+    font-size 12px
+
+.g-sivacor-records
+  margin-bottom 12px
+
+.g-sivacor-bad-text
+  color #a94442
+  font-weight 600
+
+.g-sivacor-status
+  display inline-block
+  padding 1px 7px
+  border-radius 10px
+  font-size 11px
+  text-transform uppercase
+  letter-spacing 0.03em
+  background #eee
+  color #555
+
+  &.g-sivacor-status-completed
+    background #dff0d8
+    color #3c763d
+
+  &.g-sivacor-status-failed
+    background #f2dede
+    color #a94442
+
+  &.g-sivacor-status-reaped
+    background #fcf8e3
+    color #8a6d3b
+
+.g-sivacor-paging
+  display flex
+  align-items center
+  gap 12px
+  margin-bottom 20px
+  font-size 13px
+  color #666
+
+.g-sivacor-empty
+  color #999
+  font-style italic

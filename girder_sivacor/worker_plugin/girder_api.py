@@ -124,6 +124,19 @@ class GirderApi:
             )
             return False
 
+    def record_execution(self, record):
+        """Store a permanent, anonymous record of how a submission ran.
+
+        Sent as a JSON body rather than query parameters because the record is
+        a nested document. The server re-filters it against an allow-list, so
+        this call cannot widen what ends up stored.
+        """
+        return self.client.post(
+            "sivacor/execution_record",
+            data=json.dumps(record),
+            headers={"Content-Type": "application/json"},
+        )
+
     # -- collections, groups and access -----------------------------------
 
     def _find_collection(self, name):
