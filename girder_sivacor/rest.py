@@ -139,7 +139,9 @@ class SIVACOR(Resource):
         self.route("POST", ("claim", ":id"), self.claim)
         self.route("POST", ("execution_record",), self.record_execution)
         self.route("GET", ("execution_record",), self.list_execution_records)
-        self.route("GET", ("execution_record", "summary"), self.summarise_execution_records)
+        self.route(
+            "GET", ("execution_record", "summary"), self.summarise_execution_records
+        )
         self.route("GET", ("image_tags",), self.get_image_tags)
         self.route("GET", ("workflow_schema",), self.get_workflow_schema)
         self.route("GET", ("fs", "manifest"), self.get_fs_manifest)
@@ -454,7 +456,9 @@ class SIVACOR(Resource):
         .param("until", "Latest date to include (YYYY-MM-DD).", required=False)
         .pagingParams(defaultSort="date", defaultSortDir=-1)
     )
-    def list_execution_records(self, status, errorCode, imageName, since, until, limit, offset, sort):
+    def list_execution_records(
+        self, status, errorCode, imageName, since, until, limit, offset, sort
+    ):
         query = self._execution_record_query(status, errorCode, imageName, since, until)
         cursor = ExecutionRecord().find(query, limit=limit, offset=offset, sort=sort)
         return {
@@ -499,7 +503,10 @@ class SIVACOR(Resource):
         return {
             "total": collection.count_documents(query),
             "byStatus": grouped(
-                [{"$group": {"_id": "$status", "count": {"$sum": 1}}}, {"$sort": {"count": -1}}]
+                [
+                    {"$group": {"_id": "$status", "count": {"$sum": 1}}},
+                    {"$sort": {"count": -1}},
+                ]
             ),
             "byErrorCode": grouped(
                 [
@@ -525,7 +532,9 @@ class SIVACOR(Resource):
                             },
                             "count": {"$sum": 1},
                             "failed": {
-                                "$sum": {"$cond": [{"$eq": ["$status", "completed"]}, 0, 1]}
+                                "$sum": {
+                                    "$cond": [{"$eq": ["$status", "completed"]}, 0, 1]
+                                }
                             },
                         }
                     },
@@ -539,7 +548,9 @@ class SIVACOR(Resource):
                             "_id": "$date",
                             "count": {"$sum": 1},
                             "failed": {
-                                "$sum": {"$cond": [{"$eq": ["$status", "completed"]}, 0, 1]}
+                                "$sum": {
+                                    "$cond": [{"$eq": ["$status", "completed"]}, 0, 1]
+                                }
                             },
                         }
                     },
@@ -844,7 +855,9 @@ class SIVACOR(Resource):
                     "parent": parent_id,
                     "name": current["name"],
                     "created": _iso8601(current.get("created")),
-                    "updated": _iso8601(current.get("updated")),
+                    "updated": _iso8601(
+                        current.get("updated") or current.get("created")
+                    ),
                 }
             )
 
@@ -866,7 +879,7 @@ class SIVACOR(Resource):
                         "folder": str(current["_id"]),
                         "name": item["name"],
                         "created": _iso8601(item.get("created")),
-                        "updated": _iso8601(item.get("updated")),
+                        "updated": _iso8601(item.get("updated") or item.get("created")),
                     }
                 )
 
@@ -887,7 +900,7 @@ class SIVACOR(Resource):
             by_item_id = {item["_id"]: item for item in folder_items}
             item_ids = list(by_item_id)
             for start in range(0, len(item_ids), _MANIFEST_FILE_BATCH):
-                chunk = item_ids[start:start + _MANIFEST_FILE_BATCH]
+                chunk = item_ids[start : start + _MANIFEST_FILE_BATCH]
                 for file in File().find({"itemId": {"$in": chunk}}):
                     budget()
                     files.append(
@@ -922,7 +935,7 @@ class SIVACOR(Resource):
             # Client-asserted at upload; deliberately not sniffed here.
             "mimeType": file.get("mimeType"),
             "created": _iso8601(file.get("created")),
-            "updated": _iso8601(file.get("updated")),
+            "updated": _iso8601(file.get("updated") or file.get("created")),
             # Set only on upload finalisation, so imported and linkUrl files
             # have none. "" means "cannot be located by hash"; never null.
             "sha512": file.get("sha512") or "",
@@ -932,7 +945,9 @@ class SIVACOR(Resource):
             # assetstore root and derivable from sha512
             # (filesystem_assetstore_adapter.py:234), so emitting it would just
             # be an absolute-looking value that is not absolute.
-            "path": file["path"] if (is_admin and imported and "path" in file) else None,
+            "path": file["path"]
+            if (is_admin and imported and "path" in file)
+            else None,
             # Non-null means there is no assetstore blob at all.
             "linkUrl": file.get("linkUrl"),
         }
