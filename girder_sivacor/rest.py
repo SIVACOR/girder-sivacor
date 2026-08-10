@@ -14,7 +14,6 @@ from girder.exceptions import AccessException, RestException, ValidationExceptio
 from girder.models.collection import Collection
 from girder.models.file import File
 from girder.models.folder import Folder
-from girder.models.item import Item
 from girder.models.setting import Setting
 from girder.models.token import Token
 from girder.models.user import User
@@ -80,6 +79,11 @@ def _iso8601(value):
 #: version it does not know, so bump this for any incompatible change to the
 #: shape emitted by get_fs_manifest -- adding a field is not one.
 FS_MANIFEST_VERSION = 1
+
+#: How many items' files to fetch per Mongo query when building a manifest.
+#: Trades round trips against the size of a single $in; 1000 puts a 100k-node
+#: tree at ~50 queries instead of ~50 000.
+_MANIFEST_FILE_BATCH = 1000
 
 
 stage_schema = {
@@ -853,7 +857,8 @@ class SIVACOR(Resource):
             # that is what keeps unreadable branches out of the manifest.
             # Never force=True here: `girder mount` walks that way and thereby
             # exposes the whole database to anyone who can read the mountpoint.
-            for item in list(Folder().childItems(current)):
+            folder_items = list(Folder().childItems(current))
+            for item in folder_items:
                 budget()
                 items.append(
                     {
@@ -864,9 +869,30 @@ class SIVACOR(Resource):
                         "updated": _iso8601(item.get("updated")),
                     }
                 )
-                for file in list(Item().childFiles(item)):
+
+            # Files are fetched per batch of items rather than per item.
+            # Item().childFiles(item) is exactly File().find({"itemId": id}),
+            # so calling it in a loop costs one Mongo round trip per item: at
+            # 50 000 items that measured 18.7s of a 26s response, against 0.55s
+            # for the same rows fetched with $in (M1-BACKEND-CHANGES.md §7).
+            # Identical query, identical access semantics -- files inherit the
+            # containing folder's ACL either way -- and the response is
+            # byte-for-byte the same, since every array is sorted at the end.
+            #
+            # Chunked rather than one query per folder so that a single
+            # enormous folder cannot pull an unbounded number of file
+            # documents into memory before budget() gets a chance to refuse
+            # them. The items themselves are already budget-checked above, so
+            # this is bounded by maxNodes regardless.
+            by_item_id = {item["_id"]: item for item in folder_items}
+            item_ids = list(by_item_id)
+            for start in range(0, len(item_ids), _MANIFEST_FILE_BATCH):
+                chunk = item_ids[start:start + _MANIFEST_FILE_BATCH]
+                for file in File().find({"itemId": {"$in": chunk}}):
                     budget()
-                    files.append(self._manifest_file(file, item, is_admin))
+                    files.append(
+                        self._manifest_file(file, by_item_id[file["itemId"]], is_admin)
+                    )
 
             for child in list(Folder().childFolders(current, "folder", user=user)):
                 budget()

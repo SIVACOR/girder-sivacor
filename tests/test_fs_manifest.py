@@ -342,3 +342,44 @@ def test_empty_folder_mounts_as_an_empty_manifest(server, db, user, tree):
     assert body["items"] == []
     assert body["files"] == []
 
+
+
+@pytest.mark.plugin("sivacor")
+def test_files_are_fetched_in_batches_not_one_query_per_item(
+    server, db, user, tree, monkeypatch
+):
+    """The walk must not issue one Mongo query per item.
+
+    ``Item().childFiles(item)`` is exactly ``File().find({"itemId": id})``, so
+    calling it in a loop costs a round trip per item: at 50 000 items that
+    measured 18.7s of a 26s response, against 0.55s for the same rows fetched
+    with ``$in``. Nothing about the response reveals the difference, which is
+    precisely why it needs a test -- a future refactor back to the obvious
+    per-item loop would be invisible until someone mounts a big folder.
+    """
+    from girder_sivacor import rest as rest_module
+
+    queries = []
+    real_find = File().find
+
+    def counting_find(query=None, **kwargs):
+        queries.append(query)
+        return real_find(query, **kwargs)
+
+    monkeypatch.setattr(File(), "find", counting_find)
+
+    body = manifest(server, user, tree.root)
+    assert len(body["files"]) == 3
+
+    itemid_queries = [q for q in queries if q and "itemId" in q]
+    assert itemid_queries, "the walk should look files up by itemId"
+    # Every lookup is a batch, never a bare equality on a single item id.
+    for query in itemid_queries:
+        assert "$in" in query["itemId"], (
+            f"file lookup {query!r} is per-item; it should batch with $in"
+        )
+    # The fixture has 3 items across 2 folders, so at most one query per folder.
+    assert len(itemid_queries) <= 2, (
+        f"{len(itemid_queries)} file queries for 2 folders of items"
+    )
+    assert rest_module._MANIFEST_FILE_BATCH >= 1
