@@ -918,7 +918,7 @@ class SIVACOR(Resource):
             "item": str(item["_id"]),
             "name": file["name"],
             # linkUrl files may carry no size at all.
-            "size": file.get("size") or 0,
+            "size": int(file.get("size") or 0),
             # Client-asserted at upload; deliberately not sniffed here.
             "mimeType": file.get("mimeType"),
             "created": _iso8601(file.get("created")),
