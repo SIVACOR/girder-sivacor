@@ -34,7 +34,8 @@ logger = logging.getLogger(__name__)
 
 
 @setting_utilities.validator(PluginSettings.UPLOADS_FOLDER_NAME)
-def _validate_uploads_folder_name(value):
+def _validate_uploads_folder_name(doc):
+    value = doc.get("value")
     if not isinstance(value, str) or not value:
         raise ValidationException("Uploads folder name must be a non-empty string.")
     return value
