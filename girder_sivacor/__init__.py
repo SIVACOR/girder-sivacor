@@ -121,16 +121,21 @@ def defaultOrcidSettings():
 def create_uploads_folder(event: events.Event) -> None:
     user = event.info
     folderModel = ModelImporter.model("folder")
+    uploads_folder_name = Setting().get(PluginSettings.UPLOADS_FOLDER_NAME)
     uploads_folder = folderModel.findOne(
         {
             "parentId": user["_id"],
             "parentCollection": "user",
-            "name": Setting().get(PluginSettings.UPLOADS_FOLDER_NAME),
+            "name": uploads_folder_name,
         }
     )
     if not uploads_folder:
         uploads_folder = folderModel.createFolder(
-            parent=user, name="Uploads", parentType="user", public=False, creator=user
+            parent=user,
+            name=uploads_folder_name,
+            parentType="user",
+            public=False,
+            creator=user,
         )
     folderModel.setUserAccess(uploads_folder, user, level=AccessType.ADMIN, save=True)
 
