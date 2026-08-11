@@ -44,6 +44,12 @@ class FailureCode(str, Enum):
     STATA_ERROR = "stata_error"
     #: The analysis container exited non-zero. ``detail`` is the exit code.
     NONZERO_EXIT = "nonzero_exit"
+    #: The kernel OOM-killed the analysis container's cgroup. ``detail`` is the
+    #: limit in bytes it exceeded -- a property of the worker's flavor, not of
+    #: the researcher. Distinct from NONZERO_EXIT because the exit code is an
+    #: indistinguishable 137 and the container's own logs say nothing: the
+    #: process is killed with no chance to report.
+    OUT_OF_MEMORY = "out_of_memory"
     #: The image could not be pulled. ``detail`` is the (allow-listed) image ref.
     IMAGE_PULL_FAILED = "image_pull_failed"
     #: No run command could be inferred for the image family.

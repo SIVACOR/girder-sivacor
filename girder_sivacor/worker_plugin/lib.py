@@ -555,6 +555,56 @@ def _infer_run_command(submission, stage):
 #: job with an explanatory message.
 DISK_FLOOR_BYTES = int(os.environ.get("SIVACOR_DISK_FLOOR_BYTES", 5 * 1024**3))
 
+#: RAM held back from the analysis container, for everything else on the worker.
+#: Overridable per host with ``SIVACOR_MEMORY_HEADROOM_BYTES``.
+#:
+#: The disk story above, in memory. An analysis container was previously
+#: unlimited, so a hungry payload competed with the celery worker that supervises
+#: it -- and won. Measured on 2026-08-11: a Stata run peaked at 29.1 GB of the
+#: worker's 29.4 GB, held it for three hours with no swap, and celery's
+#: MainProcess stopped answering. The analysis finished with ``exit 0``, but
+#: nothing was left alive to advance the chain, so the submission was reaped as
+#: "no heartbeat" and the completed work was discarded.
+#:
+#: Capping the container moves the failure inside the cgroup: the kernel kills
+#: the *analysis*, the container exits, ``recorded_run`` raises
+#: :attr:`~girder_sivacor.errors.FailureCode.OUT_OF_MEMORY`, and the worker
+#: survives to report it. One clearly-explained failed submission instead of a
+#: silently lost one.
+#:
+#: 2 GiB is for celery, the docker daemon, and the OS. It is not generous; it is
+#: the smallest amount that has to survive for a failure to be *reportable*.
+MEMORY_HEADROOM_BYTES = int(
+    os.environ.get("SIVACOR_MEMORY_HEADROOM_BYTES", 2 * 1024**3)
+)
+
+#: Do not cap below this. A limit this small cannot run any analysis image, so
+#: setting one would convert "this host is too small" into a confusing
+#: out-of-memory report against the researcher's code.
+MIN_CONTAINER_MEMORY_BYTES = 2 * 1024**3
+
+
+def container_memory_limit(mem_total) -> int | None:
+    """Bytes to allow the analysis container, or ``None`` to leave it unlimited.
+
+    ``None`` on a host too small to spare the headroom: an uncapped run on a tiny
+    dev box is the status quo and merely risky, whereas a 0-byte limit would fail
+    every submission instantly.
+    """
+    if not isinstance(mem_total, int) or mem_total <= 0:
+        logging.warning("Docker reported no MemTotal; analysis container uncapped")
+        return None
+    limit = mem_total - MEMORY_HEADROOM_BYTES
+    if limit < MIN_CONTAINER_MEMORY_BYTES:
+        logging.warning(
+            "Host has %.1f GiB total, too little to reserve %.1f GiB; "
+            "analysis container uncapped",
+            mem_total / 1024**3,
+            MEMORY_HEADROOM_BYTES / 1024**3,
+        )
+        return None
+    return limit
+
 
 def directory_usage(*paths) -> int:
     """Bytes actually occupied on disk by everything under ``paths``.
@@ -859,6 +909,21 @@ def recorded_run(api, submission, stage, env_vars, task=None):
             ORPHAN_LABEL_JOB: str(submission.get("job_id", "")),
         },
     }
+    if (mem_limit := container_memory_limit(info.get("MemTotal"))) is not None:
+        container_kwargs["mem_limit"] = mem_limit
+        # Equal to mem_limit, which is how docker spells "no swap for this
+        # container". Left unset, docker allows swap up to 2x the limit, and a
+        # payload that swaps instead of dying reproduces the original failure in
+        # slow motion: the box thrashes, celery stops being scheduled, and the
+        # OOM that would have produced a clean error never arrives. The JS2
+        # workers have no swap today, so this is insurance against a host that
+        # does, not a change in behaviour on the current fleet.
+        container_kwargs["memswap_limit"] = mem_limit
+        logging.info(
+            "Analysis container capped at %.1f GiB of %.1f GiB total",
+            mem_limit / 1024**3,
+            info["MemTotal"] / 1024**3,
+        )
     container = cli.containers.create(**container_kwargs)
     # redact env in container_kwargs since we dump them later
     container_kwargs["environment"] = {
@@ -927,6 +992,10 @@ def recorded_run(api, submission, stage, env_vars, task=None):
             ret = container.wait()
 
         container.reload()
+        # Read before container.remove() further down, which takes the state with
+        # it. Docker sets this when the kernel OOM-killed the container's cgroup;
+        # the exit code is an indistinguishable 137, the same as any SIGKILL.
+        oom_killed = bool((container.attrs.get("State") or {}).get("OOMKilled"))
         logging.info(f"Container exited with status: {ret['StatusCode']}")
         logging.info("Collecting performance data...")
         performance_data.update(
@@ -977,6 +1046,11 @@ def recorded_run(api, submission, stage, env_vars, task=None):
                 "exit_code": ret.get("StatusCode"),
                 "max_cpu_percent": performance_data.get("MaxCPUPercent"),
                 "max_memory_bytes": performance_data.get("MaxMemoryUsage"),
+                # The cap this run was given, so max_memory_bytes can be read as
+                # a fraction of what was allowed rather than an absolute number.
+                # Without it, a future flavor change silently re-baselines every
+                # comparison against older records.
+                "mem_limit_bytes": mem_limit,
                 "max_disk_bytes": performance_data.get("MaxDiskUsage"),
                 "image_size_bytes": performance_data.get("ImageSize"),
             }
@@ -1100,6 +1174,24 @@ def recorded_run(api, submission, stage, env_vars, task=None):
         pass
 
     if not task.canceled:
+        # Before the generic branch: an OOM kill exits 137, which would otherwise
+        # be reported as "check stdout/stderr" -- and stdout will say nothing,
+        # because the process was killed without warning. This is the one failure
+        # whose cause is invisible from inside the container.
+        if oom_killed:
+            raise SubmissionError(
+                FailureCode.OUT_OF_MEMORY,
+                (
+                    f"The analysis used more memory than this worker allows "
+                    f"({mem_limit / 1024**3:.1f} GiB) and was stopped. Reduce the "
+                    "memory your code needs, or ask support@sivacor.org about a "
+                    "larger worker."
+                    if mem_limit is not None
+                    else "The analysis was stopped by the kernel for using too "
+                    "much memory."
+                ),
+                detail=mem_limit,
+            )
         if ret["StatusCode"] != 0:
             raise SubmissionError(
                 FailureCode.NONZERO_EXIT,

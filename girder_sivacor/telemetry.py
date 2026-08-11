@@ -148,6 +148,12 @@ def _stata_detail(value):
 _DETAIL_VALIDATORS = {
     FailureCode.STATA_ERROR: _stata_detail,
     FailureCode.NONZERO_EXIT: lambda v: _safe_int(v),
+    # The memory cap the run exceeded. A machine fact -- it is derived from the
+    # worker's flavor, identically for every submission that lands on one -- so
+    # it says nothing about the researcher, and it is the number that makes the
+    # record actionable: "failed at 59 GiB" and "failed at 28 GiB" are different
+    # problems with different fixes.
+    FailureCode.OUT_OF_MEMORY: lambda v: _safe_int(v, minimum=0),
     FailureCode.MAIN_FILE_AMBIGUOUS: lambda v: _safe_int(v, minimum=0),
     FailureCode.IMAGE_PULL_FAILED: lambda v: _image_reference(v),
     FailureCode.UNSAFE_ARCHIVE: lambda v: _one_of(v, _ARCHIVE_REASONS),
@@ -179,6 +185,9 @@ def _sanitize_stage(stage):
         "exit_code": _safe_int(stage.get("exit_code")),
         "max_cpu_percent": _safe_number(stage.get("max_cpu_percent")),
         "max_memory_bytes": _safe_number(stage.get("max_memory_bytes")),
+        # The cap the run was given. Same class as image_size_bytes: a property
+        # of the worker, identical for every submission on that flavor.
+        "mem_limit_bytes": _safe_number(stage.get("mem_limit_bytes"), minimum=0),
         # Peak bytes the run's own workspace occupied, and the size of the image
         # it needed on the machine. Both are machine facts, not researcher
         # content -- an exact byte count is fine here, unlike the uploaded
