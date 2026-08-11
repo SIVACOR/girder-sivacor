@@ -124,8 +124,8 @@ def create_uploads_folder(event: events.Event) -> None:
     uploads_folder = folderModel.findOne(
         {
             "parentId": user["_id"],
-            "parentType": "user",
-            "name": PluginSettings.UPLOADS_FOLDER_NAME,
+            "parentCollection": "user",
+            "name": Setting().get(PluginSettings.UPLOADS_FOLDER_NAME),
         }
     )
     if not uploads_folder:
@@ -223,6 +223,7 @@ def add_public_settings(self, event):
     public_settings = [
         PluginSettings.BANNER_ENABLED,
         PluginSettings.BANNER_MESSAGE,
+        PluginSettings.UPLOADS_FOLDER_NAME,
     ]
     settings.update({key: Setting().get(key) for key in public_settings})
 
