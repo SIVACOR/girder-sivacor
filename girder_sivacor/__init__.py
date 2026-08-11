@@ -223,6 +223,7 @@ def add_public_settings(self, event):
     public_settings = [
         PluginSettings.BANNER_ENABLED,
         PluginSettings.BANNER_MESSAGE,
+        PluginSettings.UPLOADS_FOLDER_NAME,
     ]
     settings.update({key: Setting().get(key) for key in public_settings})
 
