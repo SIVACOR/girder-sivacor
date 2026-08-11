@@ -8,6 +8,7 @@ from girder.api import access
 from girder.api.rest import boundHandler, filtermodel
 from girder.constants import AccessType, TokenScope
 from girder.exceptions import ValidationException
+from girder.models.file import File
 from girder.models.folder import Folder
 from girder.models.setting import Setting
 from girder.models.user import User
@@ -267,6 +268,22 @@ class SIVACORPlugin(GirderPlugin):
         ModelImporter.model("user").exposeFields(
             level=AccessType.READ, fields=("lastJobId", "lastProjectId")
         )
+        # sivacor-girderfs mounts a Girder folder read-only into an analysis
+        # container and needs each blob's content hash *as metadata* -- hashing
+        # a mounted dataset by reading it defeats the point of not copying it.
+        # Girder computes sha512 at upload but exposes it at no access level
+        # (girder/models/file.py:37-41), so widen that here.
+        #
+        # The split: sha512 is a hash of data the caller can already download in
+        # full, and 'imported' is a boolean selecting which storage layout
+        # applies -- neither is sensitive. 'path' is an absolute host path for
+        # imported files, i.e. infrastructure layout, so site admins only.
+        #
+        # exposeFields is global to this Girder instance: every File response
+        # site-wide grows these fields, including the ones aea-sivacor consumes.
+        # That is accepted, but it is a site-wide change made from a plugin.
+        File().exposeFields(level=AccessType.READ, fields=("sha512", "imported"))
+        File().exposeFields(level=AccessType.SITE_ADMIN, fields=("path",))
 
         getPlugin("oauth").load(info)
         OAuthSettings.ORCID_CLIENT_ID = "oauth.orcid_client_id"

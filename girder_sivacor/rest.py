@@ -57,6 +57,35 @@ def _as_utc(value):
     return value
 
 
+def _iso8601(value):
+    """Format a Mongo timestamp as RFC 3339 with a literal ``Z``.
+
+    Girder's own JSON encoder emits ``+00:00`` instead
+    (``girder/utility/__init__.py:130``), so anything that has to match the
+    manifest's documented ``...Z`` shape has to format itself rather than hand a
+    datetime back and let the encoder do it.
+    """
+    if value is None:
+        return None
+    return (
+        _as_utc(value)
+        .astimezone(datetime.timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+#: The manifest schema version. sivacor-girderfs refuses to mount against a
+#: version it does not know, so bump this for any incompatible change to the
+#: shape emitted by get_fs_manifest -- adding a field is not one.
+FS_MANIFEST_VERSION = 1
+
+#: How many items' files to fetch per Mongo query when building a manifest.
+#: Trades round trips against the size of a single $in; 1000 puts a 100k-node
+#: tree at ~50 queries instead of ~50 000.
+_MANIFEST_FILE_BATCH = 1000
+
+
 stage_schema = {
     "$schema": "http://json-schema.org/draft-04/schema#",
     "title": "Workflow",
@@ -110,9 +139,12 @@ class SIVACOR(Resource):
         self.route("POST", ("claim", ":id"), self.claim)
         self.route("POST", ("execution_record",), self.record_execution)
         self.route("GET", ("execution_record",), self.list_execution_records)
-        self.route("GET", ("execution_record", "summary"), self.summarise_execution_records)
+        self.route(
+            "GET", ("execution_record", "summary"), self.summarise_execution_records
+        )
         self.route("GET", ("image_tags",), self.get_image_tags)
         self.route("GET", ("workflow_schema",), self.get_workflow_schema)
+        self.route("GET", ("fs", "manifest"), self.get_fs_manifest)
         self.route("DELETE", ("submission", ":id"), self.delete_submission)
 
     @access.user
@@ -424,7 +456,9 @@ class SIVACOR(Resource):
         .param("until", "Latest date to include (YYYY-MM-DD).", required=False)
         .pagingParams(defaultSort="date", defaultSortDir=-1)
     )
-    def list_execution_records(self, status, errorCode, imageName, since, until, limit, offset, sort):
+    def list_execution_records(
+        self, status, errorCode, imageName, since, until, limit, offset, sort
+    ):
         query = self._execution_record_query(status, errorCode, imageName, since, until)
         cursor = ExecutionRecord().find(query, limit=limit, offset=offset, sort=sort)
         return {
@@ -469,7 +503,10 @@ class SIVACOR(Resource):
         return {
             "total": collection.count_documents(query),
             "byStatus": grouped(
-                [{"$group": {"_id": "$status", "count": {"$sum": 1}}}, {"$sort": {"count": -1}}]
+                [
+                    {"$group": {"_id": "$status", "count": {"$sum": 1}}},
+                    {"$sort": {"count": -1}},
+                ]
             ),
             "byErrorCode": grouped(
                 [
@@ -495,7 +532,9 @@ class SIVACOR(Resource):
                             },
                             "count": {"$sum": 1},
                             "failed": {
-                                "$sum": {"$cond": [{"$eq": ["$status", "completed"]}, 0, 1]}
+                                "$sum": {
+                                    "$cond": [{"$eq": ["$status", "completed"]}, 0, 1]
+                                }
                             },
                         }
                     },
@@ -509,7 +548,9 @@ class SIVACOR(Resource):
                             "_id": "$date",
                             "count": {"$sum": 1},
                             "failed": {
-                                "$sum": {"$cond": [{"$eq": ["$status", "completed"]}, 0, 1]}
+                                "$sum": {
+                                    "$cond": [{"$eq": ["$status", "completed"]}, 0, 1]
+                                }
                             },
                         }
                     },
@@ -732,6 +773,184 @@ class SIVACOR(Resource):
             return json.load(f)
 
         return tags
+
+    # DATA_READ rather than the bare @access.user every other handler here uses,
+    # and that is deliberate: sivacor-girderfs authenticates with a DATA_READ
+    # API key exchanged for a long-lived token, so an analysis container that
+    # somehow reaches the daemon's config still cannot mutate Girder. Do not
+    # "tidy" this into consistency with its neighbours.
+    @access.user(scope=TokenScope.DATA_READ)
+    @autoDescribeRoute(
+        Description("Get a complete metadata manifest for a folder subtree.")
+        .notes(
+            "Serves sivacor-girderfs, which mounts a Girder folder read-only "
+            "into an analysis container. It needs the whole subtree up front: "
+            "walking it over stock REST costs one request per node, and it "
+            "needs every file's content hash without reading the file, since "
+            "hashing a mounted dataset defeats the point of mounting it.\n\n"
+            "The walk uses the requesting user's own permissions, so a "
+            "subfolder they cannot read is simply absent -- the rest of the "
+            "tree is still returned.\n\n"
+            "Contract, not implementation detail: 'folders', 'items' and "
+            "'files' are each sorted by 'id', and stay so between calls. The "
+            "client derives inode numbers from manifest order, so an unstable "
+            "order would renumber the same folder between mounts. Timestamps "
+            "are RFC 3339 UTC with a 'Z' suffix; 'updated' is null on a file "
+            "never modified since upload. 'root.parent' is null even when the "
+            "folder has a parent in Girder -- a subtree mount must not be told "
+            "about anything above it. 'sha512' is '' when Girder never recorded "
+            "one (imported and link files), which means the client fetches over "
+            "HTTP rather than locating the blob on disk; it is not an error. "
+            "Clients must refuse a 'manifestVersion' they do not know."
+        )
+        .modelParam(
+            "folderId",
+            "The folder whose subtree to describe.",
+            model=Folder,
+            level=AccessType.READ,
+            required=True,
+            paramType="query",
+        )
+        .param(
+            "maxNodes",
+            "Refuse trees larger than this many folders, items and files.",
+            required=False,
+            dataType="integer",
+            default=1000000,
+        )
+        .errorResponse("The subtree exceeds maxNodes.", 413)
+    )
+    def get_fs_manifest(self, folder, maxNodes):
+        user = self.getCurrentUser()
+        is_admin = bool(user.get("admin"))
+
+        folders = []
+        items = []
+        files = []
+        seen = 0
+
+        def budget():
+            nonlocal seen
+            seen += 1
+            if seen > maxNodes:
+                # Abort during the walk, not after: the guard exists to keep a
+                # pathological tree from OOM-ing the web process, which a
+                # check on the finished response would not do.
+                raise RestException(
+                    f"This subtree has more than maxNodes ({maxNodes}) nodes. "
+                    "Mount a smaller folder, or raise maxNodes.",
+                    code=413,
+                )
+
+        # Iterative rather than recursive: nothing bounds Girder's folder depth,
+        # and a REST handler should not be able to exhaust the Python stack.
+        # Order of traversal does not matter -- every array is sorted at the end.
+        budget()
+        stack = [(folder, None)]
+        while stack:
+            current, parent_id = stack.pop()
+            folders.append(
+                {
+                    "id": str(current["_id"]),
+                    "parent": parent_id,
+                    "name": current["name"],
+                    "created": _iso8601(current.get("created")),
+                    "updated": _iso8601(
+                        current.get("updated") or current.get("created")
+                    ),
+                }
+            )
+
+            # childItems and childFiles take no `user`: items and files are
+            # AccessControlMixin resources that inherit the containing folder's
+            # ACL (girder/utility/acl_mixin.py), so a READ-permitted folder
+            # settles them. Passing user= would not filter -- childItems
+            # forwards **kwargs straight into the pymongo query and would
+            # corrupt it. childFolders, by contrast, does filter by user, and
+            # that is what keeps unreadable branches out of the manifest.
+            # Never force=True here: `girder mount` walks that way and thereby
+            # exposes the whole database to anyone who can read the mountpoint.
+            folder_items = list(Folder().childItems(current))
+            for item in folder_items:
+                budget()
+                items.append(
+                    {
+                        "id": str(item["_id"]),
+                        "folder": str(current["_id"]),
+                        "name": item["name"],
+                        "created": _iso8601(item.get("created")),
+                        "updated": _iso8601(item.get("updated") or item.get("created")),
+                    }
+                )
+
+            # Files are fetched per batch of items rather than per item.
+            # Item().childFiles(item) is exactly File().find({"itemId": id}),
+            # so calling it in a loop costs one Mongo round trip per item: at
+            # 50 000 items that measured 18.7s of a 26s response, against 0.55s
+            # for the same rows fetched with $in (M1-BACKEND-CHANGES.md §7).
+            # Identical query, identical access semantics -- files inherit the
+            # containing folder's ACL either way -- and the response is
+            # byte-for-byte the same, since every array is sorted at the end.
+            #
+            # Chunked rather than one query per folder so that a single
+            # enormous folder cannot pull an unbounded number of file
+            # documents into memory before budget() gets a chance to refuse
+            # them. The items themselves are already budget-checked above, so
+            # this is bounded by maxNodes regardless.
+            by_item_id = {item["_id"]: item for item in folder_items}
+            item_ids = list(by_item_id)
+            for start in range(0, len(item_ids), _MANIFEST_FILE_BATCH):
+                chunk = item_ids[start : start + _MANIFEST_FILE_BATCH]
+                for file in File().find({"itemId": {"$in": chunk}}):
+                    budget()
+                    files.append(
+                        self._manifest_file(file, by_item_id[file["itemId"]], is_admin)
+                    )
+
+            for child in list(Folder().childFolders(current, "folder", user=user)):
+                budget()
+                stack.append((child, str(current["_id"])))
+
+        for array in (folders, items, files):
+            array.sort(key=lambda entry: entry["id"])
+
+        return {
+            "manifestVersion": FS_MANIFEST_VERSION,
+            "root": {"type": "folder", "id": str(folder["_id"])},
+            "generatedAt": _iso8601(datetime.datetime.now(datetime.timezone.utc)),
+            "folders": folders,
+            "items": items,
+            "files": files,
+        }
+
+    @staticmethod
+    def _manifest_file(file, item, is_admin):
+        imported = bool(file.get("imported"))
+        return {
+            "id": str(file["_id"]),
+            "item": str(item["_id"]),
+            "name": file["name"],
+            # linkUrl files may carry no size at all.
+            "size": int(file.get("size") or 0),
+            # Client-asserted at upload; deliberately not sniffed here.
+            "mimeType": file.get("mimeType"),
+            "created": _iso8601(file.get("created")),
+            "updated": _iso8601(file.get("updated") or file.get("created")),
+            # Set only on upload finalisation, so imported and linkUrl files
+            # have none. "" means "cannot be located by hash"; never null.
+            "sha512": file.get("sha512") or "",
+            "imported": imported,
+            # Only an imported file's `path` is an absolute host path. A normal
+            # filesystem-assetstore file also has one, but it is relative to the
+            # assetstore root and derivable from sha512
+            # (filesystem_assetstore_adapter.py:234), so emitting it would just
+            # be an absolute-looking value that is not absolute.
+            "path": file["path"]
+            if (is_admin and imported and "path" in file)
+            else None,
+            # Non-null means there is no assetstore blob at all.
+            "linkUrl": file.get("linkUrl"),
+        }
 
     @access.user
     @autoDescribeRoute(
