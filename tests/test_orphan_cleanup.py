@@ -52,6 +52,21 @@ def docker_client():
         client.ping()
     except Exception:
         pytest.skip("docker daemon not reachable")
+    # Ensure the image these tests build containers from actually exists.
+    # `containers.run()` pulls an absent image; **`containers.create()` does not** --
+    # so a runner without alpine cached fails only the create()-based tests. That is
+    # exactly what happened on CI 2026-08-12 (PR #102: 2 failed, 280 passed) while
+    # every local run passed, because the image was cached locally and on the runner
+    # that had served earlier PRs the same day. Pull once here rather than at each
+    # call site, and skip rather than fail if the runner has no network: this suite
+    # tests the stats collector, not image distribution.
+    try:
+        client.images.get("alpine")
+    except docker.errors.ImageNotFound:
+        try:
+            client.images.pull("alpine", tag="latest")
+        except Exception as exc:
+            pytest.skip(f"alpine image unavailable and cannot be pulled: {exc}")
     return client
 
 

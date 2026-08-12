@@ -47,11 +47,74 @@ class TestDockerStatsCollectorThread:
                 content = f.read()
                 expected_header = (
                     "Timestamp,CPU %,Memory Usage,Memory Limit,Network RX,Network TX,"
-                    "Block IO Read,Block IO Write,PIDs\n"
+                    "Block IO Read,Block IO Write,PIDs,CPU Seconds\n"
                 )
                 assert content.startswith(
                     expected_header
                 ), "CSV should have correct header"
+
+    def test_cpu_seconds_is_a_counter_in_seconds(self):
+        """Nanoseconds in, seconds out.
+
+        `CPU %` is a rate sampled over ~1 s windows, so the aggregation can only keep
+        its max -- which says "this touched N cores once", not "this used N cores". On
+        2026-08-12 a stage reported max_cpu_percent 906 while `top` showed one core;
+        both readings were true and nothing recorded could distinguish them. Mean cores
+        is cpu_seconds_total / duration_seconds.
+        """
+        stats_thread = DockerStatsCollectorThread(Mock(), "/tmp/test")
+        d = {"cpu_stats": {"cpu_usage": {"total_usage": 9_500_000_000}}}
+        assert stats_thread.calculate_cpu_seconds(d) == pytest.approx(9.5)
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {},
+            {"cpu_stats": {}},
+            {"cpu_stats": {"cpu_usage": {}}},
+            {"cpu_stats": {"cpu_usage": {"total_usage": None}}},
+        ],
+    )
+    def test_cpu_seconds_tolerates_a_missing_counter(self, payload):
+        """A malformed reading must not raise in a daemon thread: it would stop
+        collection for the rest of the run and surface only as a warning."""
+        stats_thread = DockerStatsCollectorThread(Mock(), "/tmp/test")
+        assert stats_thread.calculate_cpu_seconds(payload) == 0.0
+
+    def test_csv_row_carries_cumulative_cpu(self):
+        """The column the aggregation reads. max() of a counter is its final value."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = os.path.join(temp_dir, "dockerstats")
+            mock_container = Mock()
+            mock_container.stats.return_value = iter(
+                [
+                    {
+                        "read": "2026-08-12T18:00:00Z",
+                        "cpu_stats": {
+                            "cpu_usage": {"total_usage": 4_000_000_000},
+                            "system_cpu_usage": 100_000_000_000,
+                            "online_cpus": 16,
+                        },
+                        "precpu_stats": {
+                            "cpu_usage": {"total_usage": 3_000_000_000},
+                            "system_cpu_usage": 99_000_000_000,
+                        },
+                        "memory_stats": {"usage": 1024, "limit": 2048},
+                    },
+                    {"read": "0001-01-01T00:00:00Z"},
+                ]
+            )
+            mock_container.attrs = {"State": {"Status": "exited"}}
+
+            stats_thread = DockerStatsCollectorThread(mock_container, output_path)
+            stats_thread.daemon = True
+            stats_thread.start()
+            stats_thread.join(timeout=2)
+
+            rows = open(output_path + ".csv").read().splitlines()
+            header, data = rows[0].split(","), rows[1].split(",")
+            assert header[-1] == "CPU Seconds"
+            assert float(data[-1]) == pytest.approx(4.0), "4e9 ns of CPU time = 4 s"
 
     def test_convert_parameter_functionality(self):
         """Test the convert parameter in calculation methods."""
