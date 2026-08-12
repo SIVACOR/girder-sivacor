@@ -443,3 +443,45 @@ def test_reaper_records_the_run_the_worker_could_not(
         FailureCode.REAPED_NO_HEARTBEAT.value,
     }
     assert records[0]["stages"][0]["image_name"] == "dataeditors/stata18_5-mp"
+
+
+# --- cumulative CPU (added 2026-08-12) --------------------------------------
+
+
+def test_cpu_seconds_total_survives_and_makes_max_cpu_readable():
+    """The number that turns `max_cpu_percent` from a curiosity into a measurement.
+
+    `max_cpu_percent` is the peak of a rate sampled over ~1 s windows, so it answers
+    "did this ever touch N cores" and not "did this use the machine". On 2026-08-12 a
+    stage recorded 906 % while `top` showed a single core busy -- both true, and nothing
+    stored could tell them apart. Mean cores is cpu_seconds_total / duration_seconds.
+    """
+    stored = sanitize(
+        status="completed",
+        stages=[
+            {
+                "image_name": "rocker/geospatial",
+                "image_tag": "4.3.2",
+                "duration_seconds": 990.0,
+                "max_cpu_percent": 906.57,
+                "cpu_seconds_total": 1009.8,
+            }
+        ],
+    )
+    (stage,) = stored["stages"]
+    assert stage["cpu_seconds_total"] == 1009.8
+    # ~1.02 cores of 16 over the run, which is the honest reading of that 906 % peak.
+    assert stage["cpu_seconds_total"] / stage["duration_seconds"] < 1.1
+
+
+@pytest.mark.parametrize(
+    "value", [-1, "12.5", True, float("nan"), float("inf"), None, {"a": 1}]
+)
+def test_cpu_seconds_total_rejects_anything_that_is_not_a_duration(value):
+    """Same allow-list discipline as every other numeric field: drop, never repair."""
+    stored = sanitize(
+        status="completed",
+        stages=[{"image_name": "rocker/r-ver", "cpu_seconds_total": value}],
+    )
+    (stage,) = stored["stages"]
+    assert stage["cpu_seconds_total"] is None

@@ -184,6 +184,9 @@ def _sanitize_stage(stage):
         "duration_seconds": _safe_number(stage.get("duration_seconds")),
         "exit_code": _safe_int(stage.get("exit_code")),
         "max_cpu_percent": _safe_number(stage.get("max_cpu_percent")),
+        # Cumulative CPU time. Not an identifier: a duration, in the same family as
+        # duration_seconds, and it is what makes max_cpu_percent interpretable.
+        "cpu_seconds_total": _safe_number(stage.get("cpu_seconds_total"), minimum=0),
         "max_memory_bytes": _safe_number(stage.get("max_memory_bytes")),
         # The cap the run was given. Same class as image_size_bytes: a property
         # of the worker, identical for every submission on that flavor.

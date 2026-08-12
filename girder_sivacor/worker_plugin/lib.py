@@ -197,7 +197,7 @@ class DockerStatsCollectorThread(Thread):
         with open(self.output_path + ".csv", mode="w") as fp:
             header = (
                 "Timestamp,CPU %,Memory Usage,Memory Limit,Network RX,Network TX,"
-                "Block IO Read,Block IO Write,PIDs\n"
+                "Block IO Read,Block IO Write,PIDs,CPU Seconds\n"
             )
             fp.write(header)
         # stream=True yields its first reading within milliseconds; stream=False
@@ -250,7 +250,8 @@ class DockerStatsCollectorThread(Thread):
                 csv_line = (
                     f'"{ts}",{cpu_percent:.2f},{mem_usage},{mem_limit},'
                     f"{bytes_in},{bytes_out},{blkio_rd},{blkio_wr},"
-                    f"{d.get('pids_stats', {}).get('current', 0)}\n"
+                    f"{d.get('pids_stats', {}).get('current', 0)},"
+                    f"{self.calculate_cpu_seconds(d):.3f}\n"
                 )
                 fp.write(csv_line)
 
@@ -276,6 +277,30 @@ class DockerStatsCollectorThread(Thread):
         p = math.pow(base, i)
         s = round(size_bytes / p, 2)
         return "%s %s" % (s, size_name[i])
+
+    @staticmethod
+    def calculate_cpu_seconds(d):
+        """Cumulative CPU time the container has consumed, in seconds.
+
+        A **counter**, not a rate, and that is the point. ``CPU %`` is sampled over
+        ~1 s windows, so the aggregation can only keep its maximum -- which answers
+        "did this ever touch N cores" and not "did this use the machine". On
+        2026-08-12 a stage recorded `max_cpu_percent 906` (≈9 cores for one second of
+        990) while `top` showed one core busy; both were true, and nothing recorded
+        could tell the two readings apart. Mean cores is ``cpu_seconds_total /
+        duration_seconds``, and it is the number a researcher optimising their code
+        actually needs.
+
+        Being cumulative also makes it robust in a way an average of percentages is
+        not: no dependence on sample spacing, no first-sample special case, and the
+        aggregation is a ``max()`` over the column because a counter only rises.
+        """
+        return (
+            float(
+                d.get("cpu_stats", {}).get("cpu_usage", {}).get("total_usage", 0) or 0
+            )
+            / 1e9
+        )
 
     @staticmethod
     def calculate_cpu_percent(d):
@@ -1035,6 +1060,12 @@ def recorded_run(api, submission, stage, env_vars, task=None):
                         "MaxMemoryUsage": int(df["Memory Usage"].max()),
                     }
                 )
+                # max() of a cumulative counter is its final value, which is also
+                # correct if the last row is truncated or the rows are unordered.
+                # Guarded on the column: a CSV written by an older worker image does
+                # not have it, and a KeyError here would lose the whole aggregation.
+                if "CPU Seconds" in df.columns:
+                    performance_data["CPUSecondsTotal"] = float(df["CPU Seconds"].max())
         # Same numbers, kept where finalize_job can still reach them. The
         # performance_data file itself lives in the submission folder and is
         # deleted with it, which is precisely the gap the record fills.
@@ -1045,6 +1076,10 @@ def recorded_run(api, submission, stage, env_vars, task=None):
                 "network_isolation": bool(stage.get("network_isolation", False)),
                 "exit_code": ret.get("StatusCode"),
                 "max_cpu_percent": performance_data.get("MaxCPUPercent"),
+                # The denominator-free primitive: divide by duration_seconds for mean
+                # cores. Kept as seconds rather than a precomputed mean so the two can
+                # never disagree, and so it stays meaningful when duration is unknown.
+                "cpu_seconds_total": performance_data.get("CPUSecondsTotal"),
                 "max_memory_bytes": performance_data.get("MaxMemoryUsage"),
                 # The cap this run was given, so max_memory_bytes can be read as
                 # a fraction of what was allowed rather than an absolute number.
