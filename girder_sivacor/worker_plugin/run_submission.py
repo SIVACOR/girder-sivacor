@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 import pathspec
 import posix1e
 import randomname
-from celery.signals import worker_ready
+from celery.signals import celeryd_after_setup, worker_ready
 from girder.constants import AccessType
 from girder_worker.app import app
 from girder_worker.utils import JobStatus
@@ -38,6 +38,7 @@ from .routing import (
     LOCAL_QUEUE,
     configured_worker_queue,
     instance_id_of,
+    is_ephemeral_worker,
     pin_chain,
     stop_accepting_submissions,
     worker_queue,
@@ -321,6 +322,13 @@ def prepare_submission(task, userId, fileId, stages, job_id):
     # capacity, so every second this goes unrecorded is a second it may refuse to
     # create the instance the next submission needs (D8 / P3.5).
     api.claim(job_id, queue)
+    # Record the same fact where *this worker* can read it back after a restart.
+    # Written before the cancel below, because the cancel is the perishable half:
+    # it dies with the process, and a RECOVERY restart mid-chain would otherwise
+    # rejoin the dispatch queue and reserve a submission it cannot start. See
+    # _decline_dispatch_if_spent.
+    if instance_id := instance_id_of(queue):
+        _mark_spent(instance_id)
     # ...and, if this instance exists only to serve one submission, stop taking new
     # ones now. Best-effort: failing to cancel the consumer means the controller may
     # over-count headroom, which is worth a warning but never worth failing a
@@ -819,6 +827,119 @@ READY_MARKER_TTL_SECONDS = 48 * 60 * 60
 
 #: Redis key prefix for readiness markers, read by ``sivacor-autoscaler``.
 READY_KEY_PREFIX = "sivacor:ready:"
+
+#: Redis key prefix for spent markers -- "this instance has already claimed a
+#: submission". Written at claim time, read at startup by
+#: :func:`_decline_dispatch_if_spent`.
+SPENT_KEY_PREFIX = "sivacor:spent:"
+
+#: How long a spent marker lives. Generously long on purpose, because the two
+#: errors are not symmetric: an over-long marker is collected when the key expires
+#: on an instance OpenStack has already deleted, and costs nothing, while one that
+#: expires *under a running submission* re-arms the bug this marker exists to
+#: prevent. It must therefore exceed the controller's ``max_lifetime``, which
+#: production currently sets to 180 h -- not the 30 h the readiness marker's
+#: comment assumes (see the incident write-up's pre-existing hazards).
+SPENT_MARKER_TTL_SECONDS = 14 * 24 * 60 * 60
+
+
+def _mark_spent(instance: str) -> None:
+    """Record durably that this instance has claimed a submission.
+
+    ``api.claim()`` already records the same fact server-side, and the controller
+    reads *that*. This marker exists for the worker's own benefit at startup, and it
+    has to be readable by a worker that holds no Girder credential -- which is the
+    entire reason it lives in Redis next to D9's readiness marker rather than being
+    re-read from Girder. See :func:`_decline_dispatch_if_spent`.
+
+    Best effort. Failing to write it means a *restarted* worker may take a
+    submission it cannot start, which the controller's unclaimed-demand signal now
+    covers; failing the submission over it would be a much worse trade.
+    """
+    try:
+        _redis_client_sync().set(
+            f"{SPENT_KEY_PREFIX}{instance}",
+            datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            ex=SPENT_MARKER_TTL_SECONDS,
+        )
+    except Exception:
+        logger.warning(
+            "Could not write the spent marker for instance %s; if this worker is "
+            "restarted mid-chain it may accept a submission it cannot start",
+            instance,
+            exc_info=True,
+        )
+
+
+@celeryd_after_setup.connect
+def _decline_dispatch_if_spent(sender=None, instance=None, **kwargs):
+    """Never consume the dispatch queue on a worker that has already claimed.
+
+    ``stop_accepting_submissions`` drops the dispatch consumer the moment a
+    submission is claimed, which is what keeps a busy ephemeral worker out of the
+    controller's capacity count. But ``cancel_consumer`` is a **runtime control
+    message: its effect lives in the worker process and dies with it.**
+
+    Observed in production 2026-08-12. A worker 9.5 h into a four-stage submission
+    wedged; the new ``RECOVER_TICKS`` supervisor correctly restarted its celery
+    container at 04:39:36Z and the chain resumed three seconds later. The restarted
+    process subscribed to everything in ``--queues``, dispatch queue included, and
+    because the chain was mid-flight ``prepare_submission`` never ran again to
+    re-issue the cancel. Nine hours later that worker reserved the next submission's
+    head task, could not start it (``--concurrency=1``, still busy), and -- because a
+    reserved message is no longer in the Redis list -- the controller saw
+    ``depth=0`` and created nothing. The submission sat untouched until it was
+    cancelled by hand.
+
+    **Deselecting here rather than cancelling later is the point.**
+    ``routing.stop_accepting_submissions`` documents why a post-hoc cancel cannot win:
+    the first messages arrive in the worker's *initial prefetch*, milliseconds after
+    ``ready`` and before any task code exists to call it. ``celeryd_after_setup``
+    fires before the consumer starts, so a spent worker never subscribes at all and
+    there is no race to lose.
+
+    The private queue is untouched -- the whole purpose of a restart mid-chain is to
+    consume the queued next step -- so recovery still works exactly as designed.
+    """
+    if not is_ephemeral_worker():
+        # The manager's static worker is long-lived and serves many submissions.
+        return
+    queue = configured_worker_queue()
+    instance_id = instance_id_of(queue) if queue else None
+    if not instance_id:
+        return
+    try:
+        spent = bool(_redis_client_sync().exists(f"{SPENT_KEY_PREFIX}{instance_id}"))
+    except Exception:
+        # Fall through to consuming. A worker that cannot reach Redis has bigger
+        # problems, and refusing work on a *failed probe* would turn a Redis blip
+        # into an instance that can never serve anything -- the phantom D9 exists
+        # to catch. Over-counted headroom is the milder error, and the controller's
+        # unclaimed-demand signal catches its consequence.
+        logger.warning(
+            "Could not read the spent marker for instance %s; consuming %s as usual",
+            instance_id,
+            DISPATCH_QUEUE,
+            exc_info=True,
+        )
+        return
+    if not spent:
+        return
+    if instance is None:
+        logger.warning(
+            "Instance %s is spent but no worker instance was supplied; cannot "
+            "decline %s",
+            instance_id,
+            DISPATCH_QUEUE,
+        )
+        return
+    instance.app.amqp.queues.deselect(DISPATCH_QUEUE)
+    logger.warning(
+        "Instance %s already claimed a submission; not consuming %s after this "
+        "restart. Its private queue is unaffected, so the interrupted chain resumes.",
+        instance_id,
+        DISPATCH_QUEUE,
+    )
 
 
 @worker_ready.connect
