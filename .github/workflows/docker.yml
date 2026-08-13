@@ -10,11 +10,31 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # Tagging policy, mirrored from sivacor-autoscaler's CI for the reason that
+      # workflow states: the immutable `sha-` tag is what lets a deployment pin, so
+      # that merging to main stops being the same decision as deploying.
+      #
+      # This image pushed `latest` only until 2026-08-13, and both
+      # docker-stack.yml and docker-stack.autoscaler.yml default to `latest` -- so
+      # a merge here armed production. That was tolerable when this image was only
+      # girder/beat/local_worker; it is not now that the fleet controller runs from
+      # it too (worker_sizing_plan.md P0.5), because a bad controller costs
+      # allocation in one direction and stalls submissions in the other.
+      - name: Compute tags
+        id: tags
+        run: |
+          branch="${GITHUB_REF_NAME//\//-}"
+          tags="${branch},sha-${GITHUB_SHA::7}"
+          [ "${GITHUB_REF}" = "refs/heads/main" ] && tags="${tags},latest"
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+          echo "will push: ${tags}"
+
       - name: Build and push
         uses: mr-smithers-excellent/docker-build-push@v6
         with:
           image: xarthisius/girder-sivacor
-          tags: latest
+          tags: ${{ steps.tags.outputs.tags }}
           registry: docker.io
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}

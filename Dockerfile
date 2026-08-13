@@ -95,6 +95,31 @@ RUN python3 -m pip install \
   python3 -m pip check || true
 
 RUN python3 -m pip install --no-cache-dir gunicorn uvicorn[standard] uvicorn-worker
+
+# The fleet controller runs from THIS image rather than its own python:3.12-slim
+# one (worker_sizing_plan.md S3, P0.5). It assigns work through Girder's model
+# layer in-process, so it needs girder, girder_worker and girder_sivacor
+# importable -- which a standalone controller image cannot have without
+# duplicating this entire install. `beat` and `local_worker` already share this
+# image with different entrypoints; the controller becomes the third.
+#
+# openstacksdk is the only real addition: redis and pymongo already arrive with
+# girder/celery. Verified 2026-08-13 -- `pip check` reports nothing broken
+# against the full girder-sivacor requirement set with openstacksdk added.
+#
+# This also lands openstacksdk on every WORKER VM, because workers boot this
+# same image. It is inert there -- clouds.yaml is bind-mounted only into the
+# controller service, so a worker gets the library and no credentials -- but it
+# is a deliberate decision rather than a side effect: a box running untrusted
+# researcher code now carries an OpenStack client.
+#
+# Pinned by sha rather than tracking main, so girder-sivacor's own git decides
+# what is in this image. An unpinned ref would let a merge in another repo
+# silently change this build, which is the failure mode sivacor-autoscaler's own
+# CI calls out by name. Bump deliberately; that repo's test suite gates the ref.
+ARG AUTOSCALER_REF=00e59934c379147ae5f5de52e8797912b543cfe6
+RUN python3 -m pip install --no-cache-dir \
+  "git+https://github.com/SIVACOR/sivacor-autoscaler.git@${AUTOSCALER_REF}"
 # The baked docker GID is only a fallback, and it is NOT reliable: a fresh JS2
 # Ubuntu 24.04 host came up with 127, not 112. Anything that needs the docker socket
 # must override the group at RUN time, because the group baked here cannot match
