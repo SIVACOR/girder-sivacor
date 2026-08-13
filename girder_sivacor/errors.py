@@ -87,6 +87,30 @@ class SubmissionError(Exception):
         self.detail = detail
         super().__init__(message)
 
+    def __reduce__(self):
+        """Rebuild through the real signature, so this survives pickling.
+
+        ``Exception.__reduce__`` reconstructs by calling ``cls(*self.args)``,
+        and ``self.args`` here is ``(message,)`` -- that is all
+        ``super().__init__`` was handed. Unpickling therefore calls
+        ``SubmissionError(message)`` and dies on the missing ``message``
+        argument, one short of the signature.
+
+        That matters because celery pickles every exception that leaves a task.
+        When the round-trip raises, it substitutes
+        ``UnpickleableExceptionWrapper``: the researcher's text survives, but
+        ``code`` and ``detail`` -- the entire operator-facing half of this class
+        -- do not, and a classified failure is logged as "raised unexpected".
+        Observed in production on 2026-08-13 on an OOM-killed Stata run.
+
+        Widening ``self.args`` to all three would also make the round-trip work,
+        but ``str()`` on a multi-argument ``Exception`` is the repr of the
+        tuple, and ``str(exc)`` is the researcher's message (see the module
+        docstring). Keeping ``args`` one long and overriding here preserves
+        both halves.
+        """
+        return (self.__class__, (self.code, str(self), self.detail))
+
 
 def classify(exc):
     """Return the ``(code, detail)`` pair to record for ``exc``.

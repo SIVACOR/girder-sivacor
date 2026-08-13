@@ -49,6 +49,18 @@ These are set by the "Run tests with coverage" step. `tox.ini` passes `GIRDER_*`
 > tasks eagerly and never reaches the broker, but it will bite the moment a test
 > stops using `eagerWorkerTasks`.
 
+That the broker is never reached is also a **coverage gap, not just a typo**, and
+it has already cost a production bug. `eagerWorkerTasks` sets
+`task_eager_propagates`, so a failing task re-raises the original exception
+in-process; nothing is ever pickled. A `SubmissionError` that could not survive
+that round-trip therefore passed every test — including one that drives a real
+container to a real OOM kill — and only showed up on a production worker, as
+`UnpickleableExceptionWrapper` with `code` and `detail` stripped off (2026-08-13).
+
+Anything that only misbehaves when it crosses the task boundary — exception
+shapes, task arguments, return values — needs a test that invokes the
+serialization boundary directly. See `tests/test_error_serialization.py`.
+
 Note that Mongo runs **without authentication** in CI, and `pytest-girder`
 defaults to `mongodb://localhost:27017` anyway — so a plain local Mongo needs no
 URI override at all.
