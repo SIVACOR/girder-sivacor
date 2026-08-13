@@ -103,7 +103,54 @@ def test_unusable_memory_readings_leave_the_container_uncapped(reported):
 # --- what happens when it bites ---------------------------------------------
 
 
+#: R allocates inside the interpreter, which is PID 1 under the ``rocker``
+#: entrypoint, so the kernel's victim and the container's init are the same
+#: process. One allocation, comfortably past the cap: a slow grower can be
+#: reclaimed instead of killed, which would make this flake.
+_R_HOG = "x <- numeric(150e6)\ncat(length(x))\n"
+
+#: ``set max_memory .`` removes Stata's *own* ceiling, and it is the whole point
+#: of this case. Left in place, Stata can refuse the allocation itself and print
+#: ``r(909); op. sys. refuses to provide memory`` -- a real failure mode, but a
+#: different one, routed through the ``stata_err`` branch with
+#: ``State.OOMKilled`` never set. Each ``generate double`` over 50M observations
+#: is 400 MB, so the second crosses the 1 GiB cap this case is given.
+_STATA_HOG = """\
+set max_memory .
+set obs 50000000
+forvalues i = 1/20 {
+    quietly generate double v`i' = `i'
+}
+"""
+
+
 @pytest.mark.plugin("sivacor")
+@pytest.mark.parametrize(
+    "image_name,image_tag,main_file,source,cap",
+    [
+        pytest.param(
+            "rocker/r-ver", "4.3.1", "main.R", _R_HOG, 256 * 1024**2, id="rocker"
+        ),
+        # Stata is here because its process tree had to be checked rather than
+        # assumed, and because it is the family with no fallback diagnosis.
+        # Verified by hand against dataeditors/stata18_5-mp:2025-02-26 on
+        # 2026-08-13: OOMKilled=true, exit 137, dead 1.3 s in -- and the Stata
+        # log stops mid-loop with no ``r(NNN);`` at all. So for Stata the daemon
+        # flag is not merely the *best* diagnosis, it is the only one: without
+        # it, stata_error() finds nothing, the generic non-zero branch fires,
+        # and the researcher is sent to a log that simply stops. The cap is
+        # 1 GiB rather than 256 MiB because Stata needs headroom to get as far
+        # as reading its license.
+        pytest.param(
+            "dataeditors/stata18_5-mp",
+            "2025-02-26",
+            "main.do",
+            _STATA_HOG,
+            1024 * 1024**2,
+            id="stata",
+        ),
+    ],
+)
 def test_an_oom_killed_analysis_is_reported_as_one(
     server,
     db,
@@ -113,6 +160,11 @@ def test_an_oom_killed_analysis_is_reported_as_one(
     patched_gpg,
     uploads_folder,
     submission_collection,
+    image_name,
+    image_tag,
+    main_file,
+    source,
+    cap,
 ):
     """A killed container must not surface as "check stdout/stderr".
 
@@ -120,26 +172,28 @@ def test_an_oom_killed_analysis_is_reported_as_one(
     reading ``State.OOMKilled`` off the daemon the researcher is told to consult
     a log that cannot explain it. The cap is forced small here rather than
     allocating ~60 GB to reach the real one.
+
+    Parametrized over image family because the claim is about a *process tree*,
+    not about R: the kernel kills a process, and Docker only reports
+    ``OOMKilled`` when that maps onto the container. An entrypoint that forked
+    would break this silently, in the one direction nothing else can catch.
     """
-    main_file = "main.R"
     stages = [
-        {"image_name": "rocker/r-ver", "image_tag": "4.3.1", "main_file": main_file}
+        {"image_name": image_name, "image_tag": image_tag, "main_file": main_file}
     ]
     with (
         tempfile.NamedTemporaryFile(suffix=".tar.gz") as temp_archive,
         tempfile.TemporaryDirectory() as temp_dir,
     ):
         with open(os.path.join(temp_dir, main_file), "w") as f:
-            # Comfortably past the 256 MiB cap below, in one allocation, so the
-            # kernel kills it rather than the process degrading slowly.
-            f.write("x <- numeric(150e6)\ncat(length(x))\n")
+            f.write(source)
         with tarfile.open(temp_archive.name, "w:gz") as tar:
             tar.add(temp_dir, arcname=".")
         fobj = upload_test_file(uploads_folder, user, temp_archive.name)
 
     with mock.patch(
         "girder_sivacor.worker_plugin.lib.container_memory_limit",
-        return_value=256 * 1024**2,
+        return_value=cap,
     ):
         resp = submit_sivacor_job(server, user, fobj, stages)
     assertStatusOk(resp)
