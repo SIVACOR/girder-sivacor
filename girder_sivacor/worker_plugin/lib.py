@@ -1071,6 +1071,12 @@ def recorded_run(api, submission, stage, env_vars, task=None):
         # deleted with it, which is precisely the gap the record fills.
         submission.setdefault("telemetry_stages", []).append(
             {
+                # The size the submission asked for, recorded beside the cap it
+                # actually got: mem_limit_bytes alone cannot say whether a run
+                # was sized deliberately or simply landed on whatever was free.
+                "requested_memory_gb": submission.get(
+                    "telemetry_requested_memory_gb"
+                ),
                 "image_name": stage.get("image_name"),
                 "image_tag": stage.get("image_tag"),
                 "network_isolation": bool(stage.get("network_isolation", False)),

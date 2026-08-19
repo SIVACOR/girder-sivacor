@@ -162,7 +162,9 @@ def upload_test_file(uploads_folder, user, filename):
         )
 
 
-def submit_sivacor_job(server, user, file_obj, stages, secrets=None, exception=False):
+def submit_sivacor_job(
+    server, user, file_obj, stages, secrets=None, exception=False, resources=None
+):
     """
     Helper function to submit a SIVACOR job.
 
@@ -187,6 +189,9 @@ def submit_sivacor_job(server, user, file_obj, stages, secrets=None, exception=F
             {
                 "stages": stages,
                 "env_secrets": secrets or [],
+                # Omitted entirely when not asked for, so the default-resolution
+                # path is what every other test exercises.
+                **({"resources": resources} if resources is not None else {}),
             }
         ),
         type="application/json",

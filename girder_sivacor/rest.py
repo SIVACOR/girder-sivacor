@@ -45,6 +45,72 @@ logger = logging.getLogger(__name__)
 WORKER_TOKEN_DAYS = 7
 
 
+def worker_sizes():
+    """The size catalogue, as the operator configured it.
+
+    Sorted by ``memory_gb`` so "the smallest" is well defined however the
+    setting was written.
+    """
+    sizes = Setting().get(PluginSettings.WORKER_SIZES) or []
+    return sorted(sizes, key=lambda entry: entry["memory_gb"])
+
+
+def default_worker_size():
+    """The size a submission gets when it does not ask for one.
+
+    Derived -- the smallest ungated entry -- rather than configured, so there is
+    no second field that can contradict the catalogue. The validator guarantees
+    at least one ungated entry exists.
+    """
+    catalogue = worker_sizes()
+    if not catalogue:
+        # The validator refuses an empty catalogue, so this is a deployment
+        # whose setting was written before it existed. Say which setting, rather
+        # than raising an IndexError that reads as a bug in the submission path.
+        raise ValidationException(
+            f"No worker sizes are configured ({PluginSettings.WORKER_SIZES})."
+        )
+    for entry in catalogue:
+        if not entry["gated"]:
+            return entry["memory_gb"]
+    # Likewise unreachable while the validator holds. Falling back to the
+    # smallest rung beats refusing every submission on the deployment.
+    return catalogue[0]["memory_gb"]
+
+
+def resolve_worker_size(workflow):
+    """Return the ``memory_gb`` a workflow asked for, validated.
+
+    Raises :class:`ValidationException` naming the selectable sizes, rather than
+    saying "invalid": the catalogue is a published contract -- an exported
+    workflow carries a bare number -- so a submission rejected because a rung
+    was withdrawn has to be told what it may ask for instead.
+    """
+    requested = (workflow.get("resources") or {}).get("memory_gb")
+    if requested is None:
+        return default_worker_size()
+    catalogue = worker_sizes()
+    selectable = [entry["memory_gb"] for entry in catalogue if not entry["gated"]]
+    match = next(
+        (entry for entry in catalogue if entry["memory_gb"] == requested), None
+    )
+    if match is None:
+        raise ValidationException(
+            f"Unknown worker size: {requested} GB. "
+            f"Available sizes: {', '.join(str(size) for size in selectable)}."
+        )
+    if match["gated"]:
+        # The group check that will let some users past this gate is not built
+        # yet, so for now a gated rung is selectable by nobody. Failing closed
+        # matters more than usual here: the gated rungs are the expensive ones.
+        raise ValidationException(
+            f"The {requested} GB worker is not self-service. "
+            "Contact support@sivacor.org to request it. "
+            f"Available sizes: {', '.join(str(size) for size in selectable)}."
+        )
+    return requested
+
+
 def _as_utc(value):
     """Make a Mongo timestamp safe to compare against an aware ``now``.
 
@@ -119,6 +185,27 @@ stage_schema = {
                 "additionalProperties": False,
             },
         },
+        # Workflow-level, not per-stage: pin_chain binds every stage of a
+        # submission to one machine, so a per-stage size would be a lie this
+        # schema was endorsing.
+        #
+        # Typed only, not an enum of the catalogue's figures. The catalogue is a
+        # Girder setting, so an enum here would either be a second hardcoded
+        # copy of it or would make this schema dynamic -- and
+        # get_workflow_schema serves it verbatim precisely so the UI validates
+        # against the same object the server does. The value is checked against
+        # the live catalogue in submit_job instead, which is mandatory rather
+        # than belt-and-braces: the root object has no additionalProperties
+        # False, so an unknown size would otherwise be silently ignored rather
+        # than rejected. Clients read the selectable values from
+        # GET /sivacor/worker_sizes.
+        "resources": {
+            "type": "object",
+            "properties": {
+                "memory_gb": {"type": "integer", "minimum": 1},
+            },
+            "additionalProperties": False,
+        },
     },
     "required": ["stages"],
 }
@@ -143,6 +230,7 @@ class SIVACOR(Resource):
             "GET", ("execution_record", "summary"), self.summarise_execution_records
         )
         self.route("GET", ("image_tags",), self.get_image_tags)
+        self.route("GET", ("worker_sizes",), self.get_worker_sizes)
         self.route("GET", ("workflow_schema",), self.get_workflow_schema)
         self.route("GET", ("fs", "manifest"), self.get_fs_manifest)
         self.route("DELETE", ("submission", ":id"), self.delete_submission)
@@ -185,11 +273,21 @@ class SIVACOR(Resource):
             if image_name not in tags or tag not in tags.get(image_name, []):
                 raise ValidationException(f"Invalid image: {image_reference}")
 
+        # Resolved server-side, before anything is created: an unknown size must
+        # never reach the controller, where the flavour it names does not exist,
+        # create_instance raises, and three of those trip the circuit breaker
+        # and stop the whole fleet.
+        requested_memory_gb = resolve_worker_size(workflow)
+
         job = Job().createJob(
             title=f"SIVACOR Run for {file['name']} by {user['firstName']} {user['lastName']}",
             type="sivacor_submission",
             public=False,
             user=user,
+            # Recorded at submit time, unlike meta.worker_queue, which only
+            # exists once a worker has been chosen. The pair is what tells
+            # "asked for N" from "ran on a box that had N".
+            otherFields={"meta": {"requested_memory_gb": requested_memory_gb}},
         )
         # Close the window between the check above and the job creation: two
         # concurrent requests can both pass it, so whoever ends up with the
@@ -244,6 +342,7 @@ class SIVACOR(Resource):
                 str(file["_id"]),
                 stages,
                 str(job["_id"]),
+                requested_memory_gb,
             ),
             f"Moving {file['name']} to submission collection",
         )
@@ -436,7 +535,11 @@ class SIVACOR(Resource):
         # deliberately only a date: at pilot scale a wall-clock submission time
         # is close enough to an identifier to undo the rest of this.
         today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
-        document = sanitize_record(payload, today)
+        document = sanitize_record(
+            payload,
+            today,
+            allowed_sizes=[entry["memory_gb"] for entry in worker_sizes()],
+        )
         ExecutionRecord().save(document)
         return document
 
@@ -731,6 +834,33 @@ class SIVACOR(Resource):
     def get_image_tags(self):
         tags = self._get_tags()
         return tags
+
+    @access.public
+    @autoDescribeRoute(
+        Description("Get the worker sizes a submission may ask for.")
+        .notes(
+            "The same catalogue submit_job validates 'resources.memory_gb' "
+            "against, so the picker offers exactly what the server accepts. "
+            "'default' is the size a submission gets if it asks for none.\n\n"
+            "'flavor' is deliberately absent: the cloud provider's name for a "
+            "machine shape must not become visible to a researcher or "
+            "load-bearing in an exported workflow. 'vcpus' is here because the "
+            "label needs it; usable memory is not, because it is an "
+            "approximation that would go stale in a cache."
+        )
+    )
+    def get_worker_sizes(self):
+        return {
+            "sizes": [
+                {
+                    "memory_gb": entry["memory_gb"],
+                    "vcpus": entry["vcpus"],
+                    "gated": entry["gated"],
+                }
+                for entry in worker_sizes()
+            ],
+            "default": default_worker_size(),
+        }
 
     @access.public
     @autoDescribeRoute(
