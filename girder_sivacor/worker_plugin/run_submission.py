@@ -310,7 +310,11 @@ def _matlab_perms(target_path, uid=1001):
 
 
 @app.task(queue=DISPATCH_QUEUE, bind=True)
-def prepare_submission(task, userId, fileId, stages, job_id):
+def prepare_submission(task, userId, fileId, stages, job_id, requested_memory_gb=None):
+    # requested_memory_gb defaults so that a chain published by an older server
+    # -- one already on the broker when this worker was upgraded -- still runs.
+    # It carries the size rather than the worker reading it off the job because
+    # build_execution_record must not read the job at all; see its docstring.
     # Create a submission directory
     api = GirderApi.for_task(task)
     # Every later step works out of a directory on this machine, so claim the
@@ -341,6 +345,7 @@ def prepare_submission(task, userId, fileId, stages, job_id):
     # starts. Carried on the submission dict so each step hands it to the next.
     telemetry = {
         "telemetry_started": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "telemetry_requested_memory_gb": requested_memory_gb,
     }
     try:
         submission_folder = _create_submission_folder(api, userId)
@@ -355,6 +360,10 @@ def prepare_submission(task, userId, fileId, stages, job_id):
                 "stages": stages,
                 "status": "submitted",
                 "job_id": str(job_id),
+                # On the folder as well as the job because this is what the UI
+                # reads: the workflow exporter builds its YAML from the
+                # submission folder's metadata, and the size has to round-trip.
+                "requested_memory_gb": requested_memory_gb,
             },
         )
         report(api, job_id, f"New submission: '{submission_folder['name']}' created.")

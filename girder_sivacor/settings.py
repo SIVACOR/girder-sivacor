@@ -15,6 +15,29 @@ class PluginSettings:
     BANNER_MESSAGE = "sivacor.banner_message"
     HEARTBEAT_TIMEOUT = "sivacor.heartbeat_timeout"  # in minutes
     MAX_RUNTIME = "sivacor.max_runtime"  # in hours
+    #: The catalogue of worker sizes a submission may ask for.
+    #:
+    #: One object per rung: ``memory_gb`` (the advertised RAM figure, which is
+    #: also the value that travels on the wire and in an exported workflow),
+    #: ``flavor`` (the OpenStack name, server-side only -- nothing
+    #: provider-specific may become visible to a researcher), ``vcpus`` and
+    #: ``gated``.
+    #:
+    #: A Girder setting rather than a file or a fetched YAML because two
+    #: processes need it and they share no other config channel: this plugin
+    #: validates submissions against it, and the fleet controller reads it out
+    #: of Mongo to know which flavour to boot. See P0.3 in
+    #: development_notes/worker_sizing_plan.md.
+    #:
+    #: ``vcpus`` is duplicated here deliberately. This plugin holds no
+    #: OpenStack credential, so it cannot ask Nova for a flavour's shape, yet
+    #: it has to render "16 cores" in the picker. The controller -- the one
+    #: process that *does* have credentials -- is what checks the duplicate
+    #: against Nova at startup. Nothing else derivable is stored: root disk is
+    #: flat at 60 GB across the ladder, SU/hr equals vCPU on Jetstream2, and
+    #: usable memory is an approximation that must not be frozen into config.
+    WORKER_SIZES = "sivacor.worker_sizes"
+
     #: Contents of ``stata.lic``, served to workers that run a Stata image.
     #:
     #: Ephemeral workers are stock VMs with no license on disk (D7: nothing
@@ -44,6 +67,14 @@ SettingDefault.defaults.update(
         # Empty by default: a deployment with no Stata license set simply cannot
         # run Stata images, and says so at container-create time.
         PluginSettings.STATA_LICENSE: "",
+        # ONE entry, matching what production runs today (SIVACOR_OS_FLAVOR is
+        # m3.large). A single rung means no submission can ask for anything
+        # different, so recording the size and, later, assigning on it are both
+        # exercised before any user can choose. Rungs are added once the
+        # controller can boot a heterogeneous fleet.
+        PluginSettings.WORKER_SIZES: [
+            {"memory_gb": 60, "flavor": "m3.large", "vcpus": 16, "gated": False},
+        ],
         PluginSettings.IMAGE_TAGS: {
             "dataeditors/stata15": ["latest", "2023-01-27"],
             "dataeditors/stata16": ["latest", "2023-06-13", "2022-10-14"],

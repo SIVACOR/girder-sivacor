@@ -24,7 +24,7 @@ from girder_sivacor.telemetry import sanitize_record, size_bucket
 from girder_sivacor.worker_plugin.lib import stata_error, stata_error_code
 from pytest_girder.assertions import assertStatus, assertStatusOk
 
-from .conftest import submit_sivacor_job, upload_test_file
+from .conftest import get_submission_folder, submit_sivacor_job, upload_test_file
 
 DATE = "2026-08-06"
 
@@ -370,6 +370,20 @@ def test_a_real_run_records_itself_end_to_end(
     assert record["stages"][0]["image_size_bytes"] > 100 * 1024**2
     assert record["package_size_bucket"] == "<10MB"
     assert record["date"] == datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+    # The size the submission asked for, beside mem_limit_bytes -- the cap it
+    # actually got. It reaches here as a task argument rather than being read
+    # off the job (build_execution_record must not touch the job at all), so a
+    # broken hand-off shows up as None rather than as a failure anywhere.
+    assert record["stages"][0]["requested_memory_gb"] == 60
+    assert record["stages"][0]["mem_limit_bytes"] > 0
+    # And on the submission folder, which is what the UI reads: the workflow
+    # exporter builds its YAML from folder metadata, so the size has to be
+    # there for an exported workflow to round-trip.
+    folders = get_submission_folder(
+        server, user, resp.json["_id"], submission_collection
+    )
+    assertStatusOk(folders)
+    assert folders.json[0]["meta"]["requested_memory_gb"] == 60
 
 
 @pytest.mark.plugin("sivacor")

@@ -93,6 +93,47 @@ def _validate_image_tags(doc):
     return value
 
 
+@setting_utilities.validator(PluginSettings.WORKER_SIZES)
+def _validate_worker_sizes(doc):
+    """Check the worker-size catalogue at write time.
+
+    Load-bearing beyond hygiene. A flavour name that does not exist on the
+    cloud reaches the controller's ``create_instance``, which raises, and three
+    of those trip the circuit breaker and stop the *entire* fleet. A typo in
+    this setting must not be able to do that, and catching it here is far
+    cheaper than catching it at create time.
+    """
+    value = doc.get("value")
+    if not isinstance(value, list) or not value:
+        raise ValidationException("Worker sizes must be a non-empty list.")
+    seen = set()
+    for entry in value:
+        if not isinstance(entry, dict):
+            raise ValidationException("Each worker size must be an object.")
+        memory_gb = entry.get("memory_gb")
+        # bool is an int in python, and True would sort and format as 1.
+        if isinstance(memory_gb, bool) or not isinstance(memory_gb, int) or memory_gb <= 0:
+            raise ValidationException("memory_gb must be a positive integer.")
+        if memory_gb in seen:
+            raise ValidationException(f"Duplicate worker size: {memory_gb}.")
+        seen.add(memory_gb)
+        flavor = entry.get("flavor")
+        if not isinstance(flavor, str) or not flavor:
+            raise ValidationException("flavor must be a non-empty string.")
+        vcpus = entry.get("vcpus")
+        if isinstance(vcpus, bool) or not isinstance(vcpus, int) or vcpus <= 0:
+            raise ValidationException("vcpus must be a positive integer.")
+        if not isinstance(entry.get("gated"), bool):
+            raise ValidationException("gated must be a boolean.")
+    # The default size is derived as the smallest non-gated entry, so a
+    # catalogue that gates everything locks every non-member out of submitting
+    # at all -- and the failure would look like a broken picker rather than a
+    # bad setting.
+    if all(entry["gated"] for entry in value):
+        raise ValidationException("At least one worker size must be ungated.")
+    return value
+
+
 @setting_utilities.validator(PluginSettings.BANNER_ENABLED)
 def _validate_banner_enabled(doc):
     value = doc.get("value")

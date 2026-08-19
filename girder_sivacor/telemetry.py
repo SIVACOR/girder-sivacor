@@ -174,10 +174,29 @@ def _image_reference(value):
     return text if len(text) <= _MAX_TEXT else None
 
 
-def _sanitize_stage(stage):
+def _catalogue_size(value, allowed):
+    """Return ``value`` only if it is one of the configured worker sizes.
+
+    ``_one_of`` in integer form, and for the same reason: the stored figure is
+    drawn from a fixed set the operator published, never from anything the
+    worker or the researcher can invent.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value in allowed else None
+
+
+def _sanitize_stage(stage, allowed_sizes=()):
     if not isinstance(stage, dict):
         return None
     return {
+        # What the submission *asked* for, beside mem_limit_bytes -- what it got.
+        # Same class as mem_limit_bytes: a machine capability shared by every
+        # submission at that size, not an identifier. Validated against the
+        # catalogue rather than a charset, per rule 4.
+        "requested_memory_gb": _catalogue_size(
+            stage.get("requested_memory_gb"), allowed_sizes
+        ),
         "image_name": _matching(stage.get("image_name"), _IMAGE_NAME),
         "image_tag": _matching(stage.get("image_tag"), _TAG),
         "network_isolation": bool(stage.get("network_isolation", False)),
@@ -232,13 +251,20 @@ def _sanitize_worker(worker):
     }
 
 
-def sanitize_record(payload, date):
+def sanitize_record(payload, date, allowed_sizes=()):
     """Rebuild an untrusted record from the worker as a storable document.
 
     ``date`` is supplied by the caller (the server) rather than read from
     ``payload`` -- see rule 2 in the module docstring.
+
+    ``allowed_sizes`` is the worker-size catalogue's ``memory_gb`` figures, also
+    supplied by the caller: this module stays free of I/O, and reading the
+    setting here would make the allow-list depend on a Girder connection. It
+    defaults to empty, which drops the field rather than trusting it -- the
+    fail-closed direction, as everywhere else here.
     """
     payload = payload if isinstance(payload, dict) else {}
+    allowed_sizes = frozenset(allowed_sizes)
 
     status = payload.get("status")
     if status not in STATUSES:
@@ -248,7 +274,7 @@ def sanitize_record(payload, date):
     stages = stages if isinstance(stages, list) else []
     # Bound the fan-out: a malformed or hostile payload must not be able to
     # write an unbounded document.
-    stages = [s for s in (_sanitize_stage(x) for x in stages[:32]) if s]
+    stages = [s for s in (_sanitize_stage(x, allowed_sizes) for x in stages[:32]) if s]
 
     bucket = payload.get("package_size_bucket")
     if bucket not in SIZE_BUCKETS:
