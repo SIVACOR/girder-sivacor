@@ -50,7 +50,11 @@ def _validate_retention_days(doc):
 
 
 @setting_utilities.validator(
-    {PluginSettings.HEARTBEAT_TIMEOUT, PluginSettings.MAX_RUNTIME}
+    {
+        PluginSettings.HEARTBEAT_TIMEOUT,
+        PluginSettings.MAX_RUNTIME,
+        PluginSettings.ASSIGNMENT_TIMEOUT,
+    }
 )
 def _validate_reaper_thresholds(doc):
     value = doc.get("value")
@@ -139,6 +143,20 @@ def _validate_banner_enabled(doc):
     value = doc.get("value")
     if not isinstance(value, bool):
         raise ValidationException("Banner enabled must be a boolean.")
+    return value
+
+
+@setting_utilities.validator(PluginSettings.TARGETED_ASSIGNMENT)
+def _validate_targeted_assignment(doc):
+    """Strict about the type, because a truthy string arms the whole path.
+
+    This is the one setting that decides whether ``submit_job`` publishes at
+    all. ``"false"`` is truthy, and getting it wrong that way stops every
+    submission being dispatched while the fleet reports itself idle.
+    """
+    value = doc.get("value")
+    if not isinstance(value, bool):
+        raise ValidationException("Targeted assignment must be a boolean.")
     return value
 
 

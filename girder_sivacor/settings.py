@@ -15,6 +15,15 @@ class PluginSettings:
     BANNER_MESSAGE = "sivacor.banner_message"
     HEARTBEAT_TIMEOUT = "sivacor.heartbeat_timeout"  # in minutes
     MAX_RUNTIME = "sivacor.max_runtime"  # in hours
+    #: How long a submission may wait for the controller to give it a worker
+    #: before it is failed. In minutes.
+    #:
+    #: Only meaningful under TARGETED_ASSIGNMENT, where a submission is RUNNING
+    #: but genuinely idle until an instance is picked for it -- so neither the
+    #: heartbeat nor the runtime rule applies, and without a bound of its own a
+    #: submission an assigner never reaches would sit forever, holding the
+    #: one-submission-per-user gate shut.
+    ASSIGNMENT_TIMEOUT = "sivacor.assignment_timeout"  # in minutes
     #: The catalogue of worker sizes a submission may ask for.
     #:
     #: One object per rung: ``memory_gb`` (the advertised RAM figure, which is
@@ -37,6 +46,24 @@ class PluginSettings:
     #: flat at 60 GB across the ladder, SU/hr equals vCPU on Jetstream2, and
     #: usable memory is an approximation that must not be frozen into config.
     WORKER_SIZES = "sivacor.worker_sizes"
+
+    #: Whether a submission is handed to a worker the fleet controller picked
+    #: for it, instead of being published to the shared dispatch queue.
+    #:
+    #: A Girder setting, and specifically *one* setting, because two processes
+    #: have to agree about it: this plugin decides whether ``submit_job``
+    #: publishes, and the controller decides whether it assigns. If Girder
+    #: publishes while the controller also assigns, two workers end up on one
+    #: workspace; if neither does, nothing runs at all and the fleet looks like
+    #: a healthy idle system. Two environment variables in two services can
+    #: disagree about that; one setting cannot. See P2 in
+    #: development_notes/worker_sizing_plan.md.
+    #:
+    #: Flipping it is safe in either direction: it only decides how *new*
+    #: submissions are routed, and each one records which way it was routed in
+    #: ``meta.awaiting_assignment``, so a submission already in flight is never
+    #: picked up by the other path.
+    TARGETED_ASSIGNMENT = "sivacor.targeted_assignment"
 
     #: Contents of ``stata.lic``, served to workers that run a Stata image.
     #:
@@ -64,9 +91,18 @@ SettingDefault.defaults.update(
         # notice a dead worker late than to fail a live submission.
         PluginSettings.HEARTBEAT_TIMEOUT: 30.0,
         PluginSettings.MAX_RUNTIME: 24.0,
+        # An hour: long enough to cover a full fleet working through a queue at
+        # ~2 min a boot, short enough that a broken assigner tells the
+        # researcher something within one sitting rather than at the 30-minute
+        # heartbeat timeout, which would name the wrong cause.
+        PluginSettings.ASSIGNMENT_TIMEOUT: 60.0,
         # Empty by default: a deployment with no Stata license set simply cannot
         # run Stata images, and says so at container-create time.
         PluginSettings.STATA_LICENSE: "",
+        # Off: the shared dispatch queue is still how a submission reaches a
+        # worker. Turn it on only against a controller that assigns -- an older
+        # one ignores the setting, so nothing would ever be published.
+        PluginSettings.TARGETED_ASSIGNMENT: False,
         # ONE entry, matching what production runs today (SIVACOR_OS_FLAVOR is
         # m3.large). A single rung means no submission can ask for anything
         # different, so recording the size and, later, assigning on it are both

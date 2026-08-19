@@ -66,6 +66,10 @@ class FailureCode(str, Enum):
     REAPED_NO_HEARTBEAT = "reaped_no_heartbeat"
     #: The submission ran past the configured maximum runtime.
     REAPED_MAX_RUNTIME = "reaped_max_runtime"
+    #: No worker was ever assigned to it. Distinct from the two above: nothing
+    #: was lost, nothing overran -- the submission never started, so the fleet
+    #: is what to look at, not the run.
+    REAPED_NO_WORKER = "reaped_no_worker"
     #: Anything not classified above. ``detail`` is the exception class name.
     UNEXPECTED = "unexpected"
 
