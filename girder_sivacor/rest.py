@@ -111,6 +111,96 @@ def resolve_worker_size(workflow):
     return requested
 
 
+def targeted_assignment():
+    """Whether the fleet controller, rather than a shared queue, routes work."""
+    return bool(Setting().get(PluginSettings.TARGETED_ASSIGNMENT))
+
+
+def build_submission_chain(job, file, stages, secrets):
+    """Assemble the celery chain that runs one submission.
+
+    Split out of :meth:`SIVACOR.submit_job` so the fleet controller can build
+    the same chain at assignment time, once it has picked an instance, and
+    publish it straight to that instance's private queue. There must be exactly
+    one builder: a second copy in another repo is a scheduling policy that can
+    drift, which is the thing S2/S3 exist to prevent. See P2 in
+    development_notes/worker_sizing_plan.md.
+
+    Builds only -- the caller publishes. Under targeted assignment the claim and
+    the publish have to be ordered against each other (claim first, always: the
+    other order publishes the chain twice if the tick dies between them), and
+    that ordering belongs where the claim is.
+    """
+    # The worker has no database of its own; it reaches back over REST as
+    # an administrator. girder_worker copies these headers from a running
+    # task onto the next one it publishes, but the chain is built here, so
+    # set them on every step rather than relying on that.
+    admin = User().findOne({"admin": True})
+    # REST_CREATE_JOB_TOKEN_SCOPE is not optional. girder_worker's
+    # girder_before_task_publish POSTs to /job to record a child job for every
+    # step it publishes, and that endpoint is
+    # @access.token(scope=REST_CREATE_JOB_TOKEN_SCOPE, required=True) -- which a
+    # plain USER_AUTH token does not satisfy even for an administrator. Without
+    # it every step logs "Failed to post job: HTTP error 403 ... Invalid token
+    # scope" and carries on, so the submission still runs but no child job is
+    # ever created: GET /job/:id/children comes back empty, per-step progress
+    # vanishes from the UI, and the reaper has no child jobs to settle.
+    worker_token = str(
+        Token().createToken(
+            user=admin,
+            days=WORKER_TOKEN_DAYS,
+            scope=[TokenScope.USER_AUTH, REST_CREATE_JOB_TOKEN_SCOPE],
+        )["_id"]
+    )
+    api_url = getWorkerApiUrl()
+
+    def step(signature, title):
+        return signature.set(
+            girder_job_title=title,
+            girder_api_url=api_url,
+            girder_client_token=worker_token,
+        )
+
+    workflow = step(
+        prepare_submission.s(
+            str(job["userId"]),
+            str(file["_id"]),
+            stages,
+            str(job["_id"]),
+            job.get("meta", {}).get("requested_memory_gb"),
+        ),
+        f"Moving {file['name']} to submission collection",
+    )
+    workflow |= step(create_workspace.s(), "Create Workspace")
+    workflow |= step(run_tro.s("add_arrangement", 0, None), "Record initial arrangement")
+    for i, stage in enumerate(stages):
+        workflow |= step(
+            execute_workflow.s(stage, secrets), "Execute SIVACOR Workflow"
+        )
+        workflow |= step(
+            run_tro.s("add_arrangement", i + 1, None), "Record final arrangement"
+        )
+        workflow |= step(
+            run_tro.s("add_performance", i, None), "Record user workflow TRP"
+        )
+    workflow |= step(prune_workspace.s(), "Prune Workspace")
+    workflow |= step(
+        run_tro.s("add_arrangement", len(stages) + 1, "is_pruned"),
+        "Record final pruned arrangement",
+    )
+    workflow |= step(
+        run_tro.s("prune_performance", len(stages), "is_pruned"),
+        "Record workspace prune TRP",
+    )
+    # Signing runs on the manager, not on the worker holding the workspace --
+    # sign_tro is declared on LOCAL_QUEUE and is exempt from pin_chain. See
+    # routing.UNPINNED_TASKS.
+    workflow |= step(sign_tro.s(), "Sign TRO")
+    workflow |= step(upload_workspace.s(), "Upload Replicated Package")
+    workflow |= step(finalize_job.s(), "Finalize Job Submission")
+    return workflow
+
+
 def _as_utc(value):
     """Make a Mongo timestamp safe to compare against an aware ``now``.
 
@@ -279,15 +369,41 @@ class SIVACOR(Resource):
         # and stop the whole fleet.
         requested_memory_gb = resolve_worker_size(workflow)
 
+        assigned = targeted_assignment()
+        other_fields = {
+            "meta": {
+                # Recorded at submit time, unlike meta.worker_queue, which only
+                # exists once a worker has been chosen. The pair is what tells
+                # "asked for N" from "ran on a box that had N".
+                "requested_memory_gb": requested_memory_gb,
+                # Which of the two routes this submission took, recorded per
+                # submission rather than read from the setting later. The
+                # setting can be flipped while this one is in flight, and a
+                # submission already published to the dispatch queue must never
+                # then be assigned as well -- that is two workers on one
+                # workspace. The controller assigns only what is marked here.
+                "awaiting_assignment": assigned,
+            }
+        }
+        if assigned:
+            # What the controller needs to build the chain once it has picked an
+            # instance. Deliberately not under meta: filtermodel drops unexposed
+            # top-level fields, so the secret envelope cannot leave the server
+            # in a job document. (It is the same ciphertext that otherwise sits
+            # in the broker message, so this is not a new exposure -- but there
+            # is no reason to widen it either.)
+            other_fields["sivacorChain"] = {
+                "fileId": file["_id"],
+                "stages": stages,
+                "secrets": env_secrets,
+            }
+
         job = Job().createJob(
             title=f"SIVACOR Run for {file['name']} by {user['firstName']} {user['lastName']}",
             type="sivacor_submission",
             public=False,
             user=user,
-            # Recorded at submit time, unlike meta.worker_queue, which only
-            # exists once a worker has been chosen. The pair is what tells
-            # "asked for N" from "ran on a box that had N".
-            otherFields={"meta": {"requested_memory_gb": requested_memory_gb}},
+            otherFields=other_fields,
         )
         # Close the window between the check above and the job creation: two
         # concurrent requests can both pass it, so whoever ends up with the
@@ -306,77 +422,17 @@ class SIVACOR(Resource):
             job, f"{timestamp} Preparing SIVACOR submission\n", status=JobStatus.RUNNING
         )
 
-        # The worker has no database of its own; it reaches back over REST as
-        # an administrator. girder_worker copies these headers from a running
-        # task onto the next one it publishes, but the chain is built here, so
-        # set them on every step rather than relying on that.
-        admin = User().findOne({"admin": True})
-        # REST_CREATE_JOB_TOKEN_SCOPE is not optional. girder_worker's
-        # girder_before_task_publish POSTs to /job to record a child job for every
-        # step it publishes, and that endpoint is
-        # @access.token(scope=REST_CREATE_JOB_TOKEN_SCOPE, required=True) -- which a
-        # plain USER_AUTH token does not satisfy even for an administrator. Without
-        # it every step logs "Failed to post job: HTTP error 403 ... Invalid token
-        # scope" and carries on, so the submission still runs but no child job is
-        # ever created: GET /job/:id/children comes back empty, per-step progress
-        # vanishes from the UI, and the reaper has no child jobs to settle.
-        worker_token = str(
-            Token().createToken(
-                user=admin,
-                days=WORKER_TOKEN_DAYS,
-                scope=[TokenScope.USER_AUTH, REST_CREATE_JOB_TOKEN_SCOPE],
-            )["_id"]
-        )
-        api_url = getWorkerApiUrl()
+        if assigned:
+            # Nothing is published: the controller picks an instance and
+            # publishes the chain to that instance's private queue. Until it
+            # does, the submission is RUNNING with no activity of its own, which
+            # the reaper is taught to leave alone.
+            return job
 
-        def step(signature, title):
-            return signature.set(
-                girder_job_title=title,
-                girder_api_url=api_url,
-                girder_client_token=worker_token,
-            )
-
-        workflow = step(
-            prepare_submission.s(
-                str(user["_id"]),
-                str(file["_id"]),
-                stages,
-                str(job["_id"]),
-                requested_memory_gb,
-            ),
-            f"Moving {file['name']} to submission collection",
-        )
-        workflow |= step(create_workspace.s(), "Create Workspace")
-        workflow |= step(
-            run_tro.s("add_arrangement", 0, None), "Record initial arrangement"
-        )
-        for i, stage in enumerate(stages):
-            workflow |= step(
-                execute_workflow.s(stage, env_secrets), "Execute SIVACOR Workflow"
-            )
-            workflow |= step(
-                run_tro.s("add_arrangement", i + 1, None), "Record final arrangement"
-            )
-            workflow |= step(
-                run_tro.s("add_performance", i, None), "Record user workflow TRP"
-            )
-        workflow |= step(prune_workspace.s(), "Prune Workspace")
-        workflow |= step(
-            run_tro.s("add_arrangement", len(stages) + 1, "is_pruned"),
-            "Record final pruned arrangement",
-        )
-        workflow |= step(
-            run_tro.s("prune_performance", len(stages), "is_pruned"),
-            "Record workspace prune TRP",
-        )
-        # Signing runs on the manager, not on the worker holding the workspace --
-        # sign_tro is declared on LOCAL_QUEUE and is exempt from pin_chain. See
-        # routing.UNPINNED_TASKS.
-        workflow |= step(sign_tro.s(), "Sign TRO")
-        workflow |= step(upload_workspace.s(), "Upload Replicated Package")
-        workflow |= step(finalize_job.s(), "Finalize Job Submission")
         try:
-            workflow.apply_async(queue=DISPATCH_QUEUE)
+            build_submission_chain(job, file, stages, env_secrets).apply_async(
+                queue=DISPATCH_QUEUE
+            )
         except Exception:
             logger.exception("Failed to dispatch submission %s", str(job["_id"]))
         return job
@@ -706,6 +762,13 @@ class SIVACOR(Resource):
         max_runtime = datetime.timedelta(
             hours=Setting().get(PluginSettings.MAX_RUNTIME)
         )
+        unassigned_after = datetime.timedelta(
+            minutes=Setting().get(PluginSettings.ASSIGNMENT_TIMEOUT)
+        )
+        # Read once, not per job: the sweep can span many submissions and the
+        # catalogue cannot change underneath a single pass in any way that
+        # matters. Sizes only, since that is all the comparison below needs.
+        catalogue_sizes = {entry["memory_gb"] for entry in worker_sizes()}
 
         # Materialize the cursor: this loop moves jobs out of the status the
         # query selects on, and Mongo can skip documents that shift under a
@@ -719,19 +782,69 @@ class SIVACOR(Resource):
         reaped = []
         for job in stranded:
             created = _as_utc(job["created"])
-            # Any of the three counts as a sign of life: the heartbeat covers a
-            # long container run, 'updated' covers every step that logs, and
-            # 'created' keeps a submission that has not reached its first step
-            # from being reaped before it starts.
+            meta = job.get("meta", {})
+            # Under targeted assignment a submission is RUNNING from the moment
+            # it is accepted but genuinely idle until the controller picks an
+            # instance for it -- there is no worker to have a heartbeat and no
+            # run to overrun. Judging that wait by either of the rules below
+            # fails a healthy submission and names the wrong cause; it gets its
+            # own, longer bound instead. See P2 in worker_sizing_plan.md.
+            assigned_at = meta.get("assigned_at")
+            if meta.get("awaiting_assignment") and not assigned_at:
+                # A rung withdrawn from the catalogue while this waited. The
+                # controller already refuses to downgrade it onto hardware the
+                # run was never sized for -- it logs `not in the catalogue` and
+                # creates nothing -- but on its own that leaves the submission
+                # to age out an hour later as REAPED_NO_WORKER, which names the
+                # fleet when the cause is a config edit. Fail it now instead,
+                # with the size in the message. Open item 3, answered 2026-08-20.
+                #
+                # Girder does this rather than the controller because S3 forbids
+                # the controller calling updateJob(), and updateJob is what marks
+                # the folder failed and emails the researcher.
+                requested = meta.get("requested_memory_gb")
+                if requested is not None and requested not in catalogue_sizes:
+                    self._reap(
+                        job,
+                        f"the {requested} GB worker size is no longer offered, so "
+                        "no machine of that size will be created for this "
+                        "submission. Please resubmit choosing one of: "
+                        + ", ".join(f"{s} GB" for s in sorted(catalogue_sizes)),
+                        FailureCode.SIZE_UNAVAILABLE,
+                        now - created,
+                        reaped,
+                        detail=requested,
+                    )
+                    continue
+                if now - created > unassigned_after:
+                    self._reap(
+                        job,
+                        f"no worker could be assigned to it within "
+                        f"{unassigned_after}",
+                        FailureCode.REAPED_NO_WORKER,
+                        now - created,
+                        reaped,
+                    )
+                continue
+            # Any of these counts as a sign of life: the heartbeat covers a
+            # long container run, 'updated' covers every step that logs,
+            # 'assigned_at' covers the gap between a controller publishing the
+            # chain and the first step logging, and 'created' keeps a submission
+            # that has not reached its first step from being reaped before it
+            # starts.
             last_seen = max(
                 _as_utc(t)
                 for t in (
                     created,
                     job.get("updated") or created,
-                    job.get("meta", {}).get("heartbeat") or created,
+                    meta.get("heartbeat") or created,
+                    assigned_at or created,
                 )
             )
-            if now - created > max_runtime:
+            # An assigned submission's clock starts when it was given a worker,
+            # not when it was accepted: the wait was not its run.
+            started = _as_utc(assigned_at) if assigned_at else created
+            if now - started > max_runtime:
                 reason = (
                     f"exceeded the maximum runtime of {max_runtime}; "
                     "started at " + created.isoformat()
@@ -746,15 +859,20 @@ class SIVACOR(Resource):
             else:
                 continue
 
-            logger.warning("Reaping stranded submission %s: %s", job["_id"], reason)
-            self._fail_stranded(job, reason)
-            self._record_reaped(job, code, now - created)
-            reaped.append(str(job["_id"]))
+            self._reap(job, reason, code, now - created, reaped)
 
         return {"reaped": reaped}
 
     @classmethod
-    def _record_reaped(cls, job, code, elapsed):
+    def _reap(cls, job, reason, code, elapsed, reaped, detail=None):
+        """Fail one submission and note it, however it was selected."""
+        logger.warning("Reaping stranded submission %s: %s", job["_id"], reason)
+        cls._fail_stranded(job, reason)
+        cls._record_reaped(job, code, elapsed, detail)
+        reaped.append(str(job["_id"]))
+
+    @classmethod
+    def _record_reaped(cls, job, code, elapsed, detail=None):
         """Write the execution record for a submission the worker lost.
 
         The worker records its own outcome, but a reaped submission is by
@@ -778,7 +896,13 @@ class SIVACOR(Resource):
                     "status": "reaped",
                     "stages": stages,
                     "total_duration_seconds": elapsed.total_seconds(),
-                    "error": {"step": "reaper", "code": code.value},
+                    "error": {
+                        "step": "reaper",
+                        "code": code.value,
+                        # sanitize_record validates this per code, so an
+                        # unexpected value is dropped rather than stored.
+                        **({"detail": detail} if detail is not None else {}),
+                    },
                 }
             )
         except Exception:

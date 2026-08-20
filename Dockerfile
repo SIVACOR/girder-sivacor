@@ -117,7 +117,7 @@ RUN python3 -m pip install --no-cache-dir gunicorn uvicorn[standard] uvicorn-wor
 # what is in this image. An unpinned ref would let a merge in another repo
 # silently change this build, which is the failure mode sivacor-autoscaler's own
 # CI calls out by name. Bump deliberately; that repo's test suite gates the ref.
-ARG AUTOSCALER_REF=00e59934c379147ae5f5de52e8797912b543cfe6
+ARG AUTOSCALER_REF=d39e238d87d4158011d115391cbd4b506aa165ef
 RUN python3 -m pip install --no-cache-dir \
   "git+https://github.com/SIVACOR/sivacor-autoscaler.git@${AUTOSCALER_REF}"
 # The baked docker GID is only a fallback, and it is NOT reliable: a fresh JS2

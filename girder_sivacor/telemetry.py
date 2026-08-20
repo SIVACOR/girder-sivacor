@@ -154,6 +154,8 @@ _DETAIL_VALIDATORS = {
     # record actionable: "failed at 59 GiB" and "failed at 28 GiB" are different
     # problems with different fixes.
     FailureCode.OUT_OF_MEMORY: lambda v: _safe_int(v, minimum=0),
+    # A catalogue rung, not a measurement: non-identifying by construction.
+    FailureCode.SIZE_UNAVAILABLE: lambda v: _safe_int(v, minimum=0),
     FailureCode.MAIN_FILE_AMBIGUOUS: lambda v: _safe_int(v, minimum=0),
     FailureCode.IMAGE_PULL_FAILED: lambda v: _image_reference(v),
     FailureCode.UNSAFE_ARCHIVE: lambda v: _one_of(v, _ARCHIVE_REASONS),

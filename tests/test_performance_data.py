@@ -398,6 +398,21 @@ def test_performance_data_integration(
                         field in performance_data
                     ), f"Performance data should contain {field}"
 
+                # The three-part memory story, and the reason this assertion is
+                # here rather than in the telemetry tests: this file is what the
+                # TRO certifies. MemTotal is what the machine had,
+                # DockerRunArgs.mem_limit what the container was given, and
+                # RequestedMemoryGB what the researcher asked for -- open item 2,
+                # answered 2026-08-20 as "performance data, not a TROV attribute".
+                assert "RequestedMemoryGB" in performance_data
+                assert performance_data["RequestedMemoryGB"] == 60, (
+                    "the size the submission asked for, so a run on hardware "
+                    "smaller than requested is visible in the signed record"
+                )
+                assert "mem_limit" in performance_data["DockerRunArgs"], (
+                    "the granted cap, which was already certified before item 2"
+                )
+
                 # Verify that timestamps are valid
                 assert performance_data["StartedAt"] != ""
                 assert performance_data["FinishedAt"] != ""
