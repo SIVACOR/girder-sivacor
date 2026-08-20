@@ -1240,10 +1240,23 @@ def recorded_run(api, submission, stage, env_vars, task=None):
             raise SubmissionError(
                 FailureCode.OUT_OF_MEMORY,
                 (
+                    # The cap is quoted from mem_limit rather than derived from
+                    # the rung that was asked for: the two can differ (a fleet
+                    # whose default flavour disagrees with the catalogue), and
+                    # the figure that killed the run is the true one. S1
+                    # property 3.
+                    #
+                    # "Choose a larger size" replaced "ask support about a
+                    # larger worker" when the picker shipped (P4.2): a
+                    # researcher can now do this themselves for the self-service
+                    # rungs. The request route stays for the gated ones, named
+                    # with the same words the picker labels them with, so the
+                    # message and the form agree.
                     f"The analysis used more memory than this worker allows "
                     f"({mem_limit / 1024**3:.1f} GiB) and was stopped. Reduce the "
-                    "memory your code needs, or ask support@sivacor.org about a "
-                    "larger worker."
+                    "memory your code needs, or choose a larger worker size when "
+                    "you resubmit. Sizes marked 'by request' need approval -- "
+                    "email support@sivacor.org for one of those."
                     if mem_limit is not None
                     else "The analysis was stopped by the kernel for using too "
                     "much memory."
