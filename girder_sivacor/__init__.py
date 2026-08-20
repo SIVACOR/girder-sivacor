@@ -69,6 +69,7 @@ def _validate_reaper_thresholds(doc):
     {
         PluginSettings.SUBMISSION_COLLECTION_NAME,
         PluginSettings.EDITORS_GROUP_NAME,
+        PluginSettings.WORKER_SIZE_GROUP_NAME,
         PluginSettings.TRO_GPG_FINGERPRINT,
         PluginSettings.TRO_GPG_PASSPHRASE,
         PluginSettings.STATA_LICENSE,
