@@ -13,10 +13,13 @@ do that.
 
 import pytest
 from girder.exceptions import ValidationException
+from girder.models.group import Group
 from girder.models.setting import Setting
+from girder.models.user import User
 from girder_jobs.models.job import Job
 from girder_sivacor.rest import (
     default_worker_size,
+    may_select_gated_sizes,
     resolve_worker_size,
     stage_schema,
     worker_sizes,
@@ -158,6 +161,9 @@ def test_worker_sizes_endpoint_is_public(server):
     assert [entry["memory_gb"] for entry in resp.json["sizes"]] == [30, 60, 250]
     assert resp.json["sizes"][0]["vcpus"] == 8
     assert resp.json["sizes"][2]["gated"] is True
+    # Nobody is logged in, so the gated rung is visible but not choosable.
+    assert resp.json["sizes"][2]["selectable"] is False
+    assert resp.json["sizes"][0]["selectable"] is True
 
 
 @pytest.mark.plugin("sivacor")
@@ -173,48 +179,180 @@ def test_endpoint_never_exposes_the_flavour_name(server):
     assertStatusOk(resp)
     for entry in resp.json["sizes"]:
         assert "flavor" not in entry
-        assert set(entry) == {"memory_gb", "vcpus", "gated"}
+        assert set(entry) == {"memory_gb", "vcpus", "gated", "selectable"}
+
+
+@pytest.mark.plugin("sivacor")
+def test_the_endpoint_reports_selectability_per_caller(server, user, size_group):
+    """'gated' describes the catalogue; 'selectable' answers this request. The
+    picker needs both, or it cannot show a rung it may not choose."""
+    Setting().set(PluginSettings.WORKER_SIZES, LADDER)
+
+    def gated_entry(as_user):
+        resp = server.request(path="/sivacor/worker_sizes", method="GET", user=as_user)
+        assertStatusOk(resp)
+        return next(e for e in resp.json["sizes"] if e["memory_gb"] == 250)
+
+    assert gated_entry(user)["selectable"] is False
+    Group().addUser(size_group, user)
+    entry = gated_entry(User().load(user["_id"], force=True))
+    assert entry["selectable"] is True
+    # Still gated: membership changes who may choose it, not what it is.
+    assert entry["gated"] is True
 
 
 # --- resolution and validation --------------------------------------------
 
 
 @pytest.mark.plugin("sivacor")
-def test_resolution_of_an_absent_request(server):
-    assert resolve_worker_size({"stages": []}) == 60
-    assert resolve_worker_size({"stages": [], "resources": {}}) == 60
+def test_resolution_of_an_absent_request(server, user):
+    assert resolve_worker_size({"stages": []}, user) == 60
+    assert resolve_worker_size({"stages": [], "resources": {}}, user) == 60
 
 
 @pytest.mark.plugin("sivacor")
-def test_resolution_of_an_explicit_request(server):
+def test_resolution_of_an_explicit_request(server, user):
     Setting().set(PluginSettings.WORKER_SIZES, LADDER)
-    assert resolve_worker_size({"resources": {"memory_gb": 60}}) == 60
+    assert resolve_worker_size({"resources": {"memory_gb": 60}}, user) == 60
 
 
 @pytest.mark.plugin("sivacor")
-def test_an_unknown_size_names_the_available_ones(server):
+def test_an_unknown_size_names_the_available_ones(server, user):
     """"Invalid" is not enough. The catalogue is a published contract -- an
     exported workflow carries a bare number -- so a submission rejected because
     a rung was withdrawn has to be told what it may ask for instead."""
     Setting().set(PluginSettings.WORKER_SIZES, LADDER)
     with pytest.raises(ValidationException) as excinfo:
-        resolve_worker_size({"resources": {"memory_gb": 120}})
+        resolve_worker_size({"resources": {"memory_gb": 120}}, user)
     message = str(excinfo.value)
     assert "120" in message
     assert "30" in message and "60" in message
-    # The gated rung is not something to advertise as available.
+    # The gated rung is not something to advertise to someone who cannot have
+    # it -- but a member is told about it, since for them it is available.
     assert "250" not in message
 
 
 @pytest.mark.plugin("sivacor")
-def test_a_gated_size_is_refused_and_points_at_support(server):
-    """The group check does not exist yet, so a gated rung is selectable by
-    nobody. Failing closed matters here: the gated rungs are the expensive
+def test_a_gated_size_is_refused_and_points_at_support(server, user):
+    """A non-member gets the FAQ's existing "please contact us" path, not a
+    button. Failing closed matters here: the gated rungs are the expensive
     ones."""
     Setting().set(PluginSettings.WORKER_SIZES, LADDER)
     with pytest.raises(ValidationException) as excinfo:
-        resolve_worker_size({"resources": {"memory_gb": 250}})
+        resolve_worker_size({"resources": {"memory_gb": 250}}, user)
     assert "support@sivacor.org" in str(excinfo.value)
+
+
+# --- S5 guard 2: the group gate -------------------------------------------
+
+
+@pytest.fixture
+def size_group(server, admin):
+    """The group named by the setting, as an operator would create it."""
+    return Group().createGroup(
+        Setting().get(PluginSettings.WORKER_SIZE_GROUP_NAME), admin, public=False
+    )
+
+
+@pytest.mark.plugin("sivacor")
+def test_a_member_may_select_a_gated_size(server, user, size_group):
+    Setting().set(PluginSettings.WORKER_SIZES, LADDER)
+    Group().addUser(size_group, user)
+    user = User().load(user["_id"], force=True)
+    assert may_select_gated_sizes(user) is True
+    assert resolve_worker_size({"resources": {"memory_gb": 250}}, user) == 250
+
+
+@pytest.mark.plugin("sivacor")
+def test_a_member_is_told_the_gated_size_is_available(server, user, size_group):
+    """The "available sizes" list is per-caller, not per-catalogue: telling a
+    member their own rung is unavailable is how a working gate reads as a broken
+    one."""
+    Setting().set(PluginSettings.WORKER_SIZES, LADDER)
+    Group().addUser(size_group, user)
+    user = User().load(user["_id"], force=True)
+    with pytest.raises(ValidationException) as excinfo:
+        resolve_worker_size({"resources": {"memory_gb": 120}}, user)
+    assert "250" in str(excinfo.value)
+
+
+@pytest.mark.plugin("sivacor")
+def test_membership_of_another_group_does_not_open_the_gate(
+    server, user, admin, size_group
+):
+    """The check is the named group, not "any group" -- the editors group in
+    particular is created by every submission."""
+    Setting().set(PluginSettings.WORKER_SIZES, LADDER)
+    other = Group().createGroup("Editors", admin, public=False)
+    Group().addUser(other, user)
+    user = User().load(user["_id"], force=True)
+    assert may_select_gated_sizes(user) is False
+
+
+@pytest.mark.plugin("sivacor")
+def test_a_missing_group_refuses_everyone(server, user):
+    """Fails closed. An operator who mistyped the setting locks the gated rungs
+    to nobody rather than opening them to everybody."""
+    Setting().set(PluginSettings.WORKER_SIZES, LADDER)
+    Setting().set(PluginSettings.WORKER_SIZE_GROUP_NAME, "Nonexistent")
+    assert may_select_gated_sizes(user) is False
+    with pytest.raises(ValidationException):
+        resolve_worker_size({"resources": {"memory_gb": 250}}, user)
+
+
+@pytest.mark.plugin("sivacor")
+def test_an_admin_bypasses_the_gate(server, admin):
+    """No group needed: an admin can add themselves to it anyway, so refusing
+    them only takes away the ability to exercise a gated rung while testing."""
+    Setting().set(PluginSettings.WORKER_SIZES, LADDER)
+    assert may_select_gated_sizes(admin) is True
+    assert resolve_worker_size({"resources": {"memory_gb": 250}}, admin) == 250
+
+
+@pytest.mark.plugin("sivacor")
+def test_an_ungated_catalogue_never_asks_about_the_group(server, user, caplog):
+    """No gated rung means no group to look up -- and no warning about one.
+
+    Every deployment is in this state until the upper rungs are added, so a
+    missing-group warning here would land on every submission, naming a group
+    nobody has any reason to have created."""
+    assert resolve_worker_size({"resources": {"memory_gb": 60}}, user) == 60
+    assert "worker_size_group_name" not in caplog.text
+
+
+@pytest.mark.plugin("sivacor")
+def test_an_anonymous_caller_has_no_gated_access(server, size_group):
+    """submit_job is @access.user, but GET /sivacor/worker_sizes is public and
+    asks the same question."""
+    assert may_select_gated_sizes(None) is False
+
+
+@pytest.mark.plugin("sivacor")
+def test_a_member_can_submit_a_gated_size(
+    server, db, user, fsAssetstore, uploads_folder, size_group
+):
+    """End to end through the endpoint: the gate is server-side, so the proof
+    has to be that submit_job accepts it, not that the helper does."""
+    Setting().set(PluginSettings.WORKER_SIZES, LADDER)
+    Group().addUser(size_group, user)
+    fobj = upload_test_file(uploads_folder, user, "test_stata.tar.gz")
+    resp = submit_sivacor_job(server, user, fobj, STAGES, resources={"memory_gb": 250})
+    assertStatusOk(resp)
+    job = Job().load(resp.json["_id"], force=True)
+    assert job["meta"]["requested_memory_gb"] == 250
+
+
+@pytest.mark.plugin("sivacor")
+def test_a_non_member_cannot_submit_a_gated_size(
+    server, db, user, fsAssetstore, uploads_folder, size_group
+):
+    """400, and no job -- the same shape as an unknown size, because an
+    imported workflow file can carry a rung the importer may not have."""
+    Setting().set(PluginSettings.WORKER_SIZES, LADDER)
+    fobj = upload_test_file(uploads_folder, user, "test_stata.tar.gz")
+    resp = submit_sivacor_job(server, user, fobj, STAGES, resources={"memory_gb": 250})
+    assertStatus(resp, 400)
+    assert Job().collection.count_documents({"type": "sivacor_submission"}) == 0
 
 
 # --- the wire and the job document ----------------------------------------

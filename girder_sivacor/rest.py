@@ -14,6 +14,7 @@ from girder.exceptions import AccessException, RestException, ValidationExceptio
 from girder.models.collection import Collection
 from girder.models.file import File
 from girder.models.folder import Folder
+from girder.models.group import Group
 from girder.models.setting import Setting
 from girder.models.token import Token
 from girder.models.user import User
@@ -78,19 +79,73 @@ def default_worker_size():
     return catalogue[0]["memory_gb"]
 
 
-def resolve_worker_size(workflow):
+def may_select_gated_sizes(user):
+    """Whether ``user`` is allowed to ask for a ``gated`` rung (S5 guard 2).
+
+    Membership of the group named by ``sivacor.worker_size_group_name``, or site
+    admin. Admins bypass because they can add themselves to that group anyway,
+    so refusing them buys nothing and takes away the operator's ability to
+    exercise a gated rung while testing it.
+
+    Fails closed: an anonymous caller, a missing group, or a user who is not a
+    member all get ``False``, because the gated rungs are the expensive ones.
+    """
+    if user is None:
+        return False
+    if user.get("admin"):
+        return True
+    group_name = Setting().get(PluginSettings.WORKER_SIZE_GROUP_NAME)
+    group = Group().findOne({"name": group_name})
+    if group is None:
+        # Refusing everyone is the safe direction, but to the researcher it
+        # looks exactly like not being a member -- and to an operator who
+        # mistyped the setting it looks like a broken gate. Say which it is
+        # here, since nothing user-facing can.
+        logger.warning(
+            "No group named %r (%s), so no user may select a gated worker size.",
+            group_name,
+            PluginSettings.WORKER_SIZE_GROUP_NAME,
+        )
+        return False
+    return group["_id"] in (user.get("groups") or [])
+
+
+def _gated_access(user, catalogue):
+    """``may_select_gated_sizes``, asked only when the catalogue gates anything.
+
+    Skipping it matters: the check is a database lookup, and on a deployment
+    whose catalogue is entirely ungated -- which is every deployment until the
+    upper rungs are added -- it would log a missing-group warning on every
+    submission, for a group nobody has any reason to have created.
+    """
+    if not any(entry["gated"] for entry in catalogue):
+        return False
+    return may_select_gated_sizes(user)
+
+
+def resolve_worker_size(workflow, user):
     """Return the ``memory_gb`` a workflow asked for, validated.
 
     Raises :class:`ValidationException` naming the selectable sizes, rather than
     saying "invalid": the catalogue is a published contract -- an exported
     workflow carries a bare number -- so a submission rejected because a rung
     was withdrawn has to be told what it may ask for instead.
+
+    ``user`` is required rather than defaulted, even though ``None`` is a
+    meaningful value here: a caller that forgets to pass it would otherwise
+    silently refuse every gated rung, which is the safe direction but is also
+    invisible.
     """
     requested = (workflow.get("resources") or {}).get("memory_gb")
     if requested is None:
         return default_worker_size()
     catalogue = worker_sizes()
-    selectable = [entry["memory_gb"] for entry in catalogue if not entry["gated"]]
+    # Once per call, not once per entry: it is a database lookup, and both the
+    # message and the refusal below have to agree about the answer.
+    gated_ok = _gated_access(user, catalogue)
+    selectable = [
+        entry["memory_gb"] for entry in catalogue if gated_ok or not entry["gated"]
+    ]
     match = next(
         (entry for entry in catalogue if entry["memory_gb"] == requested), None
     )
@@ -99,10 +154,7 @@ def resolve_worker_size(workflow):
             f"Unknown worker size: {requested} GB. "
             f"Available sizes: {', '.join(str(size) for size in selectable)}."
         )
-    if match["gated"]:
-        # The group check that will let some users past this gate is not built
-        # yet, so for now a gated rung is selectable by nobody. Failing closed
-        # matters more than usual here: the gated rungs are the expensive ones.
+    if match["gated"] and not gated_ok:
         raise ValidationException(
             f"The {requested} GB worker is not self-service. "
             "Contact support@sivacor.org to request it. "
@@ -367,7 +419,11 @@ class SIVACOR(Resource):
         # never reach the controller, where the flavour it names does not exist,
         # create_instance raises, and three of those trip the circuit breaker
         # and stop the whole fleet.
-        requested_memory_gb = resolve_worker_size(workflow)
+        # Re-validated here even though the picker only offers what the user may
+        # have: the gate is server-side or it is not a gate, and the value can
+        # also arrive from an imported workflow file that was exported by
+        # somebody who *is* a member.
+        requested_memory_gb = resolve_worker_size(workflow, user)
 
         assigned = targeted_assignment()
         other_fields = {
@@ -966,6 +1022,13 @@ class SIVACOR(Resource):
             "The same catalogue submit_job validates 'resources.memory_gb' "
             "against, so the picker offers exactly what the server accepts. "
             "'default' is the size a submission gets if it asks for none.\n\n"
+            "'gated' is a property of the catalogue -- this rung is by request "
+            "-- while 'selectable' is the answer for the caller making this "
+            "request, so a picker can show a gated rung it cannot choose "
+            "rather than hiding the ladder's top half from everyone. Both are "
+            "reported because they say different things: an unauthenticated "
+            "caller sees 'gated' true and 'selectable' false, and so does a "
+            "logged-in non-member.\n\n"
             "'flavor' is deliberately absent: the cloud provider's name for a "
             "machine shape must not become visible to a researcher or "
             "load-bearing in an exported workflow. 'vcpus' is here because the "
@@ -974,14 +1037,17 @@ class SIVACOR(Resource):
         )
     )
     def get_worker_sizes(self):
+        catalogue = worker_sizes()
+        gated_ok = _gated_access(self.getCurrentUser(), catalogue)
         return {
             "sizes": [
                 {
                     "memory_gb": entry["memory_gb"],
                     "vcpus": entry["vcpus"],
                     "gated": entry["gated"],
+                    "selectable": gated_ok or not entry["gated"],
                 }
-                for entry in worker_sizes()
+                for entry in catalogue
             ],
             "default": default_worker_size(),
         }

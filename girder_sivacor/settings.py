@@ -47,6 +47,22 @@ class PluginSettings:
     #: usable memory is an approximation that must not be frozen into config.
     WORKER_SIZES = "sivacor.worker_sizes"
 
+    #: The Girder group whose members may select a ``gated`` worker size.
+    #:
+    #: S5 guard 2: the expensive rungs stay behind the FAQ's existing "please
+    #: contact us" path rather than becoming a self-service button on the most
+    #: expensive resource in the allocation. A group, alongside the
+    #: ``sivacor.editors_group_name`` idiom, so granting access is an operator
+    #: action in the Girder UI and not a code change.
+    #:
+    #: A missing group refuses every gated rung, which is the safe direction --
+    #: but it is also indistinguishable from "you are not a member" to the
+    #: researcher, so ``may_select_gated_sizes`` logs when the group named here
+    #: does not exist. Site admins bypass the gate: they can add themselves to
+    #: the group anyway, so refusing them buys nothing and costs the operator
+    #: the ability to exercise a gated rung while testing it.
+    WORKER_SIZE_GROUP_NAME = "sivacor.worker_size_group_name"
+
     #: Whether a submission is handed to a worker the fleet controller picked
     #: for it, instead of being published to the shared dispatch queue.
     #:
@@ -91,6 +107,10 @@ SettingDefault.defaults.update(
         PluginSettings.UPLOADS_FOLDER_NAME: "Uploads",
         PluginSettings.SUBMISSION_COLLECTION_NAME: "Submissions",
         PluginSettings.EDITORS_GROUP_NAME: "Editors",
+        # Named for what membership buys rather than for a rung, so the set of
+        # gated sizes can move (it already has: 125 joined 250 on 2026-08-20)
+        # without the group's name becoming a lie.
+        PluginSettings.WORKER_SIZE_GROUP_NAME: "Large Workers",
         PluginSettings.RETENTION_DAYS: 7,
         PluginSettings.BANNER_ENABLED: False,
         PluginSettings.BANNER_MESSAGE: "",
