@@ -59,10 +59,19 @@ class PluginSettings:
     #: disagree about that; one setting cannot. See P2 in
     #: development_notes/worker_sizing_plan.md.
     #:
-    #: Flipping it is safe in either direction: it only decides how *new*
-    #: submissions are routed, and each one records which way it was routed in
-    #: ``meta.awaiting_assignment``, so a submission already in flight is never
-    #: picked up by the other path.
+    #: A submission already in flight is never picked up by the other path:
+    #: each one records which way it was routed in ``meta.awaiting_assignment``,
+    #: and the controller assigns only what is marked there.
+    #:
+    #: **Disarming is only safe while something still consumes the shared queue.**
+    #: Once a deployment sets ``SIVACOR_WORKER_QUEUES=private`` (P2 rollout step 4)
+    #: its workers no longer subscribe to ``sivacor``, so turning this off makes
+    #: ``submit_job`` publish to a queue with no consumer. Those submissions are
+    #: marked ``awaiting_assignment: False``, so they miss the longer
+    #: ``REAPED_NO_WORKER`` bound and are failed at ``sivacor.heartbeat_timeout``
+    #: as ``REAPED_NO_HEARTBEAT`` -- telling the researcher their worker was lost
+    #: when none was ever requested. Check what the fleet's workers subscribe to
+    #: before flipping this off, not just what is in flight.
     TARGETED_ASSIGNMENT = "sivacor.targeted_assignment"
 
     #: Contents of ``stata.lic``, served to workers that run a Stata image.
