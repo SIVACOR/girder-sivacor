@@ -812,6 +812,23 @@ def recorded_run(api, submission, stage, env_vars, task=None):
         "MemTotal": info.get("MemTotal"),
         "NCPU": info.get("NCPU"),
         "Processor": cpu_info.get("brand_raw"),
+        # What the researcher ASKED for, beside what the machine had (MemTotal) and
+        # what the container was given (DockerRunArgs.mem_limit, added below). The
+        # three together are the whole memory story for a run, and only the middle
+        # one was certified before this.
+        #
+        # Performance data rather than a TROV attribute, decided 2026-08-20 (open
+        # item 2): a signed *claim* about the requested size would need a matching
+        # TRS capability under the warrant chain, i.e. a trace-specification change
+        # before any code -- and tro_utils raises ValueError for a TRP attribute with
+        # no backing capability, so it cannot be added incrementally. The consequence
+        # accepted knowingly: the TRO certifies what a run got, never what was asked
+        # for, so a submission that should have been 60 and ran on 30 leaves no
+        # signed trace of that intent.
+        #
+        # None for a chain published by a server older than P1, the same reason
+        # prepare_submission defaults it.
+        "RequestedMemoryGB": submission.get("telemetry_requested_memory_gb"),
     }
     # Machine shape for the execution record. Kept as a capability class, not
     # an identity: no hostname, no queue name, nothing naming this instance.

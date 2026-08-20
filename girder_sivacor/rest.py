@@ -765,6 +765,10 @@ class SIVACOR(Resource):
         unassigned_after = datetime.timedelta(
             minutes=Setting().get(PluginSettings.ASSIGNMENT_TIMEOUT)
         )
+        # Read once, not per job: the sweep can span many submissions and the
+        # catalogue cannot change underneath a single pass in any way that
+        # matters. Sizes only, since that is all the comparison below needs.
+        catalogue_sizes = {entry["memory_gb"] for entry in worker_sizes()}
 
         # Materialize the cursor: this loop moves jobs out of the status the
         # query selects on, and Mongo can skip documents that shift under a
@@ -787,6 +791,31 @@ class SIVACOR(Resource):
             # own, longer bound instead. See P2 in worker_sizing_plan.md.
             assigned_at = meta.get("assigned_at")
             if meta.get("awaiting_assignment") and not assigned_at:
+                # A rung withdrawn from the catalogue while this waited. The
+                # controller already refuses to downgrade it onto hardware the
+                # run was never sized for -- it logs `not in the catalogue` and
+                # creates nothing -- but on its own that leaves the submission
+                # to age out an hour later as REAPED_NO_WORKER, which names the
+                # fleet when the cause is a config edit. Fail it now instead,
+                # with the size in the message. Open item 3, answered 2026-08-20.
+                #
+                # Girder does this rather than the controller because S3 forbids
+                # the controller calling updateJob(), and updateJob is what marks
+                # the folder failed and emails the researcher.
+                requested = meta.get("requested_memory_gb")
+                if requested is not None and requested not in catalogue_sizes:
+                    self._reap(
+                        job,
+                        f"the {requested} GB worker size is no longer offered, so "
+                        "no machine of that size will be created for this "
+                        "submission. Please resubmit choosing one of: "
+                        + ", ".join(f"{s} GB" for s in sorted(catalogue_sizes)),
+                        FailureCode.SIZE_UNAVAILABLE,
+                        now - created,
+                        reaped,
+                        detail=requested,
+                    )
+                    continue
                 if now - created > unassigned_after:
                     self._reap(
                         job,
@@ -835,15 +864,15 @@ class SIVACOR(Resource):
         return {"reaped": reaped}
 
     @classmethod
-    def _reap(cls, job, reason, code, elapsed, reaped):
+    def _reap(cls, job, reason, code, elapsed, reaped, detail=None):
         """Fail one submission and note it, however it was selected."""
         logger.warning("Reaping stranded submission %s: %s", job["_id"], reason)
         cls._fail_stranded(job, reason)
-        cls._record_reaped(job, code, elapsed)
+        cls._record_reaped(job, code, elapsed, detail)
         reaped.append(str(job["_id"]))
 
     @classmethod
-    def _record_reaped(cls, job, code, elapsed):
+    def _record_reaped(cls, job, code, elapsed, detail=None):
         """Write the execution record for a submission the worker lost.
 
         The worker records its own outcome, but a reaped submission is by
@@ -867,7 +896,13 @@ class SIVACOR(Resource):
                     "status": "reaped",
                     "stages": stages,
                     "total_duration_seconds": elapsed.total_seconds(),
-                    "error": {"step": "reaper", "code": code.value},
+                    "error": {
+                        "step": "reaper",
+                        "code": code.value,
+                        # sanitize_record validates this per code, so an
+                        # unexpected value is dropped rather than stored.
+                        **({"detail": detail} if detail is not None else {}),
+                    },
                 }
             )
         except Exception:

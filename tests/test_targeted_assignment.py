@@ -210,7 +210,12 @@ def test_the_builder_produces_the_chain_the_controller_can_publish(
 
 
 def _running_submission(
-    user, submission_collection, awaiting=False, assigned_at=None, age_minutes=0
+    user,
+    submission_collection,
+    awaiting=False,
+    assigned_at=None,
+    age_minutes=0,
+    requested_memory_gb=None,
 ):
     """A RUNNING submission job, aged, with the routing metadata under test.
 
@@ -223,7 +228,12 @@ def _running_submission(
         type="sivacor_submission",
         public=False,
         user=user,
-        otherFields={"meta": {"awaiting_assignment": awaiting}},
+        otherFields={
+            "meta": {
+                "awaiting_assignment": awaiting,
+                "requested_memory_gb": requested_memory_gb,
+            }
+        },
     )
     job = Job().updateJob(job, "Preparing\n", status=JobStatus.RUNNING)
     folder = Folder().createFolder(
@@ -342,3 +352,78 @@ def test_the_runtime_limit_starts_when_the_worker_does(
         {"$set": {"meta.assigned_at": now - datetime.timedelta(minutes=70)}},
     )
     assert str(job["_id"]) in reap(server, admin)
+
+
+@pytest.mark.plugin("sivacor")
+def test_a_withdrawn_size_fails_immediately_and_says_which_size(
+    server, db, admin, user, submission_collection
+):
+    """Open item 3. The submission asked for a rung that no longer exists.
+
+    The controller already refuses to downgrade it -- it logs `not in the
+    catalogue` and creates nothing -- but on its own that leaves the researcher
+    waiting out ASSIGNMENT_TIMEOUT to be told `no worker could be assigned`,
+    which names the fleet when the cause is a config edit. The wait is the part
+    being removed here: nothing about this is time-dependent, so it is failed on
+    the first sweep, four minutes in, with the size named and the survivors
+    listed so the researcher can act without asking anyone.
+    """
+    Setting().set(
+        PluginSettings.WORKER_SIZES,
+        [
+            {"memory_gb": 30, "flavor": "m3.medium", "vcpus": 8, "gated": False},
+            {"memory_gb": 60, "flavor": "m3.large", "vcpus": 16, "gated": False},
+        ],
+    )
+    Setting().set(PluginSettings.ASSIGNMENT_TIMEOUT, 60.0)
+    job = _running_submission(
+        user,
+        submission_collection,
+        awaiting=True,
+        age_minutes=4,           # nowhere near the hour-long bound
+        requested_memory_gb=125,  # withdrawn
+    )
+
+    assert str(job["_id"]) in reap(server, admin)
+    reloaded = Job().load(job["_id"], force=True, includeLog=True)
+    assert reloaded["status"] == JobStatus.ERROR
+    log = reloaded["log"][-1]
+    assert "125 GB" in log, "name the size that went away"
+    assert "30 GB, 60 GB" in log, "and what may be chosen instead"
+    assert "no worker could be assigned" not in log, "that names the wrong cause"
+
+
+@pytest.mark.plugin("sivacor")
+def test_a_size_still_in_the_catalogue_waits_out_the_normal_bound(
+    server, db, admin, user, submission_collection
+):
+    """The guard must not fire on a submission that is merely queued behind a
+    busy fleet -- which is the common case, and failing it would be far worse
+    than the hour-long wait this fixes."""
+    Setting().set(
+        PluginSettings.WORKER_SIZES,
+        [{"memory_gb": 60, "flavor": "m3.large", "vcpus": 16, "gated": False}],
+    )
+    Setting().set(PluginSettings.ASSIGNMENT_TIMEOUT, 60.0)
+    job = _running_submission(
+        user, submission_collection, awaiting=True, age_minutes=4,
+        requested_memory_gb=60,
+    )
+
+    assert reap(server, admin) == []
+    assert Job().load(job["_id"], force=True)["status"] == JobStatus.RUNNING
+
+
+@pytest.mark.plugin("sivacor")
+def test_a_pre_p1_submission_is_not_failed_for_having_no_size(
+    server, db, admin, user, submission_collection
+):
+    """`requested_memory_gb` is None for anything submitted before P1 recorded
+    it. That is not a withdrawn rung and must not be treated as one."""
+    Setting().set(PluginSettings.ASSIGNMENT_TIMEOUT, 60.0)
+    job = _running_submission(
+        user, submission_collection, awaiting=True, age_minutes=4
+    )
+
+    assert reap(server, admin) == []
+    assert Job().load(job["_id"], force=True)["status"] == JobStatus.RUNNING

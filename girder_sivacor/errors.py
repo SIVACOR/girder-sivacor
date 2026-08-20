@@ -70,6 +70,14 @@ class FailureCode(str, Enum):
     #: was lost, nothing overran -- the submission never started, so the fleet
     #: is what to look at, not the run.
     REAPED_NO_WORKER = "reaped_no_worker"
+    #: The size this submission asked for was withdrawn from
+    #: ``sivacor.worker_sizes`` while it waited, so no worker of that shape will
+    #: ever be created for it. Deliberately NOT one of the ``REAPED_*`` codes:
+    #: those mean time passed, and this is knowable on the first tick. It is also
+    #: the one reaper outcome that is a *configuration* fault rather than a fleet
+    #: or run fault, which is exactly what the reporting data should be able to
+    #: separate. ``detail`` is the requested size in GB.
+    SIZE_UNAVAILABLE = "size_unavailable"
     #: Anything not classified above. ``detail`` is the exception class name.
     UNEXPECTED = "unexpected"
 
