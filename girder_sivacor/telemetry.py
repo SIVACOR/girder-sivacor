@@ -134,6 +134,40 @@ def _safe_int(value, minimum=None):
     return value
 
 
+#: Largest scratch volume that may be recorded, in GB. A shape bound, not a
+#: policy one: the policy ceiling is per user and lives in the settings, and this
+#: module stays free of I/O so it cannot read either. Anything above this is a
+#: value no operator could have configured against the 1000 GB the whole feature
+#: has, so it is dropped rather than stored.
+_MAX_VOLUME_GB = 2000
+
+
+def _volume_gb(value):
+    """Validate a recorded scratch-volume size.
+
+    ``None`` -- no volume -- is the overwhelmingly common answer and is stored as
+    ``None``, not dropped: "did not ask" is a fact worth having when the question
+    is how often anyone asks.
+
+    A whole number of gigabytes, rounded to
+    :data:`~girder_sivacor.rest.VOLUME_GRANULARITY_GB` by the server before it
+    ever reaches a worker, so the stored value comes from a set of ~100 coarse
+    figures. That is the same class as ``mem_limit_bytes`` and
+    ``requested_memory_gb``: a machine capability shared by every submission at
+    that size, and strictly less revealing than the ``max_disk_bytes`` this
+    module already stores per stage, which is an exact byte count.
+
+    Deliberately **not** checked against the granularity. A worker on an older
+    build could legitimately report an unrounded figure, and dropping it would
+    lose the fact that a volume was requested at all in order to enforce a
+    cosmetic property.
+    """
+    if value is None:
+        return None
+    size = _safe_int(value, minimum=0)
+    return size if size is not None and size <= _MAX_VOLUME_GB else None
+
+
 def _stata_detail(value):
     return _matching(value, _STATA_CODE) or _one_of(value, _STATA_FIXED)
 
@@ -289,6 +323,7 @@ def sanitize_record(payload, date, allowed_sizes=()):
         "n_stages": len(stages),
         "total_duration_seconds": _safe_number(payload.get("total_duration_seconds")),
         "package_size_bucket": bucket,
+        "requested_disk_gb": _volume_gb(payload.get("requested_disk_gb")),
         "worker": _sanitize_worker(payload.get("worker")),
         "stages": stages,
     }

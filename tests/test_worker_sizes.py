@@ -361,9 +361,17 @@ def test_a_non_member_cannot_submit_a_gated_size(
 @pytest.mark.plugin("sivacor")
 def test_schema_carries_a_workflow_level_resources_object(server):
     """Workflow-level, not per-stage: pin_chain binds every stage to one
-    machine, so a per-stage size would be a lie the schema endorsed."""
+    machine, so a per-stage size would be a lie the schema endorsed.
+
+    The property set is asserted exactly, and stays that way. Every entry here
+    is a published contract -- the schema is served to clients and an exported
+    workflow carries these keys -- so adding one should be a deliberate edit to
+    this line, not something a change slips past. ``disk_gb`` was added by C1
+    of cinder_volumes_plan.md and is workflow-level for the same reason
+    ``memory_gb`` is: one submission gets one machine, and one volume.
+    """
     resources = stage_schema["properties"]["resources"]
-    assert set(resources["properties"]) == {"memory_gb"}
+    assert set(resources["properties"]) == {"memory_gb", "disk_gb"}
     assert resources["additionalProperties"] is False
     assert "resources" not in stage_schema["properties"]["stages"]["items"]["properties"]
     # Served verbatim, so the UI validates an imported workflow with the same

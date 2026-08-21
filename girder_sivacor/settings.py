@@ -90,6 +90,36 @@ class PluginSettings:
     #: before flipping this off, not just what is in flight.
     TARGETED_ASSIGNMENT = "sivacor.targeted_assignment"
 
+    #: Whether a submission may ask for a Cinder scratch volume at all.
+    #:
+    #: **Off, and it is the master switch.** A submission that asks for
+    #: ``resources.disk_gb`` on a deployment with this false is refused at
+    #: submit time; a submission that does not ask is unaffected either way, and
+    #: takes a code path with no volume in it. See V1/V8 in
+    #: development_notes/cinder_volumes_plan.md.
+    #:
+    #: Separate from :attr:`VOLUME_TOTAL_GB` on purpose, even though a zero
+    #: reservation would also refuse everything: "the operator has not turned
+    #: this on" and "the operator has turned it on and budgeted nothing" are
+    #: different states, and only the first should read as *not offered*.
+    VOLUMES_ENABLED = "sivacor.volumes_enabled"
+
+    #: GB of the OpenStack Cinder quota this deployment may spend on scratch
+    #: volumes, as a deliberate reservation rather than a derived figure.
+    #:
+    #: **Configure it well below the real quota, and know what shares it.** Read
+    #: live 2026-08-21: the project has 10 volumes / 2000 GB, of which two
+    #: volumes and 1000 GB are the two deployments' own data volumes --
+    #: production's 800 GB one holds the filesystem assetstore. So the whole
+    #: feature has 8 volumes and 1000 GB, and those gigabytes are the same ones
+    #: production would need to grow its assetstore. Deriving this from the quota
+    #: would guarantee a collision with that.
+    #:
+    #: In C1 this bounds a *single* request, because nothing here can see the
+    #: fleet. Fleet-wide accounting against it is C3, in the controller, where
+    #: the live volume list is.
+    VOLUME_TOTAL_GB = "sivacor.volume_total_gb"
+
     #: Contents of ``stata.lic``, served to workers that run a Stata image.
     #:
     #: Ephemeral workers are stock VMs with no license on disk (D7: nothing
@@ -132,6 +162,12 @@ SettingDefault.defaults.update(
         # worker. Turn it on only against a controller that assigns -- an older
         # one ignores the setting, so nothing would ever be published.
         PluginSettings.TARGETED_ASSIGNMENT: False,
+        # Off, and 0 GB budgeted. Both, so that turning the feature on is one
+        # deliberate act and *funding* it is a second one -- an operator who
+        # flips the switch and stops there refuses every request with a capacity
+        # message rather than silently spending the assetstore's quota.
+        PluginSettings.VOLUMES_ENABLED: False,
+        PluginSettings.VOLUME_TOTAL_GB: 0,
         # ONE entry, matching what production runs today (SIVACOR_OS_FLAVOR is
         # m3.large). A single rung means no submission can ask for anything
         # different, so recording the size and, later, assigning on it are both

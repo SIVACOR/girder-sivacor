@@ -161,6 +161,38 @@ def _validate_targeted_assignment(doc):
     return value
 
 
+@setting_utilities.validator(PluginSettings.VOLUMES_ENABLED)
+def _validate_volumes_enabled(doc):
+    """Strict about the type, for the same reason targeted assignment is.
+
+    ``"false"`` is truthy, and getting it wrong that way turns on a feature that
+    spends the Cinder quota the assetstore shares.
+    """
+    value = doc.get("value")
+    if not isinstance(value, bool):
+        raise ValidationException("Volumes enabled must be a boolean.")
+    return value
+
+
+@setting_utilities.validator(PluginSettings.VOLUME_TOTAL_GB)
+def _validate_volume_total_gb(doc):
+    """A non-negative whole number of GB, and an ``int`` specifically.
+
+    ``bool`` is an ``int`` in Python, so it is excluded explicitly: ``True``
+    would otherwise validate and reserve one gigabyte.
+
+    Zero is allowed and is the default -- it means "enabled but unfunded", which
+    refuses requests with a capacity message rather than pretending the feature
+    is not there.
+    """
+    value = doc.get("value")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValidationException(
+            "Volume total GB must be a non-negative whole number of gigabytes."
+        )
+    return value
+
+
 @setting_utilities.validator(PluginSettings.BANNER_MESSAGE)
 def _validate_banner_message(doc):
     value = doc.get("value")
