@@ -48,9 +48,13 @@ STAGES = [
 ]
 
 
-def _enable(total_gb=500):
+def _enable(total_gb=500, armed=True):
     Setting().set(PluginSettings.VOLUMES_ENABLED, True)
     Setting().set(PluginSettings.VOLUME_TOTAL_GB, total_gb)
+    # Armed by default, because from C3 the fleet can only honour a disk request when
+    # it is placing submissions itself -- the size comes from the submission's own
+    # record, and demand read from queue depth has no submission behind it.
+    Setting().set(PluginSettings.TARGETED_ASSIGNMENT, armed)
 
 
 def _approve(user, max_gb):
@@ -469,46 +473,33 @@ def test_the_record_still_carries_no_identifier(server):
 
 
 @pytest.mark.plugin("sivacor")
-def test_the_size_reaches_the_submission_folder(
-    server,
-    db,
-    user,
-    eagerWorkerTasks,
-    fsAssetstore,
-    patched_gpg,
-    uploads_folder,
-    submission_collection,
+def test_the_size_reaches_the_job_when_the_fleet_can_honour_it(
+    server, user, uploads_folder, fsAssetstore
 ):
-    """The third recording place, and the only one a unit test cannot reach.
+    """End to end through ``submit_job`` on a deployment that can actually deliver.
 
-    ``prepare_submission`` writes it, so this needs a real run. It matters
-    because the folder is what the *UI* reads: the workflow exporter builds its
-    YAML from the submission folder's metadata, so a size that stops here never
-    round-trips through an export and re-import.
-
-    Also the only test that proves the new task argument is wired end to end.
-    ``prepare_submission`` takes the size as an argument rather than reading it
-    off the job -- ``build_execution_record``'s docstring forbids reading the
-    job at all, which is what keeps the records anonymous -- so a chain builder
-    that forgot to pass it would fail silently here and nowhere else.
+    **This asserts the job, not the folder, and that is a consequence rather than a
+    shortcut.** A disk request now requires ``sivacor.targeted_assignment`` (refusal 5),
+    and arming it means ``submit_job`` records the chain instead of publishing it -- so
+    no worker runs inline, and ``prepare_submission`` never writes the folder. The
+    folder leg for a disk-carrying submission is therefore only observable against a
+    real fleet, which is what the mirror run is for; the no-disk case below still covers
+    it inline.
     """
     _enable(total_gb=500)
     approved = _approve(user, 300)
-    fobj = upload_test_file(uploads_folder, approved, "with_space_R.zip")
-    stages = [
-        {"image_name": "rocker/r-ver", "image_tag": "4.3.1", "main_file": "main.R"}
-    ]
+    file_obj = upload_test_file(uploads_folder, approved, "test_stata.tar.gz")
 
-    resp = submit_sivacor_job(
-        server, approved, fobj, stages, resources={"disk_gb": 55}
+    response = submit_sivacor_job(
+        server, approved, file_obj, STAGES, resources={"disk_gb": 95}
     )
-    assertStatusOk(resp)
-    job = resp.json
-    assert job["status"] == 2  # completed: asking for a volume changed nothing
 
-    resp = get_submission_folder(server, approved, job["_id"], submission_collection)
-    assertStatusOk(resp)
-    assert resp.json[0]["meta"]["requested_disk_gb"] == 60  # 55 rounded up
+    assertStatusOk(response)
+    job = Job().load(response.json["_id"], force=True)
+    # The granted figure, not the requested one: C2 creates the volume from this
+    # number, so it has to be the one the quota was checked against.
+    assert job["meta"]["requested_disk_gb"] == 100
+    assert job["meta"]["awaiting_assignment"] is True, "armed, so the fleet places it"
 
 
 @pytest.mark.plugin("sivacor")
@@ -552,3 +543,42 @@ def test_a_run_without_a_volume_records_none_on_the_folder(
     )
     assertStatusOk(resp)
     assert "requested_disk_gb" not in resp.json[0]["meta"]
+
+
+# --- C3: the fleet must be able to honour it -------------------------------
+
+
+@pytest.mark.plugin("sivacor")
+def test_an_unarmed_deployment_refuses_rather_than_promising(server, user):
+    """Refusal 5, and the one that would otherwise fail an hour later.
+
+    On the shared-queue path the controller creates instances from queue *depth*, which
+    carries no submission -- so it never learns what disk was asked for and never
+    creates a volume. Accepting the request would run the submission on the plain root
+    disk and surface as ``out_of_disk`` after a boot and a wait, blaming the package.
+
+    A capacity message, not a permissions one: the researcher did nothing wrong and can
+    do nothing about it.
+    """
+    _enable(armed=False)
+    approved = _approve(user, 500)
+
+    with pytest.raises(ValidationException) as exc:
+        resolve_volume_gb({"resources": {"disk_gb": 100}}, approved)
+
+    message = str(exc.value)
+    assert "cannot be provided on this deployment right now" in message
+    assert "needs approval" not in message, "not the researcher's fault"
+
+
+@pytest.mark.plugin("sivacor")
+def test_an_unarmed_deployment_still_accepts_submissions_without_disk(server, user):
+    """The refusal must be scoped to the request, not to the deployment.
+
+    An unarmed deployment runs submissions perfectly well; it just cannot attach
+    volumes. Refusing everything would be a far worse regression than the one this
+    guards against.
+    """
+    _enable(armed=False)
+
+    assert resolve_volume_gb({"stages": STAGES}, _approve(user, 500)) is None

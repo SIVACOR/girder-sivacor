@@ -264,6 +264,22 @@ def resolve_volume_gb(workflow, user):
             "Extra scratch disk is not available on this deployment."
         )
 
+    # **The fleet cannot honour this unless it is placing submissions itself.** The
+    # volume's size comes from this submission's own record, and the controller only
+    # reads that when it assigns; demand derived from queue *depth* carries no
+    # submission at all, so on the shared-queue path a volume is never created however
+    # large a disk was asked for. Accepting the request anyway is the exact shape of
+    # promise-silently-broken that one-setting-for-two-processes exists to prevent, so
+    # it is refused here rather than discovered as an out_of_disk failure an hour later.
+    #
+    # A capacity message, not a permissions one: the researcher did nothing wrong and
+    # can do nothing about it.
+    if not targeted_assignment():
+        raise ValidationException(
+            "Extra scratch disk cannot be provided on this deployment right now. "
+            "Contact support@sivacor.org."
+        )
+
     ceiling = user_volume_quota(user)
     if ceiling <= 0:
         raise ValidationException(
