@@ -65,9 +65,20 @@ tests really do build and run containers; the suite is Docker-bound, not CPU-bou
 
 ## Test suite gotchas
 
-- **The suite runs in parallel** (`-n 4`). This is safe because `pytest-girder`
-  names each test's database from a hash of its node id, so isolation is per-test,
-  not per-process.
+- **The suite runs in parallel** (`-n 4` by default). This is safe because
+  `pytest-girder` names each test's database from a hash of its node id, so isolation
+  is per-test, not per-process.
+- **The default 4 is sized for CI, not for a workstation.** CI runs on a 4-vCPU
+  `ubuntu-latest`. On a big local box, `export PYTEST_XDIST_N=16` (or `-- -n 16`) is
+  **~2.5x faster** — measured 2026-08-21 on 32 threads: 122-132s at `-n 4` against
+  49-53s at `-n 16`, flattening from 16 to 32. tox.ini's `commands` line carries the
+  full table and the reasoning.
+- **Above `-n 8`, mongo needs `--ulimit nofile=64000:64000` or it aborts.** Every
+  test gets its own database, so a wide run opens hundreds of WiredTiger files;
+  a default-limit mongo hits 1024 fds and dies with `WT_PANIC`/exit 14, after which
+  every remaining test errors against a dead database and it looks like a mass code
+  regression. `CI_SETUP.md` has the corrected `docker run`. The
+  `Too many index builds` line alongside it is INFO and is not the cause.
 - **Timing-sensitive Docker tests can fail under load** without anything being
   broken. `test_orphan_cleanup.py::test_short_containers_are_still_sampled[0.2]`
   is skipped for this reason. Before treating a new intermittent failure as a

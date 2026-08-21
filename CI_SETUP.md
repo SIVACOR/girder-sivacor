@@ -89,8 +89,21 @@ tox -e test -- -n 0 test_stata.py::test_dual_stdout
 
 ```sh
 # Start services (no auth needed)
-docker run -d --name test-mongo -p 27017:27017 mongo:4.4
+docker run -d --name test-mongo -p 27017:27017 --ulimit nofile=64000:64000 mongo:4.4
 docker run -d --name test-redis -p 6379:6379 redis:7-alpine
+
+**The `--ulimit` on mongo is load-bearing above `-n 8`, and its absence fails
+confusingly.** `pytest-girder` gives every test its own database, so a wide run holds
+hundreds of WiredTiger files open at once. Against a default-limit mongo (1024 fds),
+`-n 16` makes mongod **abort mid-run** — `Too many open files` → `WT_PANIC` →
+`fassert()` → exit 14 — and every remaining test then errors against a dead database,
+which reads like a mass code regression rather than a resource limit. 64000 is
+MongoDB's own documented recommendation. Measured 2026-08-21.
+
+The `Too many index builds running simultaneously` line that shows up in the same log
+is **INFO and benign**: mongo throttling itself back to 3 concurrent builds, which
+resolves on its own. It is not the failure, and raising
+`maxNumActiveUserIndexBuilds` does not help.
 
 export DOCKER_HOST="unix:///var/run/docker.sock"
 export GIRDER_NOTIFICATION_REDIS_URL="redis://localhost:6379/"
