@@ -1,6 +1,7 @@
 import datetime
 import json
 import logging
+import math
 import os
 from zoneinfo import ZoneInfo
 
@@ -168,6 +169,135 @@ def targeted_assignment():
     return bool(Setting().get(PluginSettings.TARGETED_ASSIGNMENT))
 
 
+#: Field on the Girder user document holding that user's scratch-volume ceiling,
+#: in GB. Absent or ``0`` means *not approved*, which is every user until an
+#: administrator says otherwise.
+#:
+#: **One field carries all three of the feature's access rules** -- off by
+#: default, approved users only, and a per-user maximum -- which is why it is a
+#: field and not a group. ``sivacor.worker_size_group_name`` gates a *boolean*
+#: capability, and a Girder group has no per-member payload, so a group cannot
+#: express "Alice may have 200 GB, Bob 50". See V3 in
+#: development_notes/cinder_volumes_plan.md.
+#:
+#: camelCase to match the other plugin-owned user fields (``lastJobId``,
+#: ``lastProjectId``); a dotted key would be a Mongo field-name hazard.
+USER_VOLUME_QUOTA_FIELD = "sivacorMaxVolumeGb"
+
+#: Volume sizes are rounded up to a multiple of this, in GB.
+#:
+#: Cinder accepts any whole number of gigabytes, so this is for legibility, not
+#: for the API: a reservation spent in 10 GB units is one an operator can reason
+#: about against :attr:`PluginSettings.VOLUME_TOTAL_GB`, where a ledger of 37s
+#: and 113s is not. Rounding *up* so the researcher never gets less than they
+#: asked for.
+VOLUME_GRANULARITY_GB = 10
+
+
+def volumes_enabled():
+    """Whether this deployment offers scratch volumes at all."""
+    return bool(Setting().get(PluginSettings.VOLUMES_ENABLED))
+
+
+def volume_total_gb():
+    """This deployment's reserved slice of the Cinder gigabytes quota."""
+    return int(Setting().get(PluginSettings.VOLUME_TOTAL_GB) or 0)
+
+
+def user_volume_quota(user):
+    """The scratch-volume ceiling for ``user``, in GB. ``0`` means not approved.
+
+    Fails closed on every uncertain input -- anonymous, a missing field, a
+    negative or non-integer value someone wrote straight into Mongo. The
+    resource being guarded is a shared quota that production's assetstore draws
+    on, so "we could not establish a ceiling" has to mean zero.
+
+    **Site admins are not special here, unlike the worker-size gate.** There, an
+    admin bypasses because they could add themselves to the group anyway, so
+    refusing them only cost the operator the ability to test a gated rung. A
+    ceiling is a *number*, and there is no equivalent "they could grant it to
+    themselves anyway" argument that produces one -- an admin who wants a volume
+    sets their own field, which is the same operator action as for anyone else,
+    and leaves a record of what was granted. It also means the value an admin
+    tests with is the value a researcher would get.
+    """
+    if not user:
+        return 0
+    value = user.get(USER_VOLUME_QUOTA_FIELD)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
+
+
+def resolve_volume_gb(workflow, user):
+    """Return the scratch-volume size this workflow may have, in GB, or ``None``.
+
+    ``None`` means *no volume*, and it is what a workflow that does not mention
+    ``resources.disk_gb`` gets. It is deliberately distinct from ``0``: the
+    absent case must take a code path with no volume in it at all, which is what
+    makes this feature inert by default and hard to regress into.
+
+    Raises :class:`ValidationException` for the four refusals in V8. Each names
+    a different thing because they are different problems: two of them the
+    researcher can do nothing about, and one -- over their own ceiling -- they
+    can act on alone, so it names the ceiling rather than saying "too large".
+
+    ``user`` is required rather than defaulted, for the same reason
+    :func:`resolve_worker_size`'s is: a caller that forgot it would silently
+    refuse everyone, which is the safe direction but an invisible one.
+    """
+    requested = (workflow.get("resources") or {}).get("disk_gb")
+    if requested is None:
+        return None
+
+    # Shape first, so a nonsense value is not reported as a permissions problem.
+    # The schema already bounds this; submit_job re-checks because the root
+    # object has no additionalProperties: False, so an unvalidated field would
+    # otherwise be silently ignored rather than rejected.
+    if isinstance(requested, bool) or not isinstance(requested, int) or requested <= 0:
+        raise ValidationException(
+            "resources.disk_gb must be a positive whole number of gigabytes."
+        )
+
+    if not volumes_enabled():
+        raise ValidationException(
+            "Extra scratch disk is not available on this deployment."
+        )
+
+    ceiling = user_volume_quota(user)
+    if ceiling <= 0:
+        raise ValidationException(
+            "Extra scratch disk needs approval. Contact support@sivacor.org to "
+            "request it."
+        )
+
+    # Round before comparing, or a request of ceiling-minus-one is accepted and
+    # then silently rounded past the ceiling it was checked against.
+    granted = (
+        math.ceil(requested / VOLUME_GRANULARITY_GB) * VOLUME_GRANULARITY_GB
+    )
+
+    if granted > ceiling:
+        raise ValidationException(
+            f"{requested} GB of extra scratch disk is more than your "
+            f"{ceiling} GB limit. Ask for {ceiling} GB or less, or contact "
+            "support@sivacor.org to raise it."
+        )
+
+    reservation = volume_total_gb()
+    if granted > reservation:
+        # A capacity message, not a permissions one: this user *is* approved for
+        # the size they asked for, and the deployment is what cannot supply it.
+        # Telling an approved user to "request access" would send them to ask
+        # for something they already have.
+        raise ValidationException(
+            f"{requested} GB of extra scratch disk is more than this deployment "
+            f"currently has available ({reservation} GB). Contact "
+            "support@sivacor.org."
+        )
+    return granted
+
+
 def build_submission_chain(job, file, stages, secrets):
     """Assemble the celery chain that runs one submission.
 
@@ -220,6 +350,7 @@ def build_submission_chain(job, file, stages, secrets):
             stages,
             str(job["_id"]),
             job.get("meta", {}).get("requested_memory_gb"),
+            job.get("meta", {}).get("requested_disk_gb"),
         ),
         f"Moving {file['name']} to submission collection",
     )
@@ -345,6 +476,13 @@ stage_schema = {
             "type": "object",
             "properties": {
                 "memory_gb": {"type": "integer", "minimum": 1},
+                # Absent means no volume, which is every submission until an
+                # approved user asks. Deliberately not an enum and not bounded
+                # here: the real ceiling is per user (V3), so the schema can
+                # only say "a positive whole number of gigabytes" and
+                # resolve_volume_gb owns the rest. A bound here would either
+                # duplicate the per-user ceiling or contradict it.
+                "disk_gb": {"type": "integer", "minimum": 1},
             },
             "additionalProperties": False,
         },
@@ -373,6 +511,8 @@ class SIVACOR(Resource):
         )
         self.route("GET", ("image_tags",), self.get_image_tags)
         self.route("GET", ("worker_sizes",), self.get_worker_sizes)
+        self.route("GET", ("volume_quota",), self.get_volume_quota)
+        self.route("PUT", ("user", ":id", "volume_quota"), self.set_volume_quota)
         self.route("GET", ("workflow_schema",), self.get_workflow_schema)
         self.route("GET", ("fs", "manifest"), self.get_fs_manifest)
         self.route("DELETE", ("submission", ":id"), self.delete_submission)
@@ -424,6 +564,11 @@ class SIVACOR(Resource):
         # also arrive from an imported workflow file that was exported by
         # somebody who *is* a member.
         requested_memory_gb = resolve_worker_size(workflow, user)
+        # Same reasoning as the size above, and the same place: server-side,
+        # before anything is created. Unlike the size this can be None, meaning
+        # no volume -- which is every submission on a deployment that has not
+        # turned the feature on. C1 in development_notes/cinder_volumes_plan.md.
+        requested_disk_gb = resolve_volume_gb(workflow, user)
 
         assigned = targeted_assignment()
         other_fields = {
@@ -432,6 +577,10 @@ class SIVACOR(Resource):
                 # exists once a worker has been chosen. The pair is what tells
                 # "asked for N" from "ran on a box that had N".
                 "requested_memory_gb": requested_memory_gb,
+                # None means no volume. Recorded either way so that "did not
+                # ask" and "asked and got it" are distinguishable in the job
+                # document without inferring from the absence of a field.
+                "requested_disk_gb": requested_disk_gb,
                 # Which of the two routes this submission took, recorded per
                 # submission rather than read from the setting later. The
                 # setting can be flipped while this one is in flight, and a
@@ -1051,6 +1200,66 @@ class SIVACOR(Resource):
             ],
             "default": default_worker_size(),
         }
+
+    @access.public
+    @autoDescribeRoute(
+        Description("Get the caller's own scratch-volume allowance.").notes(
+            "'max_gb' is 0 for anyone not approved, which is the default for "
+            "every account -- so 0 and 'enabled: false' are both ordinary "
+            "answers, not errors.\n\n"
+            "Public rather than @access.user so an unauthenticated client gets "
+            "the deployment's answer ('enabled') without a login, the way "
+            "/sivacor/worker_sizes does. An anonymous caller is never approved, "
+            "so 'max_gb' is 0 for them.\n\n"
+            "'granularity_gb' is reported because the server rounds a request "
+            "*up* to a multiple of it before checking it against 'max_gb'. A "
+            "client that does not round the same way can offer a value it will "
+            "then be refused for."
+        )
+    )
+    def get_volume_quota(self):
+        return {
+            "enabled": volumes_enabled(),
+            "max_gb": user_volume_quota(self.getCurrentUser()),
+            "granularity_gb": VOLUME_GRANULARITY_GB,
+            # The deployment's reservation, so a client can explain a refusal it
+            # would otherwise have to describe as "too large" with no number.
+            "deployment_gb": volume_total_gb(),
+        }
+
+    @access.admin
+    @autoDescribeRoute(
+        Description("Set a user's scratch-volume allowance, in GB.")
+        .modelParam("id", "The user to grant or revoke.", model=User, level=AccessType.ADMIN)
+        .param(
+            "maxGb",
+            "Ceiling in GB. 0 revokes approval.",
+            dataType="integer",
+            required=True,
+        )
+        .notes(
+            "The only way to approve a user for scratch volumes; nothing else "
+            "creates or raises this. Deliberately an explicit endpoint rather "
+            "than a field on the user PUT: it spends a shared OpenStack quota "
+            "that production's assetstore also draws on, so granting it is an "
+            "operator action that should be hard to do by accident.\n\n"
+            "Not bounded by 'sivacor.volume_total_gb' here on purpose -- an "
+            "operator may reasonably grant a ceiling ahead of funding it, and "
+            "submit_job enforces both independently. The refusals read "
+            "differently, which is the point: over your own ceiling is "
+            "actionable by the researcher, over the deployment's is not."
+        )
+    )
+    def set_volume_quota(self, user, maxGb):
+        if maxGb < 0:
+            raise ValidationException("maxGb must be zero or more.")
+        User().update({"_id": user["_id"]}, {"$set": {USER_VOLUME_QUOTA_FIELD: maxGb}})
+        logger.info(
+            "Scratch-volume allowance for user %s set to %d GB by an administrator",
+            user["_id"],
+            maxGb,
+        )
+        return {"userId": str(user["_id"]), "max_gb": maxGb}
 
     @access.public
     @autoDescribeRoute(

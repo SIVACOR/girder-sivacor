@@ -113,6 +113,11 @@ def build_execution_record(submission, status, step=None, exc=None):
         "stack_version": _stack_version(),
         "stages": submission.get("telemetry_stages") or [],
         "package_size_bucket": size_bucket(submission.get("telemetry_package_bytes")),
+        # Top-level, not per stage, because one submission gets one volume --
+        # the same reason resources.disk_gb is workflow-level. Contrast
+        # requested_memory_gb, which the worker records per stage beside the cap
+        # that stage was actually given.
+        "requested_disk_gb": submission.get("telemetry_requested_disk_gb"),
         "worker": submission.get("telemetry_worker") or {},
         "total_duration_seconds": _elapsed_since(submission.get("telemetry_started")),
     }
@@ -310,11 +315,23 @@ def _matlab_perms(target_path, uid=1001):
 
 
 @app.task(queue=DISPATCH_QUEUE, bind=True)
-def prepare_submission(task, userId, fileId, stages, job_id, requested_memory_gb=None):
-    # requested_memory_gb defaults so that a chain published by an older server
+def prepare_submission(
+    task,
+    userId,
+    fileId,
+    stages,
+    job_id,
+    requested_memory_gb=None,
+    requested_disk_gb=None,
+):
+    # Both resource figures default so that a chain published by an older server
     # -- one already on the broker when this worker was upgraded -- still runs.
-    # It carries the size rather than the worker reading it off the job because
+    # They are carried as arguments rather than read off the job because
     # build_execution_record must not read the job at all; see its docstring.
+    #
+    # requested_disk_gb is None for "no scratch volume", which is every
+    # submission until an approved user asks for one. Nothing in the pipeline
+    # acts on it yet: C1 records the request, C2 creates the volume.
     # Create a submission directory
     api = GirderApi.for_task(task)
     # Every later step works out of a directory on this machine, so claim the
@@ -346,6 +363,7 @@ def prepare_submission(task, userId, fileId, stages, job_id, requested_memory_gb
     telemetry = {
         "telemetry_started": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "telemetry_requested_memory_gb": requested_memory_gb,
+        "telemetry_requested_disk_gb": requested_disk_gb,
     }
     try:
         submission_folder = _create_submission_folder(api, userId)
@@ -364,6 +382,18 @@ def prepare_submission(task, userId, fileId, stages, job_id, requested_memory_gb
                 # reads: the workflow exporter builds its YAML from the
                 # submission folder's metadata, and the size has to round-trip.
                 "requested_memory_gb": requested_memory_gb,
+                # Likewise on the folder for the exporter's round-trip.
+                #
+                # **None here removes the key rather than storing it**, because
+                # Girder's metadata PUT treats null as a delete. So the folder
+                # carries this only for a submission that asked for a volume,
+                # while the *job* document stores None -- the two are written by
+                # different mechanisms and do not behave the same way. That
+                # asymmetry is fine, and is arguably what you want: the exporter
+                # builds its YAML from the folder, and a submission with no
+                # volume should export no disk_gb at all rather than an explicit
+                # null a re-import would have to interpret.
+                "requested_disk_gb": requested_disk_gb,
             },
         )
         report(api, job_id, f"New submission: '{submission_folder['name']}' created.")
