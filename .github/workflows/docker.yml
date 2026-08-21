@@ -40,3 +40,28 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
           enableBuildKit: true
           multiPlatform: false
+
+      # The action above exposes imageFullName/imageName/tags but no digest, so
+      # ask the registry for it. This is the only ref that is immutable no matter
+      # what later pushes do to `latest` or to the branch tag, so it is what a
+      # post-mortem needs when the question is "which build is production
+      # actually running".
+      - name: Record image digest
+        run: |
+          ref="docker.io/xarthisius/girder-sivacor:sha-${GITHUB_SHA::7}"
+          digest="$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}')"
+          {
+            echo "### Image pushed"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| tags | \`${{ steps.tags.outputs.tags }}\` |"
+            echo "| digest | \`${digest}\` |"
+            echo
+            echo "Pin a deployment to this exact build with:"
+            echo
+            echo '```sh'
+            echo "GIRDER_SIVACOR_IMAGE=docker.io/xarthisius/girder-sivacor@${digest}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice title=Image digest::docker.io/xarthisius/girder-sivacor@${digest}"
