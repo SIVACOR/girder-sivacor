@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Tagging policy, mirrored from sivacor-autoscaler's CI for the reason that
       # workflow states: the immutable `sha-` tag is what lets a deployment pin, so
@@ -31,7 +31,7 @@ jobs:
           echo "will push: ${tags}"
 
       - name: Build and push
-        uses: mr-smithers-excellent/docker-build-push@v6
+        uses: mr-smithers-excellent/docker-build-push@v7
         with:
           image: xarthisius/girder-sivacor
           tags: ${{ steps.tags.outputs.tags }}
