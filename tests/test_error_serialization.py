@@ -36,6 +36,7 @@ end-to-end coverage closes that gap while the boundary is stubbed out, so these
 tests call the serialization boundary directly instead.
 """
 
+import errno
 import pickle
 
 import pytest
@@ -313,3 +314,95 @@ def test_an_unclassified_exception_still_reads_as_unexpected():
     wrapper = get_pickleable_exception(ValueError("something surprising"))
 
     assert classify(wrapper) == (FailureCode.UNEXPECTED, type(wrapper).__name__)
+
+
+# --- C0.1: ENOSPC is classified from the errno --------------------------------
+
+
+def test_a_full_disk_is_recorded_as_a_full_disk_not_as_a_bug():
+    """``upload_workspace`` and ``create_workspace`` write with no guard at all.
+
+    Both run as container-less pool tasks, so ``recorded_run``'s free-space poll
+    does not exist for them -- and both write the researcher's data twice over on
+    one filesystem: an archive beside its extracted tree, and a zip of the whole
+    project *inside* that project. A disk that filled there raised ``OSError`` and
+    was recorded as ``UNEXPECTED``/``OSError``, indistinguishable from a bug in
+    our own code. See workspace_disk_waste.md.
+    """
+    exc = OSError(errno.ENOSPC, "No space left on device")
+
+    assert classify(exc) == (FailureCode.OUT_OF_DISK, None)
+
+
+def test_the_researchers_path_never_reaches_the_record():
+    """``OSError.filename`` is the one field here that is their data.
+
+    A zip write that fails names the file it was writing, which is a path out of
+    the replication package. The detail must stay ``None``: ``OUT_OF_DISK`` has no
+    telemetry validator, so anything set here would be dropped server-side, and
+    relying on that is not the same as not setting it.
+    """
+    exc = OSError(errno.ENOSPC, "No space left on device")
+    exc.filename = "/tmp/workspace-abc/project/confidential_wages_2019.dta"
+
+    code, detail = classify(exc)
+
+    assert code is FailureCode.OUT_OF_DISK
+    assert detail is None
+    assert "confidential" not in str(detail)
+
+
+@pytest.mark.parametrize(
+    "number",
+    [errno.EACCES, errno.ENOENT, errno.EIO, errno.EDQUOT],
+)
+def test_other_os_errors_are_still_unexpected(number):
+    """Only ENOSPC.
+
+    ``EDQUOT`` in particular is a quota, not a full disk, and it has never been
+    observed here -- classifying it speculatively would make a future real
+    occurrence harder to notice.
+
+    Note what the recorded name is: Python maps most errnos to an ``OSError``
+    subclass, so these already store ``PermissionError`` or ``FileNotFoundError``
+    rather than a flat ``OSError``, which is strictly more useful in aggregate.
+    ``ENOSPC`` has no such subclass, which is part of why it needed classifying
+    by hand.
+    """
+    exc = OSError(number, "something else")
+
+    assert classify(exc) == (FailureCode.UNEXPECTED, type(exc).__name__)
+    assert classify(exc)[0] is not FailureCode.OUT_OF_DISK
+
+
+def test_an_oserror_with_no_errno_is_still_unexpected():
+    """``OSError("text")`` sets no errno. It must not fall into the disk branch."""
+    assert classify(OSError("stale NFS handle")) == (
+        FailureCode.UNEXPECTED,
+        "OSError",
+    )
+
+
+def test_a_submission_error_still_wins_over_the_errno_branch():
+    """Ordering: an explicit classification is always more specific.
+
+    ``recorded_run`` raises OUT_OF_DISK deliberately with a researcher-facing
+    message; that must not be re-derived from an errno that is not there.
+    """
+    explicit = SubmissionError(FailureCode.OUT_OF_MEMORY, "capped", detail=61)
+
+    assert classify(explicit) == (FailureCode.OUT_OF_MEMORY, 61)
+
+
+def test_the_enospc_classification_survives_a_task_boundary():
+    """Same boundary the rest of this module exists for.
+
+    ``OSError`` round-trips through pickle where ``SubmissionError`` did not, but
+    asserting it costs one line and this is the file that would have caught the
+    2026-08-13 regression.
+    """
+    exc = OSError(errno.ENOSPC, "No space left on device")
+
+    restored = get_pickleable_exception(exc)
+
+    assert classify(restored) == (FailureCode.OUT_OF_DISK, None)
