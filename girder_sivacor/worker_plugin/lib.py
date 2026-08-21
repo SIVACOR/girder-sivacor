@@ -726,6 +726,175 @@ def disk_shortfall(submission) -> str | None:
     )
 
 
+#: Multiplier from a registry manifest's *compressed* layer total to bytes on
+#: disk. Overridable per host with ``SIVACOR_IMAGE_ON_DISK_MULTIPLIER``.
+#:
+#: A manifest reports the size of each compressed layer blob; what lands in
+#: ``/var/lib/docker`` is those layers extracted, and every layer that rewrites a
+#: file from a lower one is stored in full again. 2.5 is deliberately on the
+#: conservative side of the 2-3x this usually lands in, because the two ways to be
+#: wrong are not symmetric: over-estimating refuses a pull that would have fitted,
+#: which the researcher sees as a false accusation, while under-estimating merely
+#: lets the pull fail the way it does today. So the pre-flight check is only ever
+#: allowed to catch the *unambiguous* cases; :func:`_is_out_of_space` is what
+#: catches the rest, from the pull's own error text.
+IMAGE_ON_DISK_MULTIPLIER = float(
+    os.environ.get("SIVACOR_IMAGE_ON_DISK_MULTIPLIER", "2.5")
+)
+
+#: Fragments docker uses when a write fails for want of space. Matched
+#: case-insensitively against the pull's free-form error string.
+#:
+#: Matching text is unpleasant and it is the only option: the streaming pull API
+#: yields an ``error`` string, not an errno, and the alternative is to keep
+#: reporting these as registry failures. Kept narrow on purpose -- a false
+#: positive here relabels a genuine registry problem as a disk problem and sends
+#: the researcher to shrink a package that was never too big.
+_OUT_OF_SPACE_FRAGMENTS = (
+    "no space left on device",
+    "not enough space",
+    "insufficient space",
+    "write /var/lib/docker",  # the ENOSPC path docker reports on layer registration
+)
+
+
+def _is_out_of_space(error_text) -> bool:
+    """Whether a pull's error string says the disk filled, rather than the registry.
+
+    See :data:`_OUT_OF_SPACE_FRAGMENTS` for why this is textual.
+    """
+    if not error_text:
+        return False
+    lowered = str(error_text).lower()
+    return any(fragment in lowered for fragment in _OUT_OF_SPACE_FRAGMENTS)
+
+
+#: Compressed registry size per image family, in GiB, read from Docker Hub
+#: 2026-08-21. Multiplied by :data:`IMAGE_ON_DISK_MULTIPLIER` to estimate what a
+#: cold pull costs on disk.
+#:
+#: Measured, not guessed: ``dynare/dynare:6.1-R2024a`` 6.2, ``:5.5-R2023a`` 6.3,
+#: ``rocker/geospatial:4.3.2`` 1.5, ``rocker/r-ver:4.6.1`` 0.3,
+#: ``dataeditors/stata19-mp:2026-06-03`` 0.5, ``dataeditors/stata16:2023-06-13``
+#: 0.4. Each entry below takes the **largest** tag seen in that family, because
+#: the check's job is to catch the case that will not fit.
+#:
+#: **The spread is the point, and it is why only one family has ever caused this
+#: failure.** dynare is ~13x a Stata image: 6.3 GiB compressed is ~16 GiB on disk,
+#: against ~1.3 GiB for Stata. All four of the production pull failures this check
+#: was written for were dynare, and a Stata pull essentially cannot cause one.
+#:
+#: A family with no entry is **not** pre-checked -- see :func:`image_on_disk_estimate`
+#: for why guessing high is the worse error. Per-tag figures are available live from
+#: ``https://hub.docker.com/v2/repositories/<repo>/tags/<tag>`` (``full_size``) if
+#: this table ever proves too coarse; it is deliberately not called at run time,
+#: because a registry lookup in the run path is a new way for a run to fail.
+_IMAGE_FAMILY_COMPRESSED_GB = {
+    "dynare": 6.3,
+    "rocker": 1.5,
+    "dataeditors": 0.5,
+}
+
+
+def image_on_disk_estimate(cli, image_reference) -> tuple[int, str] | None:
+    """Estimate what pulling ``image_reference`` will add to the disk.
+
+    Returns ``(bytes, how)`` where ``how`` names the basis, so the researcher-facing
+    message can say which it was -- an estimate presented as a measurement is worse
+    than no estimate. ``None`` means no basis could be established, and the caller
+    must then let the pull proceed: a check that cannot run must never fail a run,
+    the same rule :func:`disk_shortfall` follows.
+
+    Zero is a meaningful answer, not a missing one: an image already present locally
+    costs nothing to "pull". That case matters more than it looks -- a worker part
+    way through a multi-stage submission already has the image, and refusing its
+    second stage for want of space it does not need would be a regression invented
+    by this check.
+
+    **An unknown family returns ``None`` rather than a default.** The two ways to be
+    wrong are not symmetric. Guessing high refuses a pull that would have fitted,
+    which the researcher experiences as being wrongly told their package is too big
+    -- and there is no way for them to disprove it. Guessing low, or declining to
+    guess, merely leaves the pull to fail as it does today, which
+    :func:`_is_out_of_space` now labels correctly anyway. So this check only ever
+    speaks up about families whose size is known.
+    """
+    try:
+        cli.images.get(image_reference)
+    except docker.errors.ImageNotFound:
+        pass
+    except Exception:
+        logging.warning(
+            "Could not check whether %s is present locally",
+            image_reference,
+            exc_info=True,
+        )
+    else:
+        return 0, "already present locally"
+
+    family = str(image_reference).split("/", 1)[0].lower()
+    compressed_gb = _IMAGE_FAMILY_COMPRESSED_GB.get(family)
+    if compressed_gb is None:
+        logging.info(
+            "No recorded size for image family %r, so the pull is not pre-checked",
+            family,
+        )
+        return None
+    return (
+        int(compressed_gb * 1024**3 * IMAGE_ON_DISK_MULTIPLIER),
+        f"{compressed_gb:g} GiB compressed for {family} images, "
+        f"at {IMAGE_ON_DISK_MULTIPLIER:g}x on disk",
+    )
+
+
+def pull_space_shortfall(cli, submission, image_reference) -> str | None:
+    """Explain why ``image_reference`` cannot be pulled here, or ``None`` to proceed.
+
+    **Why this exists as a separate check from** :func:`disk_shortfall`. That one
+    runs inside ``recorded_run``'s poll loop, which does not exist until a container
+    is running -- so a pull that exhausts the disk could never reach it, and
+    surfaced instead as ``IMAGE_PULL_FAILED`` naming the image. Four production
+    submissions failed that way on 2026-08-20/21, all of them ``>5GB`` packages
+    pulling a ~15 GB dynare image onto a 60 GB root disk already holding their
+    extracted workspace. The record said the image could not be fetched, which
+    reads as *our* registry problem and sent nobody to look at disk.
+
+    See ``development_notes/cinder_volumes_plan.md`` C0.1. The permanent
+    consequence of that misattribution: ``out_of_disk`` has never been recorded, so
+    any before/after comparison across this change has to read the *old* side as
+    ``image_pull_failed`` on large packages.
+    """
+    estimate = image_on_disk_estimate(cli, image_reference)
+    if estimate is None:
+        return None
+    needed, how = estimate
+    if not needed:
+        return None
+
+    path = submission.get("workspace_dir") or "/tmp"
+    try:
+        free = shutil.disk_usage(path).free
+    except OSError:
+        logging.warning("Could not determine free space for %s", path, exc_info=True)
+        return None
+
+    # The floor is included because the pull has to leave the run somewhere to
+    # work: filling the disk to within a byte of DISK_FLOOR_BYTES only moves the
+    # same failure to the first thing the analysis writes.
+    required = needed + DISK_FLOOR_BYTES
+    if free >= required:
+        return None
+    return (
+        f"Not enough disk space to pull {image_reference}: "
+        f"{free / 1024**3:.1f} GiB free on the workspace filesystem, but the image "
+        f"needs about {needed / 1024**3:.1f} GiB ({how}) plus a "
+        f"{DISK_FLOOR_BYTES / 1024**3:.1f} GiB working reserve. The replication "
+        "package, its outputs and the analysis image all share this worker's disk, "
+        "and together they do not fit. A smaller package, or fewer files kept in "
+        "it, is the only thing that changes this today."
+    )
+
+
 #: How often to put a progress line in the job log while an image is pulling.
 #: Deliberately much coarser than the heartbeat: each one is an updateJob, which
 #: fires ``jobs.job.update.after`` server-side, whereas the heartbeat writes
@@ -787,6 +956,25 @@ def pull_image(cli, api, submission, image_reference):
                 logging.warning("Progress report during image pull failed", exc_info=True)
 
     if error:
+        if _is_out_of_space(error):
+            # A pull that filled the disk is a disk failure, not a registry one,
+            # and this branch is the reliable half of C0.1: it rests on what
+            # docker actually reported rather than on an estimate, so it catches
+            # the cases the pre-flight check declines to guess about.
+            #
+            # No detail: OUT_OF_DISK has no entry in telemetry's
+            # _DETAIL_VALIDATORS, so one would be dropped server-side anyway.
+            # The free-space figure would be defensible there -- it is a machine
+            # fact of the same class as OUT_OF_MEMORY's cap -- but adding it is a
+            # deliberate telemetry change with a privacy argument attached, and
+            # not part of C0.
+            raise SubmissionError(
+                FailureCode.OUT_OF_DISK,
+                f"Ran out of disk space while pulling {image_reference}. The "
+                "replication package, its outputs and the analysis image all "
+                "share this worker's disk, and together they did not fit. "
+                f"Docker reported: {error}",
+            )
         # Infrastructure, not user error: a registry timeout or a rate limit must
         # not read as "your replication package is broken".
         # The registry's own text is free-form and goes no further than the job
@@ -900,6 +1088,11 @@ def recorded_run(api, submission, stage, env_vars, task=None):
                 read_only=True,
             )
         )
+
+    # Before the pull, not during it: a pull that exhausts the disk cannot reach
+    # disk_shortfall() below, because that only runs once a container exists. C0.1.
+    if shortfall := pull_space_shortfall(cli, submission, image_reference):
+        raise SubmissionError(FailureCode.OUT_OF_DISK, shortfall)
 
     pull_image(cli, api, submission, image_reference)
 

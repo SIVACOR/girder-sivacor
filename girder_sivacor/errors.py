@@ -25,6 +25,7 @@ This module imports nothing from girder, so both the server and a remote
 worker (which has no Mongo, only HTTP) can use it.
 """
 
+import errno
 from enum import Enum
 
 
@@ -133,7 +134,31 @@ def classify(exc):
     unknown source, which is the one thing that must not reach the permanent
     record. The class name plus the pipeline step is still enough to notice
     "every OSError is in create_workspace" months later.
+
+    **One exception is classified from the errno, not the raise site**:
+    ``ENOSPC``. The pipeline writes the researcher's data in three places that
+    no explicit check covers -- ``create_workspace`` extracting an archive
+    beside itself, and ``upload_workspace`` writing a zip of the whole project
+    *inside* that project's own filesystem, both of which run with no container
+    and therefore outside ``recorded_run``'s free-space poll. A disk that fills
+    there raises ``OSError`` and was recorded as ``UNEXPECTED``/``OSError``,
+    which is indistinguishable from a bug.
+
+    Doing it here rather than at each raise site is deliberate: ``ENOSPC`` is a
+    fact the kernel reports, so there is no error-string parsing and no way to
+    get a false positive, and any *future* write in the pipeline is covered
+    without anyone remembering to wrap it. The module docstring's warning about
+    classifying error strings after the fact does not apply -- an errno is not a
+    string, and nothing about the researcher's data reaches the record.
+
+    See ``development_notes/cinder_volumes_plan.md`` C0.1 and
+    ``workspace_disk_waste.md`` for the two writes this covers.
     """
     if isinstance(exc, SubmissionError):
         return exc.code, exc.detail
+    if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+        # No detail: OUT_OF_DISK has no telemetry validator, so one would be
+        # dropped server-side. `exc.filename` would be the researcher's path,
+        # which is exactly what must never reach the permanent record.
+        return FailureCode.OUT_OF_DISK, None
     return FailureCode.UNEXPECTED, type(exc).__name__
