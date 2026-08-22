@@ -20,10 +20,12 @@ from girder_sivacor.worker_plugin.lib import (
     DISK_FLOOR_BYTES,
     HEARTBEAT_INTERVAL,
     _is_out_of_space,
+    disk_floor_bytes,
     disk_shortfall,
     image_on_disk_estimate,
     pull_image,
     pull_space_shortfall,
+    workspace_has_own_filesystem,
 )
 
 IMAGE = "dataeditors/stata19_5-mp:2026-04-15"
@@ -386,3 +388,162 @@ def test_the_preflight_check_never_fails_a_run_by_itself():
     broken = mock.MagicMock()
     broken.images.get.side_effect = RuntimeError("docker socket gone")
     assert image_on_disk_estimate(broken, "who/what:1") is None
+
+
+# --- open item 3: what these checks mean once the workspace is on a volume ---
+#
+# A Cinder scratch volume splits one filesystem into two, and both checks above
+# were written when there was only one. The floor's justification (a full disk
+# wedges the VM) does not survive the split, and the pre-pull check was measuring
+# the wrong side of it: the image is unpacked into the per-VM store, never onto
+# the per-submission volume. Answered 2026-08-22; see
+# development_notes/cinder_volumes_plan.md open item 3.
+
+VOLUME_GB = 20
+
+
+def _split_filesystems(volume_free, root_free, volume_total=VOLUME_GB * 1000**3):
+    """Patch in a workspace on its own filesystem, with per-path free space."""
+    def usage(path):
+        if path == "/":
+            return mock.MagicMock(free=root_free, total=500 * 1000**3)
+        return mock.MagicMock(free=volume_free, total=volume_total)
+
+    return (
+        mock.patch(
+            "girder_sivacor.worker_plugin.lib.workspace_has_own_filesystem",
+            return_value=True,
+        ),
+        mock.patch(
+            "girder_sivacor.worker_plugin.lib.shutil.disk_usage", side_effect=usage
+        ),
+    )
+
+
+def test_the_floor_is_unchanged_where_it_still_protects_the_vm(tmp_path):
+    """No volume, no change. The 5 GiB floor is load-bearing here."""
+    assert disk_floor_bytes({"workspace_dir": str(tmp_path)}) == DISK_FLOOR_BYTES
+
+
+def test_the_floor_on_a_volume_is_a_share_of_the_volume():
+    """5 GiB is a quarter of a 20 GB volume, taken from the user's own allowance.
+
+    The volume holds only the workspace, so filling it fails one run cleanly --
+    which is the outcome the floor exists to manufacture in the first place.
+    """
+    own_fs, usage = _split_filesystems(volume_free=10 * 1024**3, root_free=40 * 1024**3)
+    with own_fs, usage:
+        floor = disk_floor_bytes({"workspace_dir": "/home/ubuntu/volumes/tmp"})
+    assert floor == int(VOLUME_GB * 1000**3 * 0.1)
+    assert floor < DISK_FLOOR_BYTES, "this may only ever lower a floor"
+
+
+def test_a_run_on_a_volume_is_not_aborted_at_the_shared_disk_floor():
+    """The concrete cost of the old constant: 4 GiB free on a 20 GB volume.
+
+    Under the shared-disk floor this aborted a run that had 4 of its 20 GB left.
+    """
+    own_fs, usage = _split_filesystems(volume_free=4 * 1024**3, root_free=40 * 1024**3)
+    with own_fs, usage:
+        assert disk_shortfall({"workspace_dir": "/home/ubuntu/volumes/tmp"}) is None
+
+
+def test_a_volume_that_is_genuinely_nearly_full_still_stops_the_run():
+    """Lowered, not removed: the proportional floor still has to bite."""
+    own_fs, usage = _split_filesystems(volume_free=1 * 1024**3, root_free=40 * 1024**3)
+    with own_fs, usage:
+        msg = disk_shortfall({"workspace_dir": "/home/ubuntu/volumes/tmp"})
+    assert msg is not None and "Ran out of disk space" in msg
+    # The floor it names is the one it used, not the constant. 10% of 20 decimal
+    # GB is 1.9 GiB, which is also a reminder that the two units differ.
+    expected = f"{int(VOLUME_GB * 1000**3 * 0.1) / 1024**3:.1f} GiB floor"
+    assert expected in msg, msg
+    assert f"{DISK_FLOOR_BYTES / 1024**3:.1f} GiB floor" not in msg
+
+
+def test_the_preflight_check_measures_where_the_image_actually_lands():
+    """The regression this exists to prevent, and it is invisible without a volume.
+
+    The workspace volume has 80 GB free and the worker's own disk has 4 -- so a
+    check that reads the workspace clears a ~16 GiB pull that cannot fit. It
+    would first bite on a multi-stage submission, where each stage unpacks
+    another image onto the same per-VM store.
+    """
+    cli = _cold_client()
+    own_fs, usage = _split_filesystems(
+        volume_free=80 * 1024**3, root_free=4 * 1024**3, volume_total=100 * 1000**3
+    )
+    with own_fs, usage:
+        msg = pull_space_shortfall(cli, {"workspace_dir": "/home/ubuntu/volumes/tmp"}, DYNARE)
+
+    assert msg is not None, "the pull cannot fit the disk it is actually going to"
+    assert "worker's own disk" in msg
+    # It must not blame the package: the package is on the volume, which is not
+    # what is short, and nothing the researcher does to it would help.
+    assert "Reduce the size of the package" not in msg
+    assert "support@sivacor.org" in msg
+    cli.api.pull.assert_not_called()
+
+
+def test_a_pull_is_not_charged_the_workspace_floor_on_another_filesystem():
+    """The mirror image: room on the root disk, a nearly-full volume.
+
+    The image fits where it is going, so the pull proceeds. Whether the *run*
+    then has room is disk_shortfall's question, on the other filesystem.
+    """
+    cli = _cold_client()
+    own_fs, usage = _split_filesystems(volume_free=1 * 1024**3, root_free=20 * 1024**3)
+    with own_fs, usage:
+        assert (
+            pull_space_shortfall(cli, {"workspace_dir": "/home/ubuntu/volumes/tmp"}, DYNARE)
+            is None
+        )
+
+
+def test_a_shared_filesystem_is_the_conservative_answer_when_it_cannot_be_told():
+    """A stat that fails must not silently lower a floor."""
+    with mock.patch(
+        "girder_sivacor.worker_plugin.lib.os.stat", side_effect=OSError("gone")
+    ):
+        assert workspace_has_own_filesystem("/home/ubuntu/volumes/tmp") is False
+
+
+def test_the_two_filesystems_are_told_apart_by_device():
+    """Asked of the filesystem, not of the submission's requested_disk_gb.
+
+    What matters is where the bytes land; a worker whose layout differs for any
+    other reason should get the same answer.
+    """
+    devices = {"/": 1, "/home/ubuntu/volumes/tmp": 2}
+
+    def stat(path):
+        return mock.MagicMock(st_dev=devices[path])
+
+    with mock.patch("girder_sivacor.worker_plugin.lib.os.stat", side_effect=stat):
+        assert workspace_has_own_filesystem("/home/ubuntu/volumes/tmp") is True
+        devices["/home/ubuntu/volumes/tmp"] = 1
+        assert workspace_has_own_filesystem("/home/ubuntu/volumes/tmp") is False
+
+
+def test_a_full_volume_is_not_told_to_ask_for_a_volume():
+    """The advice has to fit the submission that reads it.
+
+    A run that already holds 20 GB of extra scratch disk and filled it must be
+    told to ask for a *larger* allowance -- "contact us about extra scratch disk"
+    is the same stale-copy failure as naming a control that does not exist, only
+    pointing the other way.
+    """
+    own_fs, usage = _split_filesystems(volume_free=1 * 1024**3, root_free=40 * 1024**3)
+    with own_fs, usage:
+        msg = disk_shortfall(
+            {
+                "workspace_dir": "/home/ubuntu/volumes/tmp",
+                "telemetry_requested_disk_gb": VOLUME_GB,
+            }
+        )
+    assert msg is not None
+    assert f"{VOLUME_GB} GB of extra scratch disk" in msg
+    assert "larger allowance" in msg
+    assert "about extra scratch disk" not in msg
+    # Still not naming the field: an allowance is raised by asking, not by editing.
+    assert "disk_gb" not in msg

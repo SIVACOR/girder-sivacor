@@ -572,13 +572,41 @@ def _infer_run_command(submission, stage):
 #: Abort a run when free space on the workspace filesystem drops below this.
 #: Overridable per host with ``SIVACOR_DISK_FLOOR_BYTES``.
 #:
-#: An ephemeral worker has no separate volume, so ``/var/lib/docker`` and the
-#: workspace share one filesystem: a runaway payload does not merely fail its own
-#: run, it wedges the whole VM -- the docker daemon starts failing, celery cannot
-#: write, and the submission has to be cleaned up by the server-side reaper
-#: instead of failing cleanly. Stopping at a floor converts that into one failed
-#: job with an explanatory message.
+#: **This is a floor for a *shared* filesystem, and that is its whole
+#: justification.** With no scratch volume, ``/var/lib/docker`` and the workspace
+#: are one filesystem: a runaway payload does not merely fail its own run, it
+#: wedges the whole VM -- the docker daemon starts failing, celery cannot write,
+#: and the submission has to be cleaned up by the server-side reaper instead of
+#: failing cleanly. Stopping at a floor converts that into one failed job with an
+#: explanatory message.
+#:
+#: On a workspace that has its own filesystem -- a Cinder scratch volume -- none
+#: of that follows: filling it fails one run and wedges nothing, which is the
+#: outcome the floor exists to manufacture. See :func:`disk_floor_bytes`, and
+#: open item 3 of ``development_notes/cinder_volumes_plan.md``.
 DISK_FLOOR_BYTES = int(os.environ.get("SIVACOR_DISK_FLOOR_BYTES", 5 * 1024**3))
+
+#: Container-visible path whose filesystem backs the docker image store.
+#:
+#: ``cli.info()['DockerRootDir']`` names a *host* path that does not exist inside
+#: the worker container, so it cannot be measured directly. ``/`` can: the worker
+#: container's own root is an overlay whose ``statvfs`` passes through to the
+#: filesystem holding ``/var/lib/docker`` (verified against the host's ``df``).
+#:
+#: This rests on one standing decision -- **never move ``/var/lib/docker`` onto
+#: the scratch volume** (cinder_volumes_plan.md's "Do not" block), since the
+#: volume is per-submission and the image store is per-VM. The override exists for
+#: a host that has moved it anyway.
+IMAGE_STORE_PATH = os.environ.get("SIVACOR_IMAGE_STORE_PATH", "/")
+
+#: On a workspace with its own filesystem, reserve this share of it rather than
+#: the full :data:`DISK_FLOOR_BYTES`.
+#:
+#: A constant 5 GiB is 25% of a 20 GB volume and half of a 10 GB one, taken from
+#: the researcher's own allowance to guard a hazard that filesystem does not have.
+#: A share keeps the reserve proportional, and it is capped by the constant so
+#: this can only ever *lower* a floor, never raise one.
+WORKSPACE_FLOOR_SHARE = float(os.environ.get("SIVACOR_WORKSPACE_FLOOR_SHARE", "0.1"))
 
 #: RAM held back from the analysis container, for everything else on the worker.
 #: Overridable per host with ``SIVACOR_MEMORY_HEADROOM_BYTES``.
@@ -720,6 +748,48 @@ def workspace_usage(submission) -> int:
 # true before C4 and stays true after it.
 
 
+def workspace_has_own_filesystem(path) -> bool:
+    """Whether ``path`` is on a different filesystem from the image store.
+
+    True exactly when a scratch volume is mounted under the workspace. Asked of
+    the filesystem rather than of the submission's ``requested_disk_gb`` on
+    purpose: what matters is where the bytes actually land, and a worker whose
+    layout differs for any other reason should get the same answer.
+
+    Falls back to ``False`` -- i.e. treat the disk as shared, which is the
+    conservative direction -- if either path cannot be stat'ed.
+    """
+    try:
+        return os.stat(path).st_dev != os.stat(IMAGE_STORE_PATH).st_dev
+    except OSError:
+        logging.warning("Could not compare filesystems for %s", path, exc_info=True)
+        return False
+
+
+def disk_floor_bytes(submission) -> int:
+    """Free space to keep on this submission's workspace filesystem.
+
+    :data:`DISK_FLOOR_BYTES` when the workspace shares the image store's
+    filesystem, because there the floor protects the *VM*. On a scratch volume it
+    protects nothing structural -- filling it fails one run cleanly -- so the
+    reserve becomes a share of the volume, capped by the constant.
+
+    **What a floor on a volume does and does not buy.** It does leave room for
+    ``upload_workspace``, which writes a zip of the project *inside* the
+    project's own filesystem (``workspace_disk_waste.md``) -- and that peak is
+    proportional to the package, which is why a proportional reserve fits it
+    better than a constant. It does not *guarantee* that upload: a nearly-full
+    20 GB volume needs more headroom than any floor here reserves. The floor is
+    not what protects that step, and this docstring is the place that says so.
+    """
+    if not workspace_has_own_filesystem(submission.get("workspace_dir") or "/tmp"):
+        return DISK_FLOOR_BYTES
+    total = _workspace_disk_total(submission)
+    if not total:
+        return DISK_FLOOR_BYTES
+    return min(DISK_FLOOR_BYTES, int(total * WORKSPACE_FLOOR_SHARE))
+
+
 def _workspace_disk_total(submission) -> int | None:
     """Total bytes of the filesystem holding the workspace, or ``None``.
 
@@ -746,7 +816,8 @@ def disk_shortfall(submission) -> str | None:
 
     The path checked is inside the worker container, but the numbers are the
     host's: the workspace is a bind mount, so ``statvfs`` reports the backing
-    filesystem -- the same one holding ``/var/lib/docker``.
+    filesystem -- which is the scratch volume when there is one, and otherwise
+    the one holding ``/var/lib/docker``.
     """
     path = submission.get("workspace_dir") or "/tmp"
     try:
@@ -755,12 +826,27 @@ def disk_shortfall(submission) -> str | None:
         # Never fail a run because the check itself could not run.
         logging.warning("Could not determine free space for %s", path, exc_info=True)
         return None
-    if free >= DISK_FLOOR_BYTES:
+    floor = disk_floor_bytes(submission)
+    if free >= floor:
         return None
-    return (
+    head = (
         f"Ran out of disk space: {free / 1024**3:.1f} GiB free on the workspace "
-        f"filesystem, below the {DISK_FLOOR_BYTES / 1024**3:.1f} GiB floor. The "
-        "replication package plus its outputs and the analysis image must fit in "
+        f"filesystem, below the {floor / 1024**3:.1f} GiB floor. "
+    )
+    granted = submission.get("telemetry_requested_disk_gb")
+    if granted:
+        # This submission *has* extra scratch disk, so telling it to ask for
+        # extra scratch disk would be nonsense -- the same stale-copy failure as
+        # naming a control that does not exist, in the other direction. Name the
+        # size it was given, because that is the number to raise.
+        return head + (
+            f"This ran with {granted} GB of extra scratch disk and filled it. The "
+            "replication package plus everything your code writes must fit there. "
+            "Reduce the size of the package, or contact support@sivacor.org about a "
+            "larger allowance."
+        )
+    return head + (
+        "The replication package plus its outputs and the analysis image must fit in "
         "the worker's disk. Reduce the size of the package, or contact "
         "support@sivacor.org about extra scratch disk."
     )
@@ -911,28 +997,51 @@ def pull_space_shortfall(cli, submission, image_reference) -> str | None:
     if not needed:
         return None
 
-    path = submission.get("workspace_dir") or "/tmp"
+    # **The image lands where the image store is, not where the workspace is**,
+    # and on a volume-backed submission those are different filesystems. Checking
+    # the workspace there would read the volume's free space -- large and nearly
+    # empty -- and clear a pull that has to fit on the root disk. That blindness
+    # would only show up for exactly the submissions this feature exists for, and
+    # first on a multi-stage one: each stage pulls its own image onto the same
+    # per-VM store. See open item 3 of cinder_volumes_plan.md.
+    workspace = submission.get("workspace_dir") or "/tmp"
+    shared = not workspace_has_own_filesystem(workspace)
+    measured = workspace if shared else IMAGE_STORE_PATH
     try:
-        free = shutil.disk_usage(path).free
+        free = shutil.disk_usage(measured).free
     except OSError:
-        logging.warning("Could not determine free space for %s", path, exc_info=True)
+        logging.warning("Could not determine free space for %s", measured, exc_info=True)
         return None
 
-    # The floor is included because the pull has to leave the run somewhere to
-    # work: filling the disk to within a byte of DISK_FLOOR_BYTES only moves the
-    # same failure to the first thing the analysis writes.
-    required = needed + DISK_FLOOR_BYTES
+    # On a shared filesystem the floor is part of what the pull must leave
+    # behind: filling the disk to within a byte of it only moves the same failure
+    # to the first thing the analysis writes. On a volume-backed run the floor
+    # belongs to the *other* filesystem, where disk_shortfall guards it, so
+    # requiring it here would refuse pulls that fit.
+    floor = disk_floor_bytes(submission) if shared else 0
+    required = needed + floor
     if free >= required:
         return None
+    if shared:
+        return (
+            f"Not enough disk space to pull {image_reference}: "
+            f"{free / 1024**3:.1f} GiB free on the workspace filesystem, but the image "
+            f"needs about {needed / 1024**3:.1f} GiB ({how}) plus a "
+            f"{floor / 1024**3:.1f} GiB working reserve. The replication "
+            "package, its outputs and the analysis image all share this worker's disk, "
+            "and together they do not fit. Reduce the size of the package -- or, if this "
+            "work genuinely needs more room than one worker has, contact "
+            "support@sivacor.org about extra scratch disk."
+        )
+    # The scratch volume is not the constraint here and the package is not the
+    # problem, so neither is mentioned: the software image alone does not fit the
+    # worker's own disk, which is nothing the researcher can act on.
     return (
         f"Not enough disk space to pull {image_reference}: "
-        f"{free / 1024**3:.1f} GiB free on the workspace filesystem, but the image "
-        f"needs about {needed / 1024**3:.1f} GiB ({how}) plus a "
-        f"{DISK_FLOOR_BYTES / 1024**3:.1f} GiB working reserve. The replication "
-        "package, its outputs and the analysis image all share this worker's disk, "
-        "and together they do not fit. Reduce the size of the package -- or, if this "
-        "work genuinely needs more room than one worker has, contact "
-        "support@sivacor.org about extra scratch disk."
+        f"{free / 1024**3:.1f} GiB free on the worker's own disk, but the image needs "
+        f"about {needed / 1024**3:.1f} GiB ({how}). Your extra scratch disk holds the "
+        "replication package and is not what is short -- the software image is "
+        "unpacked onto the worker itself. Please contact support@sivacor.org."
     )
 
 
