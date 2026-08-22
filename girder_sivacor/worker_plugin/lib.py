@@ -699,6 +699,22 @@ def workspace_usage(submission) -> int:
     return directory_usage(submission.get("workspace_dir"), submission.get("tmp_dir"))
 
 
+# Both disk messages below point at support@sivacor.org rather than naming
+# `resources.disk_gb`, and that is deliberate.
+#
+# Extra scratch disk exists, but it is granted per user and there is no UI for asking
+# (C4 of cinder_volumes_plan.md is unbuilt), so naming the field would send a researcher
+# to hand-edit an exported workflow file for something they may not be approved for.
+# That is the mistake worker sizing made in the other direction: its OOM message told
+# researchers to "choose a larger worker size" and shipped an image ahead of the picker,
+# naming a control that did not yet exist.
+#
+# The earlier wording here ended "is the only thing that changes this today". True when
+# written, false the moment anyone is approved -- and a hedge like "today" still reads as
+# a factual claim and does not expire on its own. Naming the request route instead is
+# true before C4 and stays true after it.
+
+
 def disk_shortfall(submission) -> str | None:
     """Return an explanatory message if the workspace filesystem is nearly full.
 
@@ -722,7 +738,8 @@ def disk_shortfall(submission) -> str | None:
         f"Ran out of disk space: {free / 1024**3:.1f} GiB free on the workspace "
         f"filesystem, below the {DISK_FLOOR_BYTES / 1024**3:.1f} GiB floor. The "
         "replication package plus its outputs and the analysis image must fit in "
-        "the worker's disk; this submission needs more room than this worker has."
+        "the worker's disk. Reduce the size of the package, or contact "
+        "support@sivacor.org about extra scratch disk."
     )
 
 
@@ -890,8 +907,9 @@ def pull_space_shortfall(cli, submission, image_reference) -> str | None:
         f"needs about {needed / 1024**3:.1f} GiB ({how}) plus a "
         f"{DISK_FLOOR_BYTES / 1024**3:.1f} GiB working reserve. The replication "
         "package, its outputs and the analysis image all share this worker's disk, "
-        "and together they do not fit. A smaller package, or fewer files kept in "
-        "it, is the only thing that changes this today."
+        "and together they do not fit. Reduce the size of the package -- or, if this "
+        "work genuinely needs more room than one worker has, contact "
+        "support@sivacor.org about extra scratch disk."
     )
 
 

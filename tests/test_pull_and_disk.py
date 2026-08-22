@@ -158,6 +158,13 @@ def test_disk_shortfall_explains_itself_when_the_disk_is_nearly_full(tmp_path):
     assert msg is not None
     assert "Ran out of disk space" in msg
     assert "GiB" in msg
+    # Names the request route, and NOT `resources.disk_gb`. Extra scratch disk is
+    # granted per user and has no UI yet (C4), so naming the field would send a
+    # researcher to hand-edit a workflow file for something they may not be approved
+    # for -- the mistake worker sizing made in reverse, shipping an OOM message that
+    # named a picker three phases before the picker existed.
+    assert "support@sivacor.org" in msg
+    assert "disk_gb" not in msg
 
 
 def test_disk_check_never_fails_a_run_by_itself(tmp_path):
@@ -296,6 +303,12 @@ def test_the_pull_is_refused_up_front_when_the_image_cannot_fit():
     # presented as a measurement is worse than no estimate.
     assert "compressed" in msg
     assert "about" in msg
+    # The remedy, and it must not go stale. The original wording ended "is the only
+    # thing that changes this today", which was true when written and false the moment
+    # anyone was approved for extra disk.
+    assert "support@sivacor.org" in msg
+    assert "only thing that changes" not in msg
+    assert "disk_gb" not in msg
     # cli.api.pull is never reached.
     cli.api.pull.assert_not_called()
 
