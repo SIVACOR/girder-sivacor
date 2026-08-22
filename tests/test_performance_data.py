@@ -413,6 +413,23 @@ def test_performance_data_integration(
                     "the granted cap, which was already certified before item 2"
                 )
 
+                # The disk story, to the same three parts (V7 of
+                # cinder_volumes_plan.md). This submission asked for no volume,
+                # which is the ~90% case and the one worth pinning: the field has
+                # to be present and None, not absent and not 0 -- absent would
+                # make an older worker indistinguishable from a root-disk run,
+                # and 0 reads as a volume of zero size.
+                assert "RequestedDiskGB" in performance_data
+                assert performance_data["RequestedDiskGB"] is None, (
+                    "no volume was requested, and absent-vs-zero is the "
+                    "distinction the whole feature hangs on"
+                )
+                assert performance_data["WorkspaceDiskTotal"] > 0, (
+                    "MemTotal's counterpart: what the filesystem had, so "
+                    "MaxDiskUsage can be read as a fraction of it"
+                )
+                assert "MaxDiskUsage" in performance_data
+
                 # Verify that timestamps are valid
                 assert performance_data["StartedAt"] != ""
                 assert performance_data["FinishedAt"] != ""

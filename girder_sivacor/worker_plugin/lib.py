@@ -702,17 +702,40 @@ def workspace_usage(submission) -> int:
 # Both disk messages below point at support@sivacor.org rather than naming
 # `resources.disk_gb`, and that is deliberate.
 #
-# Extra scratch disk exists, but it is granted per user and there is no UI for asking
-# (C4 of cinder_volumes_plan.md is unbuilt), so naming the field would send a researcher
-# to hand-edit an exported workflow file for something they may not be approved for.
-# That is the mistake worker sizing made in the other direction: its OOM message told
-# researchers to "choose a larger worker size" and shipped an image ahead of the picker,
-# naming a control that did not yet exist.
+# Extra scratch disk is granted per user, and for almost every account the allowance is
+# zero -- so naming the field would tell the reader to set something the server will
+# refuse. That is the mistake worker sizing made in the other direction: its OOM message
+# told researchers to "choose a larger worker size" and shipped an image ahead of the
+# picker, naming a control that did not yet exist.
+#
+# C4 shipped on 2026-08-22, so "there is no UI" is no longer the reason -- but the
+# wording does not change, and the reason it does not is worth keeping: the control
+# renders *disabled* for an unapproved account and names this same address itself. The
+# route is the answer for the reader who has no allowance, and the reader who has one
+# already has a control. Both are served by naming the address rather than the field.
 #
 # The earlier wording here ended "is the only thing that changes this today". True when
 # written, false the moment anyone is approved -- and a hedge like "today" still reads as
 # a factual claim and does not expire on its own. Naming the request route instead is
 # true before C4 and stays true after it.
+
+
+def _workspace_disk_total(submission) -> int | None:
+    """Total bytes of the filesystem holding the workspace, or ``None``.
+
+    The disk counterpart of ``MemTotal``, written into ``performance_data`` so a
+    peak can be read as a fraction of what was available. On a volume-backed run
+    this is the volume; otherwise it is the worker's root disk.
+
+    Same defensive shape as :func:`disk_shortfall`: a run must never fail because
+    a *reporting* call could not be made.
+    """
+    path = submission.get("workspace_dir") or "/tmp"
+    try:
+        return shutil.disk_usage(path).total
+    except OSError:
+        logging.warning("Could not determine size of %s", path, exc_info=True)
+        return None
 
 
 def disk_shortfall(submission) -> str | None:
@@ -1035,6 +1058,22 @@ def recorded_run(api, submission, stage, env_vars, task=None):
         # None for a chain published by a server older than P1, the same reason
         # prepare_submission defaults it.
         "RequestedMemoryGB": submission.get("telemetry_requested_memory_gb"),
+        # The disk story, to the same three parts as the memory one above (V7 of
+        # cinder_volumes_plan.md): what the extra scratch volume was asked for,
+        # what the workspace filesystem actually had, and -- added after the run
+        # -- what the run peaked at (MaxDiskUsage).
+        #
+        # None rather than 0 when no volume was requested, because absent is the
+        # shape the whole feature uses for "no volume": submit_job omits the key,
+        # prepare_submission defaults it to None, and a 0 here would read as a
+        # volume of zero size rather than as the ordinary root-disk run.
+        "RequestedDiskGB": submission.get("telemetry_requested_disk_gb"),
+        # MemTotal's counterpart, and the number that makes the other two
+        # legible: 20 GiB peak means one thing on a 58 GB root disk and another
+        # on a 20 GB volume. Read from the workspace path, so on a volume-backed
+        # run it is the volume -- which is also the only place the volume's real
+        # size (after mkfs overhead) is ever observed.
+        "WorkspaceDiskTotal": _workspace_disk_total(submission),
     }
     # Machine shape for the execution record. Kept as a capability class, not
     # an identity: no hostname, no queue name, nothing naming this instance.

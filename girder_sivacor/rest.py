@@ -229,6 +229,164 @@ def user_volume_quota(user):
     return value
 
 
+#: Terminal job statuses, i.e. the point after which the volume is on its way out.
+_TERMINAL_JOB_STATUSES = (JobStatus.SUCCESS, JobStatus.ERROR, JobStatus.CANCELED)
+
+
+def _naive_utc(value):
+    """Girder writes job timestamps as naive UTC; normalise anything else to match."""
+    if not isinstance(value, datetime.datetime):
+        return None
+    return value.replace(tzinfo=None) if value.tzinfo else value
+
+
+def _volume_hours(job, now):
+    """Hours a submission's volume plausibly existed for.
+
+    Measured from the job's first RUNNING stamp (falling back to ``created``) to
+    its first terminal stamp (falling back to ``updated``, or to *now* while it
+    is still in flight).
+
+    **This brackets the submission, not the volume, and the error is known in
+    both directions.** The volume is created moments before its instance and so
+    starts a little *after* RUNNING -- under targeted assignment `submit_job`
+    marks the job RUNNING and leaves the placement to the controller, which can
+    take until ``sivacor.assignment_timeout`` -- and it is destroyed at the
+    *reap*, up to ~20 minutes after the run ends (10 min boot grace + 5 idle +
+    the timer; measured at ~18 min in CV4). So a figure here is good to within a
+    reap tail, which is what "who is spending the storage grant" needs. It is
+    not a billing record and must not be presented as one.
+    """
+    stamps = job.get("timestamps") or []
+
+    def first(statuses):
+        times = [
+            _naive_utc(stamp.get("time"))
+            for stamp in stamps
+            if stamp.get("status") in statuses and _naive_utc(stamp.get("time"))
+        ]
+        return min(times) if times else None
+
+    start = first((JobStatus.RUNNING,)) or _naive_utc(job.get("created"))
+    end = first(_TERMINAL_JOB_STATUSES)
+    if end is None:
+        end = (
+            now
+            if job.get("status") in ACTIVE_JOB_STATUSES
+            else _naive_utc(job.get("updated"))
+        )
+    if start is None or end is None or end <= start:
+        return 0.0
+    return (end - start).total_seconds() / 3600.0
+
+
+def volume_usage():
+    """Per-user scratch-volume accounting: C5.2 of cinder_volumes_plan.md.
+
+    The precondition for approving a second account, because the first question a
+    second approved user creates is "who is spending the storage grant" -- and
+    until this existed there was no way to answer it.
+
+    **Derived from job documents rather than from a ledger, deliberately.** A
+    permanent per-user record of who used how much storage would be a *new*
+    store of personal data, and the one store that outlives a submission here
+    (``sivacor_execution_record``) is lawful precisely because it carries no
+    identifier at all. Rather than argue that exception open, this reads what is
+    already there and inherits the submissions' own retention: the figures below
+    reach back exactly as far as ``sivacor.retention_days``, and no further. An
+    operator who needs a longer history should export this, not make the server
+    remember it.
+
+    Approved accounts with no volume submissions are listed too, with zeroes. An
+    allowance nobody has spent is still an allowance against the quota, and
+    leaving it out would make the grant look smaller than it is.
+    """
+    # Naive UTC, to match what pymongo hands back: Girder writes aware UTC
+    # timestamps, but reads them from Mongo without a timezone, so a job just
+    # written and a job loaded later disagree about tzinfo. _naive_utc settles
+    # that for the stored values; this is the same convention for "now".
+    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    users = {}
+
+    def slot(user_id, user=None):
+        key = str(user_id)
+        if key not in users:
+            user = user or User().load(user_id, force=True)
+            users[key] = {
+                "user_id": key,
+                "login": (user or {}).get("login"),
+                "ceiling_gb": user_volume_quota(user),
+                "submissions": 0,
+                "gb_hours": 0.0,
+                "largest_gb": 0,
+                "live_gb": 0,
+                "last_at": None,
+            }
+        return users[key]
+
+    for user in User().find({USER_VOLUME_QUOTA_FIELD: {"$gt": 0}}):
+        slot(user["_id"], user)
+
+    jobs = Job().collection.find(
+        {
+            "type": "sivacor_submission",
+            "meta.requested_disk_gb": {"$exists": True, "$ne": None},
+        },
+        # Never pull kwargs: they carry the submission's encrypted secrets, and
+        # an aggregation has no business holding them even in memory.
+        projection={
+            "userId": 1,
+            "status": 1,
+            "created": 1,
+            "updated": 1,
+            "timestamps": 1,
+            "meta.requested_disk_gb": 1,
+        },
+    )
+    for job in jobs:
+        if not job.get("userId"):
+            continue
+        gb = (job.get("meta") or {}).get("requested_disk_gb")
+        if not isinstance(gb, int) or isinstance(gb, bool) or gb <= 0:
+            continue
+        entry = slot(job["userId"])
+        entry["submissions"] += 1
+        entry["gb_hours"] += gb * _volume_hours(job, now)
+        entry["largest_gb"] = max(entry["largest_gb"], gb)
+        if job.get("status") in ACTIVE_JOB_STATUSES:
+            entry["live_gb"] += gb
+        created = _naive_utc(job.get("created"))
+        if created and (entry["last_at"] is None or created > entry["last_at"]):
+            entry["last_at"] = created
+
+    rows = []
+    for entry in users.values():
+        entry["gb_hours"] = round(entry["gb_hours"], 2)
+        entry["last_at"] = entry["last_at"].isoformat() + "Z" if entry["last_at"] else None
+        rows.append(entry)
+    # Biggest spender first: the operator's question is who, not when.
+    rows.sort(key=lambda row: (-row["gb_hours"], row["login"] or ""))
+
+    return {
+        "enabled": volumes_enabled(),
+        "deployment_gb": volume_total_gb(),
+        "granularity_gb": VOLUME_GRANULARITY_GB,
+        # The window these figures cover, so a small total is not mistaken for a
+        # quiet month when it is really a short retention window.
+        "retention_days": Setting().get(PluginSettings.RETENTION_DAYS),
+        "users": rows,
+        "totals": {
+            "approved_users": sum(1 for row in rows if row["ceiling_gb"] > 0),
+            "granted_gb": sum(row["ceiling_gb"] for row in rows),
+            "submissions": sum(row["submissions"] for row in rows),
+            "gb_hours": round(sum(row["gb_hours"] for row in rows), 2),
+            # What is out right now, against the deployment's reservation: the
+            # one figure that says whether the next request can be honoured.
+            "live_gb": sum(row["live_gb"] for row in rows),
+        },
+    }
+
+
 def resolve_volume_gb(workflow, user):
     """Return the scratch-volume size this workflow may have, in GB, or ``None``.
 
@@ -528,6 +686,7 @@ class SIVACOR(Resource):
         self.route("GET", ("image_tags",), self.get_image_tags)
         self.route("GET", ("worker_sizes",), self.get_worker_sizes)
         self.route("GET", ("volume_quota",), self.get_volume_quota)
+        self.route("GET", ("volume_usage",), self.get_volume_usage)
         self.route("PUT", ("user", ":id", "volume_quota"), self.set_volume_quota)
         self.route("GET", ("workflow_schema",), self.get_workflow_schema)
         self.route("GET", ("fs", "manifest"), self.get_fs_manifest)
@@ -1242,6 +1401,30 @@ class SIVACOR(Resource):
             # would otherwise have to describe as "too large" with no number.
             "deployment_gb": volume_total_gb(),
         }
+
+    @access.admin
+    @autoDescribeRoute(
+        Description("Per-user scratch-volume accounting, in GB-hours.").notes(
+            "C5.2 of cinder_volumes_plan.md, and the precondition for approving "
+            "a second account: it answers 'who is spending the storage grant'.\n\n"
+            "Admin-only and deliberately user-attributed -- unlike "
+            "/sivacor/execution_record, which is anonymous by design and must "
+            "stay that way. Nothing here is stored: it is derived from job "
+            "documents on each call, so it reaches back exactly as far as "
+            "'sivacor.retention_days' and no further. Export it if you need a "
+            "longer history; do not make the server remember one.\n\n"
+            "'gb_hours' brackets the *submission*, not the volume: the volume "
+            "appears moments before its instance and is destroyed at the reap, "
+            "up to ~20 minutes after the run ends. Good to within a reap tail, "
+            "which is what a budget question needs -- not a billing record.\n\n"
+            "Approved accounts that have spent nothing are listed with zeroes, "
+            "because an unspent allowance still stands against the quota.\n\n"
+            "Volume gigabytes come out of the storage allocation, not the SU "
+            "budget that pays for worker instance-hours (open item 6)."
+        )
+    )
+    def get_volume_usage(self):
+        return volume_usage()
 
     @access.admin
     @autoDescribeRoute(
