@@ -402,7 +402,12 @@ def test_the_preflight_check_never_fails_a_run_by_itself():
 VOLUME_GB = 20
 
 
-def _split_filesystems(volume_free, root_free, volume_total=VOLUME_GB * 1000**3):
+#: **Cinder sizes are GiB, not decimal GB.** Verified 2026-08-22: the 20 GB volume
+#: from open item 4's probe reported `20G` total under `df -h`, which counts in
+#: powers of 1024 -- a decimal 20 GB device would have printed 19G. So a "20 GB"
+#: volume is 20 * 2**30, and the floor on it is 2.0 GiB rather than the 1.9 an
+#: earlier version of this fixture computed from decimal gigabytes.
+def _split_filesystems(volume_free, root_free, volume_total=VOLUME_GB * 1024**3):
     """Patch in a workspace on its own filesystem, with per-path free space."""
     def usage(path):
         if path == "/":
@@ -434,7 +439,7 @@ def test_the_floor_on_a_volume_is_a_share_of_the_volume():
     own_fs, usage = _split_filesystems(volume_free=10 * 1024**3, root_free=40 * 1024**3)
     with own_fs, usage:
         floor = disk_floor_bytes({"workspace_dir": "/home/ubuntu/volumes/tmp"})
-    assert floor == int(VOLUME_GB * 1000**3 * 0.1)
+    assert floor == int(VOLUME_GB * 1024**3 * 0.1)
     assert floor < DISK_FLOOR_BYTES, "this may only ever lower a floor"
 
 
@@ -454,9 +459,8 @@ def test_a_volume_that_is_genuinely_nearly_full_still_stops_the_run():
     with own_fs, usage:
         msg = disk_shortfall({"workspace_dir": "/home/ubuntu/volumes/tmp"})
     assert msg is not None and "Ran out of disk space" in msg
-    # The floor it names is the one it used, not the constant. 10% of 20 decimal
-    # GB is 1.9 GiB, which is also a reminder that the two units differ.
-    expected = f"{int(VOLUME_GB * 1000**3 * 0.1) / 1024**3:.1f} GiB floor"
+    # The floor it names is the one it used, not the constant: 10% of 20 GiB.
+    expected = f"{int(VOLUME_GB * 1024**3 * 0.1) / 1024**3:.1f} GiB floor"
     assert expected in msg, msg
     assert f"{DISK_FLOOR_BYTES / 1024**3:.1f} GiB floor" not in msg
 
@@ -471,7 +475,7 @@ def test_the_preflight_check_measures_where_the_image_actually_lands():
     """
     cli = _cold_client()
     own_fs, usage = _split_filesystems(
-        volume_free=80 * 1024**3, root_free=4 * 1024**3, volume_total=100 * 1000**3
+        volume_free=80 * 1024**3, root_free=4 * 1024**3, volume_total=100 * 1024**3
     )
     with own_fs, usage:
         msg = pull_space_shortfall(cli, {"workspace_dir": "/home/ubuntu/volumes/tmp"}, DYNARE)
