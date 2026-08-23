@@ -357,17 +357,24 @@ def test_an_unknown_image_family_is_never_pre_judged():
         assert pull_space_shortfall(cli, {"workspace_dir": "/tmp/w"}, "who/what:1") is None
 
 
-def test_the_dynare_estimate_matches_what_the_codebase_already_documents():
-    """~16 GiB, independently: 6.3 GiB compressed at 2.5x.
+def test_the_dynare_estimate_matches_the_measured_footprint():
+    """~21.6 GiB: 6.3 GiB compressed at 3.5x.
 
-    pull_image's own docstring has said "a cold dynare pull is ~15 GB" since
-    before this check existed, from a different source. The two agreeing is the
-    only validation the multiplier has, so pin it.
+    This used to pin 14-18 GiB and cross-check pull_image's docstring claim that a
+    cold dynare pull is "~15 GB" -- the only validation the multiplier had, and the
+    guard that caught a per-family ratio being introduced on a misread measurement.
+
+    It is now pinned against a *direct* measurement instead: on a VM built exactly
+    like a worker, dynare's footprint is **21.00 GiB** for 6.16 GiB compressed
+    (3.41x), corroborated by `docker system df -v` at 22.5 GB. So ~15 GB was itself
+    an under-estimate, and 2.5x was too optimistic rather than too pessimistic.
     """
     cli = _cold_client()
     needed, how = image_on_disk_estimate(cli, DYNARE)
-    assert 14 * 1024**3 < needed < 18 * 1024**3
-    assert "2.5x" in how
+    # The real footprint is 21.00 GiB; the estimate must not fall below it.
+    assert needed >= 21 * 1024**3, needed / 1024**3
+    assert needed < 23 * 1024**3, "and not wildly above it either"
+    assert "3.5x" in how
 
     # And the spread that explains why only dynare has ever caused this: a Stata
     # pull is an order of magnitude smaller and essentially cannot fill a disk.
@@ -494,9 +501,15 @@ def test_a_pull_is_not_charged_the_workspace_floor_on_another_filesystem():
 
     The image fits where it is going, so the pull proceeds. Whether the *run*
     then has room is disk_shortfall's question, on the other filesystem.
+
+    **root_free was 20 GiB until 2026-08-22 and had to move to 30.** Not because
+    this behaviour changed, but because dynare's footprint was then measured at
+    21 GiB: 20 GiB of free space genuinely is not enough for that pull, so refusing
+    it became the right answer and this fixture had been asserting the opposite by
+    accident. A measurement that lands in a constant lands in test data too.
     """
     cli = _cold_client()
-    own_fs, usage = _split_filesystems(volume_free=1 * 1024**3, root_free=20 * 1024**3)
+    own_fs, usage = _split_filesystems(volume_free=1 * 1024**3, root_free=30 * 1024**3)
     with own_fs, usage:
         assert (
             pull_space_shortfall(cli, {"workspace_dir": "/home/ubuntu/volumes/tmp"}, DYNARE)
@@ -576,6 +589,6 @@ def test_the_unpack_multiplier_is_flat_across_families():
     cli = _cold_client()
     dynare_needed, dynare_how = image_on_disk_estimate(cli, DYNARE)
     stata_needed, stata_how = image_on_disk_estimate(_cold_client(), IMAGE)
-    assert "2.5x" in dynare_how and "2.5x" in stata_how
-    assert dynare_needed == int(6.3 * 1024**3 * 2.5)
-    assert stata_needed == int(0.5 * 1024**3 * 2.5)
+    assert "3.5x" in dynare_how and "3.5x" in stata_how
+    assert dynare_needed == int(6.3 * 1024**3 * 3.5)
+    assert stata_needed == int(0.5 * 1024**3 * 3.5)

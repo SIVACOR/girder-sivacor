@@ -857,15 +857,48 @@ def disk_shortfall(submission) -> str | None:
 #:
 #: A manifest reports the size of each compressed layer blob; what lands in
 #: ``/var/lib/docker`` is those layers extracted, and every layer that rewrites a
-#: file from a lower one is stored in full again. 2.5 is deliberately on the
-#: conservative side of the 2-3x this usually lands in, because the two ways to be
-#: wrong are not symmetric: over-estimating refuses a pull that would have fitted,
-#: which the researcher sees as a false accusation, while under-estimating merely
-#: lets the pull fail the way it does today. So the pre-flight check is only ever
-#: allowed to catch the *unambiguous* cases; :func:`_is_out_of_space` is what
-#: catches the rest, from the pull's own error text.
+#: file from a lower one is stored in full again.
+#:
+#: **3.5, raised from 2.5 on 2026-08-22 because 2.5 was measured to be an
+#: UNDER-estimate.** Measured on a purpose-built `m3.medium` running
+#: `Featured-Ubuntu24` and `apt-get install docker.io` exactly as
+#: ``worker-cloud-init.sh`` does -- so, a worker in every respect that matters:
+#:
+#: ==========================  ==========  =========  =====
+#: image                       compressed  footprint  ratio
+#: ==========================  ==========  =========  =====
+#: ``dynare:6.1-R2024a``       6.16 GiB    21.00 GiB  3.41x
+#: ``rocker/r-ver:4.6.1``      0.34 GiB     1.26 GiB  3.69x
+#: ==========================  ==========  =========  =====
+#:
+#: "Footprint" is the **free-space delta on the image store filesystem**, which is
+#: the quantity this check actually compares against, corroborated by
+#: ``docker system df -v`` (22.5 GB and 1.35 GB). Transient peak equalled the
+#: resting footprint -- sampled every 2 s across a 141 s pull -- so there is no
+#: extra headroom to reserve for the pull itself.
+#:
+#: **Why it is so much more than "extracted layers".** Workers run docker.io 29,
+#: whose default image store is containerd's (`io.containerd.snapshotter.v1`,
+#: confirmed on the same VM). That keeps the compressed blobs in the content store
+#: *and* materialises a snapshot per layer, so a rewritten file is stored in the
+#: blob, in its own layer's snapshot, and again in the layer above.
+#:
+#: **The asymmetry that justified 2.5 has flipped.** It said over-estimating
+#: refuses a pull that would have fitted while under-estimating "merely lets the
+#: pull fail the way it does today" -- true when a failed pull was mislabelled
+#: ``image_pull_failed``. Since C0.1, ENOSPC is labelled ``out_of_disk`` correctly,
+#: so the cost of under-estimating is now a *correct* failure 141 seconds and a
+#: whole image download later, and the cost of over-estimating is a fast refusal.
+#: Catching it early is worth more than it used to be.
+#:
+#: 3.5 covers dynare's 3.41 -- the family responsible for every ENOSPC failure here
+#: and the one with by far the largest absolute error -- with a small margin. It
+#: sits 0.19 below rocker's 3.69, where that gap is 0.07 GiB of a 1.26 GiB image and
+#: cannot decide anything. **``dataeditors`` footprint is still unmeasured**: its
+#: unpacked ratios are 2.26-2.82x, so 3.5 is plausible for it, and the same probe
+#: settles it by pulling a Stata image instead.
 IMAGE_ON_DISK_MULTIPLIER = float(
-    os.environ.get("SIVACOR_IMAGE_ON_DISK_MULTIPLIER", "2.5")
+    os.environ.get("SIVACOR_IMAGE_ON_DISK_MULTIPLIER", "3.5")
 )
 
 #: Fragments docker uses when a write fails for want of space. Matched
@@ -924,12 +957,11 @@ def _is_out_of_space(error_text) -> bool:
 #: so much smaller than the disk it costs, and it is independent corroboration of
 #: pull_image's long-standing "~15 GB" figure rather than a refutation of it.
 #:
-#: So 2.5x is roughly right for dynare (real ~2.0x) and mildly *optimistic* for
-#: rocker and dataeditors (real ~3.3-3.6x). **Not adjusted**, because the honest
-#: number needs one measurement nobody has taken: the free-space delta on a worker
-#: across a cold pull, or ``docker system df -v`` on a live one. Until then the
-#: constant stays where it is and this note records why -- see section 4b of
-#: cinder_volumes_plan.md.
+#: **The measurement was then taken, and it says 3.41x for dynare** -- 6.16 GiB
+#: compressed becomes a **21 GiB** footprint, because the containerd store keeps the
+#: blobs *and* a snapshot per layer. So neither reading above was right: 2.5x was not
+#: too pessimistic, it was too *optimistic*. :data:`IMAGE_ON_DISK_MULTIPLIER` carries
+#: the numbers and how they were obtained.
 #:
 #: A family with no entry is **not** pre-checked -- see :func:`image_on_disk_estimate`
 #: for why guessing high is the worse error. Per-tag figures are available live from
