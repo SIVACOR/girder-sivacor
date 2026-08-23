@@ -1128,7 +1128,9 @@ def pull_image(cli, api, submission, image_reference):
 
     ``images.pull()`` blocks and emits nothing. Analysis images are pulled on
     demand rather than baked into the worker image, and a cold dynare pull is
-    ~15 GB on disk, so that silence can run for many minutes. Meanwhile the
+    **21 GiB on disk** (measured 2026-08-22; this docstring said ~15 GB, which was
+    itself an under-estimate -- see :data:`IMAGE_ON_DISK_MULTIPLIER`), so that
+    silence can run for many minutes. Meanwhile the
     server's liveness signal is ``max(meta.heartbeat, job.updated,
     job.created)`` measured against ``sivacor.heartbeat_timeout`` (default 30
     min) -- so a large enough pull races the reaper, and losing that race shows
