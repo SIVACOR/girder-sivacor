@@ -551,3 +551,31 @@ def test_a_full_volume_is_not_told_to_ask_for_a_volume():
     assert "about extra scratch disk" not in msg
     # Still not naming the field: an allowance is raised by asking, not by editing.
     assert "disk_gb" not in msg
+
+
+# --- C5.3: why the flat 2.5x multiplier stays -------------------------------
+#
+# Measured 2026-08-22, same tag on both sides: dynare 6.16 GiB compressed -> 6.21
+# unpacked (1.01x), rocker/r-ver 2.58x, dataeditors 2.26-2.82x. On those numbers
+# alone 2.5x looks 2.5x too pessimistic for dynare, and a per-family ratio looks
+# like the fix -- it was written, and then reverted, because the fleet keeps both
+# copies: docker.io 29's containerd image store retains the compressed blobs *and*
+# the snapshot, so the real footprint is roughly compressed + unpacked. 2.5x is
+# therefore about right for dynare and mildly optimistic for the rest.
+#
+# The test below exists to stop the same well-reasoned wrong change being made
+# twice.
+
+
+def test_the_unpack_multiplier_is_flat_across_families():
+    """Deliberately not per-family. See the note above and section 4b of the plan.
+
+    A measurement of unpacked-vs-compressed is NOT a measurement of footprint on
+    a containerd image store, and only the second one licenses changing this.
+    """
+    cli = _cold_client()
+    dynare_needed, dynare_how = image_on_disk_estimate(cli, DYNARE)
+    stata_needed, stata_how = image_on_disk_estimate(_cold_client(), IMAGE)
+    assert "2.5x" in dynare_how and "2.5x" in stata_how
+    assert dynare_needed == int(6.3 * 1024**3 * 2.5)
+    assert stata_needed == int(0.5 * 1024**3 * 2.5)

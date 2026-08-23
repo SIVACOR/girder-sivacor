@@ -906,9 +906,30 @@ def _is_out_of_space(error_text) -> bool:
 #: the check's job is to catch the case that will not fit.
 #:
 #: **The spread is the point, and it is why only one family has ever caused this
-#: failure.** dynare is ~13x a Stata image: 6.3 GiB compressed is ~16 GiB on disk,
-#: against ~1.3 GiB for Stata. All four of the production pull failures this check
-#: was written for were dynare, and a Stata pull essentially cannot cause one.
+#: failure.** dynare is ~5x a Stata image on disk: 6.2 GiB against ~1.2 GiB. All
+#: four of the production pull failures this check was written for were dynare, and
+#: a Stata pull essentially cannot cause one.
+#:
+#: **Refined 2026-08-22 (C5.3), and the multiplier survives the scrutiny.** Measured
+#: unpack ratios, same tag on both sides: dynare 6.16 GiB compressed -> 6.21 GiB
+#: unpacked (**1.01x** -- an already-compressed MATLAB runtime), rocker/r-ver 2.58x,
+#: dataeditors 2.26-2.82x. Taken alone that made 2.5x look 2.5x too pessimistic for
+#: dynare, and a per-family ratio looked like the fix.
+#:
+#: **It is not, because the fleet keeps both copies.** Workers install docker.io 29,
+#: whose default image store is containerd's: compressed blobs stay in the content
+#: store *and* the unpacked snapshot is created, so a resting footprint is roughly
+#: compressed + unpacked -- ~12.4 GiB for dynare, not 6.2. That is why
+#: ``ImageSize`` (which reports only the content-store half; see recorded_run) reads
+#: so much smaller than the disk it costs, and it is independent corroboration of
+#: pull_image's long-standing "~15 GB" figure rather than a refutation of it.
+#:
+#: So 2.5x is roughly right for dynare (real ~2.0x) and mildly *optimistic* for
+#: rocker and dataeditors (real ~3.3-3.6x). **Not adjusted**, because the honest
+#: number needs one measurement nobody has taken: the free-space delta on a worker
+#: across a cold pull, or ``docker system df -v`` on a live one. Until then the
+#: constant stays where it is and this note records why -- see section 4b of
+#: cinder_volumes_plan.md.
 #:
 #: A family with no entry is **not** pre-checked -- see :func:`image_on_disk_estimate`
 #: for why guessing high is the worse error. Per-tag figures are available live from
@@ -920,6 +941,7 @@ _IMAGE_FAMILY_COMPRESSED_GB = {
     "rocker": 1.5,
     "dataeditors": 0.5,
 }
+
 
 
 def image_on_disk_estimate(cli, image_reference) -> tuple[int, str] | None:
@@ -1410,11 +1432,36 @@ def recorded_run(api, submission, stage, env_vars, task=None):
         performance_data.update({"DockerRunArgs": json.dumps(container_kwargs)})
         # The two halves of "how much disk did this run need": the workspace it
         # grew, and the image it had to have on the machine first. Kept apart
-        # because only the first is the researcher's to control, and a Stata
-        # image alone is several GiB -- reporting the sum would make every
-        # Stata run look like a storage hog.
+        # because only the first is the researcher's to control, and an analysis
+        # image is a gigabyte or more on its own -- reporting the sum would make
+        # every Stata run look like a storage hog.
         performance_data["MaxDiskUsage"] = peak_disk
         try:
+            # **ImageSize is the COMPRESSED size on this fleet, not the on-disk
+            # footprint**, and the difference is a factor of ~2.5 for every family
+            # except dynare. Measured 2026-08-22 (C5.3): a rocker/r-ver:4.6.1 run
+            # recorded 0.341 GiB, exactly that image's compressed manifest total,
+            # while the same image occupies 0.88 GiB unpacked under a classic
+            # overlay2 docker.
+            #
+            # docker's `Size` normally means unpacked. The likely cause is the
+            # containerd image store, which accounts the content store rather than
+            # the snapshot -- unconfirmed, and one `docker info | grep -i
+            # snapshotter` on a worker settles it. The measurement holds either way.
+            #
+            # **So do not add this to MaxDiskUsage and call it disk used.** C5.3's
+            # first pass did exactly that and understated every image by the
+            # compression ratio. Worse, the footprint is not even the unpacked size:
+            # docker.io 29 defaults to the containerd image store, which keeps the
+            # compressed blobs *and* the snapshot, so the disk cost is roughly
+            # compressed + unpacked -- about twice this figure for dynare and ~3.5x
+            # for the others.
+            #
+            # The raw figure is kept as-is rather than converted here, because what a
+            # run *reports* should be what it observed, not a derived number a later
+            # reader cannot check. The conversion belongs wherever a footprint is
+            # actually needed, and _IMAGE_FAMILY_COMPRESSED_GB's note says what is
+            # still unmeasured about it.
             performance_data["ImageSize"] = cli.images.get(image_reference).attrs["Size"]
         except Exception:
             logging.warning("Could not determine size of %s", image_reference, exc_info=True)
