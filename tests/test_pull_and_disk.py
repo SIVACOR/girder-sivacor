@@ -18,6 +18,7 @@ import pytest
 from girder_sivacor.errors import FailureCode, SubmissionError
 from girder_sivacor.worker_plugin.lib import (
     DISK_FLOOR_BYTES,
+    _IMAGE_FAMILY_COMPRESSED_GB,
     HEARTBEAT_INTERVAL,
     _is_out_of_space,
     disk_floor_bytes,
@@ -377,9 +378,14 @@ def test_the_dynare_estimate_matches_the_measured_footprint():
     assert "3.5x" in how
 
     # And the spread that explains why only dynare has ever caused this: a Stata
-    # pull is an order of magnitude smaller and essentially cannot fill a disk.
+    # pull is several times smaller and essentially cannot fill a disk. Measured
+    # footprints put it at 21.0 vs 2.68 GiB, i.e. ~7.8x; the estimates give ~7x.
+    #
+    # This assertion read `* 8` until 2026-08-22 and now reads `* 6`, because the
+    # *Stata* entry was corrected upward from 0.5 to 0.9 GiB. The spread narrowed
+    # because the small side was wrong, not because dynare moved.
     stata_needed, _ = image_on_disk_estimate(_cold_client(), IMAGE)
-    assert stata_needed * 8 < needed
+    assert stata_needed * 6 < needed, (stata_needed, needed)
 
 
 def test_the_preflight_check_never_fails_a_run_by_itself():
@@ -591,4 +597,24 @@ def test_the_unpack_multiplier_is_flat_across_families():
     stata_needed, stata_how = image_on_disk_estimate(_cold_client(), IMAGE)
     assert "3.5x" in dynare_how and "3.5x" in stata_how
     assert dynare_needed == int(6.3 * 1024**3 * 3.5)
-    assert stata_needed == int(0.5 * 1024**3 * 3.5)
+    assert stata_needed == int(0.9 * 1024**3 * 3.5)
+
+
+def test_the_family_entry_is_the_largest_image_in_that_family():
+    """The table's stated rule, pinned because it stopped being true unnoticed.
+
+    `dataeditors` held 0.5 GiB while its largest image, stata19_5-mp-i-python, is
+    0.89 GiB compressed -- so the family's biggest member was under-estimated by
+    1.8x. Measured footprints for the family are 1.73 and 2.68 GiB.
+    """
+    assert _IMAGE_FAMILY_COMPRESSED_GB["dataeditors"] >= 0.89
+    assert _IMAGE_FAMILY_COMPRESSED_GB["dynare"] >= 6.16
+    assert _IMAGE_FAMILY_COMPRESSED_GB["rocker"] >= 1.4
+
+    # And the estimate it produces must clear the measured footprint of the largest
+    # image in each family, which is the whole point of the two constants together.
+    cli = _cold_client()
+    stata_needed, _ = image_on_disk_estimate(cli, IMAGE)
+    assert stata_needed >= 2.68 * 1024**3, stata_needed / 1024**3
+    dynare_needed, _ = image_on_disk_estimate(_cold_client(), DYNARE)
+    assert dynare_needed >= 21.0 * 1024**3, dynare_needed / 1024**3

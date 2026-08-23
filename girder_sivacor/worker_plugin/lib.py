@@ -864,12 +864,14 @@ def disk_shortfall(submission) -> str | None:
 #: `Featured-Ubuntu24` and `apt-get install docker.io` exactly as
 #: ``worker-cloud-init.sh`` does -- so, a worker in every respect that matters:
 #:
-#: ==========================  ==========  =========  =====
-#: image                       compressed  footprint  ratio
-#: ==========================  ==========  =========  =====
-#: ``dynare:6.1-R2024a``       6.16 GiB    21.00 GiB  3.41x
-#: ``rocker/r-ver:4.6.1``      0.34 GiB     1.26 GiB  3.69x
-#: ==========================  ==========  =========  =====
+#: ===================================  ==========  =========  =====
+#: image                                compressed  footprint  ratio
+#: ===================================  ==========  =========  =====
+#: ``dynare:6.1-R2024a``                6.16 GiB    21.00 GiB  3.41x
+#: ``rocker/r-ver:4.6.1``               0.34 GiB     1.26 GiB  3.69x
+#: ``stata19-mp:2026-06-03``            0.52 GiB     1.73 GiB  3.33x
+#: ``stata19_5-mp-i-python:2026-06-03`` 0.89 GiB     2.68 GiB  3.01x
+#: ===================================  ==========  =========  =====
 #:
 #: "Footprint" is the **free-space delta on the image store filesystem**, which is
 #: the quantity this check actually compares against, corroborated by
@@ -891,12 +893,17 @@ def disk_shortfall(submission) -> str | None:
 #: whole image download later, and the cost of over-estimating is a fast refusal.
 #: Catching it early is worth more than it used to be.
 #:
-#: 3.5 covers dynare's 3.41 -- the family responsible for every ENOSPC failure here
-#: and the one with by far the largest absolute error -- with a small margin. It
-#: sits 0.19 below rocker's 3.69, where that gap is 0.07 GiB of a 1.26 GiB image and
-#: cannot decide anything. **``dataeditors`` footprint is still unmeasured**: its
-#: unpacked ratios are 2.26-2.82x, so 3.5 is plausible for it, and the same probe
-#: settles it by pulling a Stata image instead.
+#: **All three families are now measured** (dataeditors added 2026-08-22, same
+#: method, same gate). 3.5 covers dynare's 3.41 -- the family responsible for every
+#: ENOSPC failure here and the one with by far the largest absolute error -- and
+#: dataeditors' 3.01-3.33, with a small margin over each. It sits 0.19 below rocker's
+#: 3.69, where that gap is 0.06 GiB of a 1.26 GiB image and cannot decide anything.
+#:
+#: Note the ratio *falls* as an image grows (3.69 -> 3.33 -> 3.01 -> 3.41), because
+#: the per-layer duplication that drives it depends on how much each layer rewrites
+#: rather than on total size. So a single multiplier is the right shape here; what it
+#: cannot absorb is a family whose *compressed* entry is wrong, which is a separate
+#: table and a separate failure -- see :data:`_IMAGE_FAMILY_COMPRESSED_GB`.
 IMAGE_ON_DISK_MULTIPLIER = float(
     os.environ.get("SIVACOR_IMAGE_ON_DISK_MULTIPLIER", "3.5")
 )
@@ -971,7 +978,17 @@ def _is_out_of_space(error_text) -> bool:
 _IMAGE_FAMILY_COMPRESSED_GB = {
     "dynare": 6.3,
     "rocker": 1.5,
-    "dataeditors": 0.5,
+    # 0.9, not the 0.5 this held until 2026-08-22. The table's own rule is "the
+    # largest tag seen in that family", and 0.5 had stopped satisfying it:
+    # dataeditors/stata19_5-mp-i-python:2026-06-03 is 0.89 GiB compressed, so the
+    # family's biggest image was being estimated at 1.75 GiB against a measured
+    # 2.68 GiB footprint. Small in absolute terms against a 5 GiB floor, and the
+    # same class of error as the multiplier it multiplies.
+    #
+    # The cost of the correction is over-estimating the *smaller* Stata images by
+    # ~1.3 GiB, which is affordable precisely because Stata footprints are small:
+    # the check has ~6 GiB of slack in the cases where a Stata pull is decided.
+    "dataeditors": 0.9,
 }
 
 
