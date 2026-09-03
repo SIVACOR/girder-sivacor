@@ -117,6 +117,17 @@ full story.
 The rationale is written up for review in
 `../aea-sivacor/LEGITIMATE_INTERESTS_ASSESSMENT.md`.
 
+## `test_girder_upload_race.py` — 2 xfails that are supposed to fail
+
+The suite reports **2 xfailed**, and that is the healthy state. That file tests
+*Girder's* upload model, not ours: it reproduces an upstream bug where a failed
+chunk's rollback truncates other chunks' bytes and the upload still finalises,
+leaving a file document larger than its blob. Both tests are
+`xfail(strict=True)`, so **a pass is a failure** — it means upstream fixed the
+bug and the mitigation in `rest.py` (`verify_upload_complete`, and
+`GET /sivacor/upload_integrity`) can be reconsidered. If you see `xpassed`, read
+`../development_notes/girder_upload_race_plan.md` before deleting anything.
+
 ## `tools/` — operator scripts, and not scratch
 
 `tools/assetstore_integrity.py` compares every Girder file document's `size`
