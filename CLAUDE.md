@@ -117,6 +117,31 @@ full story.
 The rationale is written up for review in
 `../aea-sivacor/LEGITIMATE_INTERESTS_ASSESSMENT.md`.
 
+## `tools/` — operator scripts, and not scratch
+
+`tools/assetstore_integrity.py` compares every Girder file document's `size`
+against the blob it points at, and separately looks for uploads whose
+`received` counter has outrun their temp file. Read-only. It exists because
+Girder can finalise an upload whose stored copy is *shorter* than its
+document, and nothing else in the stack notices until something reads the whole
+file — see `../development_notes/girder_upload_race_plan.md`.
+
+Run it inside the girder container, which already has pymongo and the
+assetstore mounted:
+
+```sh
+docker exec -i $(docker ps -qf name=wt_girder) \
+    python3 - < tools/assetstore_integrity.py --verify-hash
+```
+
+Two results worth knowing before you read its output: a missing temp file is
+ordinary debris (an abandoned upload outlives its temp file), which is why
+those are counted rather than listed; and its first production run reported 0
+short blobs among 177 documents, because the two known-corrupt files had
+already gone away with their deleted submissions.
+
+Unlike the files below, this directory *is* part of the repo.
+
 ## Scratch files — not part of the plugin
 
 Root `aaa.py` / `ddd.py` / `debug.py` / `ala.py` / `foobar/`, the `*.patch`
