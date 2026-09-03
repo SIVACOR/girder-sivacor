@@ -414,7 +414,9 @@ def stata_license_mount_source(api, submission, host_tmp_root: str) -> str:
     container_path = os.path.join(submission["tmp_dir"], "stata.lic")
     with open(container_path, "w") as fp:
         fp.write(license_text if license_text.endswith("\n") else license_text + "\n")
-    os.chmod(container_path, 0o644)  # read-only mount, but the container's uid must read it
+    os.chmod(
+        container_path, 0o644
+    )  # read-only mount, but the container's uid must read it
     logging.info("Materialized Stata license for submission %s", submission["job_id"])
     return os.path.join(host_tmp_root, container_path.lstrip("/"))
 
@@ -992,7 +994,6 @@ _IMAGE_FAMILY_COMPRESSED_GB = {
 }
 
 
-
 def image_on_disk_estimate(cli, image_reference) -> tuple[int, str] | None:
     """Estimate what pulling ``image_reference`` will add to the disk.
 
@@ -1081,7 +1082,9 @@ def pull_space_shortfall(cli, submission, image_reference) -> str | None:
     try:
         free = shutil.disk_usage(measured).free
     except OSError:
-        logging.warning("Could not determine free space for %s", measured, exc_info=True)
+        logging.warning(
+            "Could not determine free space for %s", measured, exc_info=True
+        )
         return None
 
     # On a shared filesystem the floor is part of what the pull must leave
@@ -1176,7 +1179,9 @@ def pull_image(cli, api, submission, image_reference):
                     log=f"Still pulling {image_reference} ({len(layers)} layers seen)\n",
                 )
             except Exception:
-                logging.warning("Progress report during image pull failed", exc_info=True)
+                logging.warning(
+                    "Progress report during image pull failed", exc_info=True
+                )
 
     if error:
         if _is_out_of_space(error):
@@ -1207,7 +1212,9 @@ def pull_image(cli, api, submission, image_reference):
             f"Failed to pull image {image_reference}: {error}",
             detail=image_reference,
         )
-    logging.info("Pulled %s (%d layers)", image_reference, len(layers))
+    msg = f"Pulled {image_reference} ({len(layers)} layers)"
+    api.update_job(job_id, log=msg + "\n")
+    logging.info(msg)
 
 
 def recorded_run(api, submission, stage, env_vars, task=None):
@@ -1282,6 +1289,7 @@ def recorded_run(api, submission, stage, env_vars, task=None):
     task = task or DummyTask
     log_queue = queue.Queue()
     logging.info("Starting recorded run")
+    api.update_job(submission["job_id"], log="Starting recorded run\n")
 
     submission_folder = api.folder(submission["folder_id"])
     folder_id = submission_folder["_id"]
@@ -1401,7 +1409,8 @@ def recorded_run(api, submission, stage, env_vars, task=None):
     container = cli.containers.create(**container_kwargs)
     # redact env in container_kwargs since we dump them later
     container_kwargs["environment"] = {
-        k: (MASK if k in user_env else v) for k, v in container_kwargs["environment"].items()
+        k: (MASK if k in user_env else v)
+        for k, v in container_kwargs["environment"].items()
     }
 
     logging_thread = Thread(target=logging_worker, args=(log_queue, container))
@@ -1513,9 +1522,13 @@ def recorded_run(api, submission, stage, env_vars, task=None):
             # reader cannot check. The conversion belongs wherever a footprint is
             # actually needed, and _IMAGE_FAMILY_COMPRESSED_GB's note says what is
             # still unmeasured about it.
-            performance_data["ImageSize"] = cli.images.get(image_reference).attrs["Size"]
+            performance_data["ImageSize"] = cli.images.get(image_reference).attrs[
+                "Size"
+            ]
         except Exception:
-            logging.warning("Could not determine size of %s", image_reference, exc_info=True)
+            logging.warning(
+                "Could not determine size of %s", image_reference, exc_info=True
+            )
         if os.path.isfile(dstats_tmppath + ".csv"):
             df = pd.read_csv(dstats_tmppath + ".csv")
             # The header is written when the collector starts, so the file exists
@@ -1548,9 +1561,7 @@ def recorded_run(api, submission, stage, env_vars, task=None):
                 # The size the submission asked for, recorded beside the cap it
                 # actually got: mem_limit_bytes alone cannot say whether a run
                 # was sized deliberately or simply landed on whatever was free.
-                "requested_memory_gb": submission.get(
-                    "telemetry_requested_memory_gb"
-                ),
+                "requested_memory_gb": submission.get("telemetry_requested_memory_gb"),
                 "image_name": stage.get("image_name"),
                 "image_tag": stage.get("image_tag"),
                 "network_isolation": bool(stage.get("network_isolation", False)),
@@ -1574,7 +1585,9 @@ def recorded_run(api, submission, stage, env_vars, task=None):
             folder_id,
             # allow_nan=False is a tripwire: a non-finite float here would be
             # written as an invalid JSON literal rather than rejected.
-            json.dumps(performance_data, cls=NpEncoder, allow_nan=False).encode("utf-8"),
+            json.dumps(performance_data, cls=NpEncoder, allow_nan=False).encode(
+                "utf-8"
+            ),
             f"performance_data_stage_{stage_num}.json",
             mime_type="text/plain",
             item_type="performance_data",
@@ -1678,9 +1691,7 @@ def recorded_run(api, submission, stage, env_vars, task=None):
                 fobj = api.upload_file(
                     folder_id, log_file, mime_type="text/plain", item_type=key
                 )
-                api.set_folder_metadata(
-                    folder_id, {f"{key}_file_id": str(fobj["_id"])}
-                )
+                api.set_folder_metadata(folder_id, {f"{key}_file_id": str(fobj["_id"])})
             os.remove(log_file)
 
     try:
