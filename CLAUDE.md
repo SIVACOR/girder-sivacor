@@ -117,6 +117,42 @@ full story.
 The rationale is written up for review in
 `../aea-sivacor/LEGITIMATE_INTERESTS_ASSESSMENT.md`.
 
+## `test_girder_upload_race.py` — 2 xfails that are supposed to fail
+
+The suite reports **2 xfailed**, and that is the healthy state. That file tests
+*Girder's* upload model, not ours: it reproduces an upstream bug where a failed
+chunk's rollback truncates other chunks' bytes and the upload still finalises,
+leaving a file document larger than its blob. Both tests are
+`xfail(strict=True)`, so **a pass is a failure** — it means upstream fixed the
+bug and the mitigation in `rest.py` (`verify_upload_complete`, and
+`GET /sivacor/upload_integrity`) can be reconsidered. If you see `xpassed`, read
+`../development_notes/girder_upload_race_plan.md` before deleting anything.
+
+## `tools/` — operator scripts, and not scratch
+
+`tools/assetstore_integrity.py` compares every Girder file document's `size`
+against the blob it points at, and separately looks for uploads whose
+`received` counter has outrun their temp file. Read-only. It exists because
+Girder can finalise an upload whose stored copy is *shorter* than its
+document, and nothing else in the stack notices until something reads the whole
+file — see `../development_notes/girder_upload_race_plan.md`.
+
+Run it inside the girder container, which already has pymongo and the
+assetstore mounted:
+
+```sh
+docker exec -i $(docker ps -qf name=wt_girder) \
+    python3 - < tools/assetstore_integrity.py --verify-hash
+```
+
+Two results worth knowing before you read its output: a missing temp file is
+ordinary debris (an abandoned upload outlives its temp file), which is why
+those are counted rather than listed; and its first production run reported 0
+short blobs among 177 documents, because the two known-corrupt files had
+already gone away with their deleted submissions.
+
+Unlike the files below, this directory *is* part of the repo.
+
 ## Scratch files — not part of the plugin
 
 Root `aaa.py` / `ddd.py` / `debug.py` / `ala.py` / `foobar/`, the `*.patch`

@@ -12,6 +12,7 @@ from girder.api.describe import Description, autoDescribeRoute
 from girder.api.rest import Resource, boundHandler, filtermodel
 from girder.constants import AccessType, TokenScope
 from girder.exceptions import AccessException, RestException, ValidationException
+from girder.models.assetstore import Assetstore
 from girder.models.collection import Collection
 from girder.models.file import File
 from girder.models.folder import Folder
@@ -19,6 +20,8 @@ from girder.models.group import Group
 from girder.models.setting import Setting
 from girder.models.token import Token
 from girder.models.user import User
+from girder.utility.assetstore_utilities import getAssetstoreAdapter
+from girder.utility.filesystem_assetstore_adapter import FilesystemAssetstoreAdapter
 from girder_jobs.constants import REST_CREATE_JOB_TOKEN_SCOPE, JobStatus
 from girder_jobs.models.job import Job
 from girder_plugin_worker.utils import getWorkerApiUrl
@@ -472,6 +475,98 @@ def resolve_volume_gb(workflow, user):
     return granted
 
 
+def stored_blob_size(file):
+    """Bytes actually on disk for ``file``, or ``None`` if that is unknowable.
+
+    ``None`` is returned for every case where the question does not apply or
+    cannot be answered: a ``linkUrl`` file with no blob, a non-filesystem
+    assetstore whose size only a network round trip could give, a document with
+    no ``path``, or a ``stat`` that failed for a reason other than the blob
+    being absent. Callers must treat ``None`` as "no opinion" rather than as
+    zero -- see :func:`verify_upload_complete` for why that direction.
+    """
+    if file.get("linkUrl") and not file.get("assetstoreId"):
+        return None
+    if not file.get("assetstoreId") or not file.get("path"):
+        return None
+
+    assetstore = Assetstore().load(file["assetstoreId"])
+    if not assetstore:
+        return None
+    adapter = getAssetstoreAdapter(assetstore)
+    if not isinstance(adapter, FilesystemAssetstoreAdapter):
+        return None
+
+    try:
+        return os.path.getsize(adapter.fullPath(file))
+    except FileNotFoundError:
+        # A definite answer, and the one case where the absence is the finding:
+        # there is no blob at all.
+        return 0
+    except OSError:
+        logger.warning(
+            "Could not stat the blob for file %s; skipping the size check",
+            file["_id"],
+            exc_info=True,
+        )
+        return None
+
+
+def verify_upload_complete(file):
+    """Refuse a submission whose stored bytes disagree with its file document.
+
+    Girder's chunked upload can finalise a file whose blob is *shorter* than the
+    ``size`` on its document: two concurrent ``POST /file/chunk`` requests for
+    one upload let the aborted one's rollback delete bytes the other had already
+    written, while the ``received`` counter it finalises on keeps the advanced
+    value. Full mechanism, evidence and the upstream fix:
+    ``development_notes/girder_upload_race_plan.md``.
+
+    Nothing else notices. The download route builds ``Content-Length`` from the
+    document and streams from disk, so the *client* is the first thing to see a
+    problem -- which in practice meant ``create_workspace`` dying on the worker
+    with ``ChunkedEncodingError`` after a fleet instance had been created, an
+    image pulled, and half an hour spent. Twice, in production, on 2026-09-02.
+
+    So this runs at submit time instead: one ``stat``, before any job document
+    exists, turning a 30-minute round trip and an unreadable error into an
+    immediate message that names the actual remedy. Re-uploading **does** fix
+    it -- the corrupt blob is stored under a hash matching neither the stored
+    bytes nor the intended content, so a fresh upload gets a fresh path rather
+    than deduplicating onto the bad one (open item 1 in that plan).
+
+    Fails **open** when the size cannot be established: this is a detector for
+    one specific corruption, not an access check, and a deployment on an
+    assetstore it cannot stat must keep accepting submissions. The download is
+    still there to fail if something really is wrong.
+    """
+    declared = file.get("size")
+    if not isinstance(declared, int):
+        return
+    stored = stored_blob_size(file)
+    if stored is None or stored == declared:
+        return
+
+    logger.error(
+        "Refusing submission for file %s: document says %d bytes, blob has %d "
+        "(short by %d). See development_notes/girder_upload_race_plan.md",
+        file["_id"],
+        declared,
+        stored,
+        declared - stored,
+    )
+    # The researcher's own file sizes, in a message only they see -- and the
+    # numbers are the point: "incomplete" alone reads as a server excuse, while
+    # a byte count that is visibly short of their file makes the remedy obvious.
+    raise ValidationException(
+        f"'{file['name']}' did not upload completely: the server stored "
+        f"{stored:,} of {declared:,} bytes. This is a known fault in the "
+        "upload, not in your package. Delete the uploaded file and upload it "
+        "again -- a fresh upload stores a fresh copy. If it happens twice for "
+        "the same file, contact support@sivacor.org."
+    )
+
+
 def build_submission_chain(job, file, stages, secrets):
     """Assemble the celery chain that runs one submission.
 
@@ -688,9 +783,48 @@ class SIVACOR(Resource):
         self.route("GET", ("volume_quota",), self.get_volume_quota)
         self.route("GET", ("volume_usage",), self.get_volume_usage)
         self.route("PUT", ("user", ":id", "volume_quota"), self.set_volume_quota)
+        self.route("GET", ("upload_integrity",), self.get_upload_integrity)
         self.route("GET", ("workflow_schema",), self.get_workflow_schema)
         self.route("GET", ("fs", "manifest"), self.get_fs_manifest)
         self.route("DELETE", ("submission", ":id"), self.delete_submission)
+
+    @access.user
+    @autoDescribeRoute(
+        Description("Report whether a file's stored bytes match its document.")
+        .notes(
+            "The only way a client can learn this. A file document's 'size' is "
+            "the size the *upload declared*, and that is precisely the value "
+            "that is wrong when Girder's chunk-upload race truncates a blob -- "
+            "so comparing GET /file/:id against the local file always agrees, "
+            "however short the stored copy is. Only the server can compare the "
+            "document against the bytes on disk.\n\n"
+            "Called by the uploader after its final chunk, so a truncated "
+            "upload is caught while the user is still looking at the upload "
+            "control, rather than at submit time or -- as happened twice on "
+            "2026-09-02 -- half an hour into a run on a worker.\n\n"
+            "'stored' is null when the question does not apply or cannot be "
+            "answered (a linkUrl file, a non-filesystem assetstore, an "
+            "unreadable path). 'complete' is true in that case: this reports a "
+            "specific corruption, and 'cannot tell' must not read as 'broken'. "
+            "See development_notes/girder_upload_race_plan.md."
+        )
+        .modelParam(
+            "id",
+            "The ID of the file to check.",
+            model=File,
+            level=AccessType.READ,
+            required=True,
+            paramType="query",
+        )
+    )
+    def get_upload_integrity(self, file):
+        declared = file.get("size")
+        stored = stored_blob_size(file) if isinstance(declared, int) else None
+        return {
+            "declared": declared,
+            "stored": stored,
+            "complete": stored is None or stored == declared,
+        }
 
     @access.user
     @autoDescribeRoute(
@@ -719,6 +853,11 @@ class SIVACOR(Resource):
         user = self.getCurrentUser()
         if active := self._active_submission(user):
             raise self._active_submission_error(active)
+
+        # Before anything is created, and before a worker is asked for: an
+        # incomplete upload cannot be run, and finding that out on the worker
+        # costs an instance, an image pull and half an hour.
+        verify_upload_complete(file)
 
         stages = workflow.get("stages", [])
         env_secrets = encrypt_job_secrets(workflow.get("env_secrets", []))
