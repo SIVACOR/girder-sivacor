@@ -17,6 +17,7 @@ import posix1e
 import randomname
 from celery.signals import celeryd_after_setup, worker_ready
 from girder.constants import AccessType
+from girder_client import HttpError
 from girder_worker.app import app
 from girder_worker.utils import JobStatus
 from tro_utils import TRPAttribute
@@ -24,6 +25,7 @@ from tro_utils.tro_utils import TRO
 
 from ..errors import FailureCode, SubmissionError, classify
 from ..settings import PluginSettings
+from ..statuses import CANCELING, FAILED
 from ..telemetry import size_bucket
 from .girder_api import GirderApi, dump_to_zip
 from .lib import (
@@ -170,6 +172,76 @@ def discard_workspace(submission):
             shutil.rmtree(path, ignore_errors=True)
 
 
+def settle_canceling_folder(api, submission):
+    """Write the terminal folder status a cancel deliberately left pending.
+
+    ``notifications.set_submission_status`` marks a cancelled submission's
+    folder :data:`~girder_sivacor.statuses.CANCELING` the moment Girder accepts
+    the revoke, which is what stops the user deleting it out from under the
+    write-back. Something then has to write the terminal status, and the worker
+    is the only party that knows when the write-back is actually finished --
+    so this runs at every exit from the chain, after the last upload.
+
+    Best effort, and here that is more than prudence. The likeliest way for
+    this to fail is that the folder is already gone, which happens when the
+    submission reached a genuinely terminal state and the user deleted it --
+    nothing left to settle, and nothing wrong. ``/sivacor/reap`` covers the
+    other way to miss it: a worker that dies before reaching here.
+    """
+    folder_id = submission.get("folder_id")
+    if not folder_id:
+        # ``prepare_submission`` never ran, so no folder carries a status.
+        return
+    try:
+        folder = api.folder(folder_id)
+        if ((folder or {}).get("meta") or {}).get("status") != CANCELING:
+            # Only ever overwrite the transitional value. This is also reached
+            # for a job that errored, and -- through submission_task's
+            # pre-flight check -- for one that left RUNNING some other way;
+            # neither of those statuses is ours to rewrite.
+            return
+        api.set_folder_metadata(folder_id, {"status": FAILED})
+    except Exception:
+        logger.warning(
+            "Could not settle the status of submission folder %s",
+            folder_id,
+            exc_info=True,
+        )
+
+
+def _classify_vanished_submission(api, submission, exc):
+    """Rewrite an HTTP failure that was really the submission being deleted.
+
+    A researcher who cancels a run and then deletes it can get the delete in
+    before the worker has finished writing the run's results back: the
+    write-back takes about twelve seconds and they need three. The worker's
+    next upload is answered ``No such folder``, ``girder_client`` raises
+    ``HttpError``, and until 2026-09-04 that reached the permanent record as
+    ``UNEXPECTED``/``HttpError`` -- the code reserved for defects, filed
+    against a run in which nothing malfunctioned.
+
+    Nothing about the *outcome* changes here: once the folder is gone no retry
+    can succeed and the chain has to stop either way. What changes is that the
+    event becomes countable apart from real bugs, which is the whole point.
+
+    Decided by asking Girder whether the folder still exists, not by matching
+    the text of its error. That message is not ours to depend on, and the
+    question -- did this submission stop existing? -- has an authoritative
+    answer one GET away. Anything else, including a folder that is still there,
+    is left exactly as it was raised.
+    """
+    if not isinstance(exc, HttpError):
+        return exc
+    folder_id = submission.get("folder_id")
+    if not folder_id or api.folder_exists(folder_id):
+        return exc
+    return SubmissionError(
+        FailureCode.SUBMISSION_DELETED,
+        "The submission was deleted while this run's results were being "
+        "written back, so there is nowhere left to store them.",
+    )
+
+
 def submission_task(failure):
     """Wrap a pipeline step in its Girder job bookkeeping.
 
@@ -187,28 +259,41 @@ def submission_task(failure):
             api = GirderApi.for_task(task)
             job_id = submission["job_id"]
             if api.job(job_id)["status"] != JobStatus.RUNNING:
-                return abandon(task, submission)
+                return abandon(task, api, submission)
             try:
                 return func(task, api, submission, *args, **kwargs)
             except Exception as exc:
-                report_failure(api, job_id, failure, exc)
+                # Before anything is reported: a step that failed only because
+                # the submission was deleted underneath it is not a defect, and
+                # this is the one place that can still tell.
+                failed_with = _classify_vanished_submission(api, submission, exc)
+                report_failure(api, job_id, failure, failed_with)
                 # func.__name__ rather than the `failure` prose: the step name
                 # is kept forever, so it has to be a stable identifier we chose,
                 # not a sentence someone may reword later.
-                record_execution(api, submission, "failed", func.__name__, exc)
+                record_execution(api, submission, "failed", func.__name__, failed_with)
                 discard_workspace(submission)
-                raise
+                if failed_with is exc:
+                    raise
+                raise failed_with from exc
 
         return inner
 
     return decorator
 
 
-def abandon(task, submission):
-    """Drop the rest of the chain and clean up after a cancelled submission."""
+def abandon(task, api, submission):
+    """Drop the rest of the chain and clean up after a cancelled submission.
+
+    Settling the folder status is the second half of the 2026-09-04 delete
+    guard: the cancel left it transitional on purpose, and this is the moment
+    the worker is provably finished with the folder -- the chain is being torn
+    down and the last upload has already happened.
+    """
     if task.request.chain:
         task.request.chain = None
     discard_workspace(submission)
+    settle_canceling_folder(api, submission)
     return {"job_id": str(submission["job_id"])}
 
 
@@ -663,7 +748,11 @@ def execute_workflow(task, api, submission, stage, env_vars):
     ret = recorded_run(api, submission, stage, env_vars, task=task)
     if ret["StatusCode"] == -123:
         print("Termination requested, stopping execution.")
-        return abandon(task, submission)
+        # recorded_run has already uploaded this stage's performance data,
+        # stdout, stderr and dockerstats -- a cancelled run still writes all of
+        # it, which is why the folder cannot be marked terminal any earlier
+        # than here.
+        return abandon(task, api, submission)
 
     if ret["StatusCode"] != 0:
         raise SubmissionError(
@@ -835,6 +924,13 @@ def finalize_job(task, submission):
         # RUNNING was cancelled or reaped, and the reaper writes its own record
         # -- recording here too would double-count it.
         record_execution(api, submission, "completed")
+    else:
+        # The last step of the chain, and the only one submission_task does not
+        # wrap -- so nothing else here would settle a folder left CANCELING by
+        # a revoke that arrived during upload_workspace. Without this the
+        # submission is undeletable until /sivacor/reap notices, 10 minutes to
+        # half an hour later.
+        settle_canceling_folder(api, submission)
     return submission
 
 
