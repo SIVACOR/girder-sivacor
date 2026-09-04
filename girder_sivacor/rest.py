@@ -29,6 +29,7 @@ from girder_plugin_worker.utils import getWorkerApiUrl
 from .errors import FailureCode
 from .models.execution_record import ExecutionRecord
 from .settings import PluginSettings
+from .statuses import CANCELING, DELETABLE, FAILED
 from .telemetry import sanitize_record
 from .utils import encrypt_job_secrets
 from .worker_plugin.routing import DISPATCH_QUEUE
@@ -1270,7 +1271,11 @@ class SIVACOR(Resource):
             "step only after the previous one returns, so a worker that dies "
             "mid-submission leaves no message to retry and no step to fail: "
             "the job stays RUNNING forever. Retrying is not an option either, "
-            "since the workspace died with the worker -- so fail loudly."
+            "since the workspace died with the worker -- so fail loudly. "
+            "Also settles submissions left mid-cancel by a worker that never "
+            "came back, which are reported separately as 'settled': their job "
+            "is already terminal, so there is nothing left to fail -- only a "
+            "folder status to finish writing."
         )
     )
     def reap_submissions(self):
@@ -1380,7 +1385,83 @@ class SIVACOR(Resource):
 
             self._reap(job, reason, code, now - created, reaped)
 
-        return {"reaped": reaped}
+        return {
+            "reaped": reaped,
+            "settled": self._settle_canceling_folders(now, stale_after),
+        }
+
+    @classmethod
+    def _settle_canceling_folders(cls, now, stale_after):
+        """Free submissions stuck mid-cancel because their worker never returned.
+
+        ``notifications.set_submission_status`` marks a cancelled submission's
+        folder CANCELING, and the worker writes the terminal status once it has
+        finished writing back. A worker that dies in between -- lost VM, killed
+        process, an exception on the way out -- leaves the folder transitional
+        forever, and a transitional folder is one its owner cannot delete. That
+        is a *worse* failure than the race the transitional status exists to
+        prevent, so it needs a settler outside the worker.
+
+        The sweep above cannot be it: that one selects jobs which are still
+        RUNNING, and every submission this concerns has a terminal job status.
+
+        ``heartbeat_timeout`` is reused as the bound rather than something
+        tighter matched to the ~12 s a write-back really takes. It already
+        means "no worker is coming back for this", which is exactly the
+        question being asked, and being early here would re-open the very race
+        the transitional status was added to close -- while being late only
+        delays a delete the user can retry.
+        """
+        settled = []
+        for folder in list(Folder().find({"meta.status": CANCELING})):
+            meta = folder.get("meta", {})
+            last_seen = _as_utc(folder["updated"])
+            job = cls._load_job(meta.get("job_id"))
+            if job is not None:
+                if job.get("status") == JobStatus.RUNNING:
+                    # The cancel has not landed on the job yet, or something
+                    # put it back; either way the sweep above owns it and this
+                    # must not race that decision.
+                    continue
+                last_seen = max(
+                    last_seen,
+                    _as_utc(job.get("updated") or folder["updated"]),
+                    _as_utc(job.get("meta", {}).get("heartbeat") or folder["updated"]),
+                )
+            if now - last_seen <= stale_after:
+                continue
+            logger.warning(
+                "Settling submission folder %s: still '%s' %s after its worker "
+                "was last heard from",
+                str(folder["_id"]),
+                CANCELING,
+                now - last_seen,
+            )
+            # Straight to the collection, like the handler that wrote CANCELING
+            # in the first place: this is not a job transition, so it must not
+            # fire jobs.job.update.after and email the user a second time.
+            Folder().collection.update_one(
+                {"_id": folder["_id"]}, {"$set": {"meta.status": FAILED}}
+            )
+            settled.append(str(folder["_id"]))
+        return settled
+
+    @staticmethod
+    def _load_job(job_id):
+        """Load a job by an id that may be missing or no longer valid.
+
+        ``Job().load`` raises on a malformed id and the caller here is a
+        periodic sweep, where an exception is a silent stall. A job that cannot
+        be loaded is treated as gone, which is the answer that lets its folder
+        be settled rather than stranded.
+        """
+        if not job_id:
+            return None
+        try:
+            return Job().load(job_id, force=True)
+        except Exception:
+            logger.warning("Could not load job %s", job_id, exc_info=True)
+            return None
 
     @classmethod
     def _reap(cls, job, reason, code, elapsed, reaped, detail=None):
@@ -1848,7 +1929,18 @@ class SIVACOR(Resource):
             raise AccessException(
                 "You do not have permission to delete '%s' submission." % folder["name"]
             )
-        if meta.get("status") not in ("completed", "failed"):
+        status = meta.get("status")
+        if status == CANCELING:
+            # The guard itself needed no change for the 2026-09-03 delete race
+            # -- CANCELING is simply not in DELETABLE. Only the message does:
+            # "only completed or failed submissions can be deleted" is baffling
+            # when the user is looking at a job the UI calls cancelled.
+            raise ValidationException(
+                "This submission was cancelled and the machine running it is "
+                "still saving the run's output. It can be deleted once that "
+                "finishes, usually within a few seconds."
+            )
+        if status not in DELETABLE:
             raise ValidationException(
                 "Only completed or failed submissions can be deleted."
             )

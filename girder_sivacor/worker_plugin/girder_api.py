@@ -218,6 +218,39 @@ class GirderApi:
     def folder(self, folder_id):
         return self.client.getFolder(folder_id)
 
+    def folder_exists(self, folder_id):
+        """Whether Girder still has this folder.
+
+        Exists to tell "the submission was deleted underneath us" apart from
+        every other reason an HTTP call can fail. A researcher may cancel a run
+        and delete it inside the seconds the write-back takes, and the
+        difference between that and a genuine bug is not readable from the
+        error Girder returns -- but it is readable from whether the folder is
+        still there.
+
+        **A deleted folder is a 400, not a 404.** Girder's ``modelParam``
+        raises a *validation* error for an id that resolves to nothing, so the
+        body reads ``No such folder: <id>`` under a 400. Both are accepted here
+        because relying on which one is a distinction upstream never promised.
+
+        Anything else -- a timeout, a 502, a Traefik restart -- answers
+        ``True``. Unknown is deliberately treated as "still there", so a
+        transient outage can never be misreported as the user having deleted
+        their own submission.
+        """
+        try:
+            self.client.getFolder(folder_id)
+            return True
+        except HttpError as exc:
+            return exc.status not in (400, 404)
+        except Exception:
+            logger.warning(
+                "Could not check whether folder %s still exists",
+                folder_id,
+                exc_info=True,
+            )
+            return True
+
     def create_folder(self, parent_id, name, parent_type="collection", public=False):
         return self.client.createFolder(
             parent_id, name, parentType=parent_type, public=public

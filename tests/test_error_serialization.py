@@ -168,6 +168,19 @@ RAISE_SITES = [
         1,
         id="nonzero_exit-stage",  # run_submission.py:630, detail=ret["StatusCode"]
     ),
+    pytest.param(
+        FailureCode.SUBMISSION_DELETED,
+        "The submission was deleted while this run's results were being "
+        "written back, so there is nowhere left to store them.",
+        None,
+        # The one site that does not raise on discovering a problem: it
+        # *rewrites* an HttpError the researcher's own delete caused, so the
+        # permanent record can tell that apart from a defect. Crossing the task
+        # boundary matters for the same reason as everything else here -- an
+        # unpickleable one is recorded as UNEXPECTED, which is the exact
+        # misclassification it exists to stop.
+        id="submission_deleted",  # run_submission.py, detail omitted
+    ),
 ]
 
 

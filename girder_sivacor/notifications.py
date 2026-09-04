@@ -25,6 +25,8 @@ from girder.utility import mail_utils
 from girder_jobs.constants import JobStatus
 from girder_jobs.models.job import Job
 
+from .statuses import CANCELING, COMPLETED, FAILED, PROCESSING
+
 logger = logging.getLogger(__name__)
 
 
@@ -221,7 +223,7 @@ def set_submission_status(event: events.Event) -> None:
 
     status = job.get("status")
     if status == JobStatus.SUCCESS:
-        submission_status = "completed"
+        submission_status = COMPLETED
         try:
             notify_user(job, submission_folder, success=True)
         except Exception as e:
@@ -231,7 +233,24 @@ def set_submission_status(event: events.Event) -> None:
                 str(e),
             )
     elif status in (JobStatus.ERROR, JobStatus.CANCELED):
-        submission_status = "failed"
+        # A cancel is terminal for the *server* and not for the worker. Girder
+        # flips the job the moment the revoke is accepted, but the worker then
+        # spends around twelve seconds stopping the container and uploading the
+        # run's performance data, stdout, stderr and dockerstats. Calling the
+        # folder FAILED here -- which is what this did until 2026-09-04 --
+        # hands the user a submission that looks finished and passes the delete
+        # guard while the worker is still writing to it. CANCELING says the
+        # true thing instead: accepted here, not finished there.
+        #
+        # ERROR needs no such state. A step that raises has already completed
+        # its write-back; the transition to ERROR is the last thing the worker
+        # does, not the first.
+        #
+        # The email still goes out now, on the transition, rather than waiting
+        # for the terminal write. It tells the user about their own cancel, and
+        # nothing re-fires this handler when the status settles -- the worker
+        # writes ``meta.status`` directly for exactly that reason.
+        submission_status = FAILED if status == JobStatus.ERROR else CANCELING
         try:
             notify_user(job, submission_folder, success=False)
         except Exception as e:
@@ -241,7 +260,7 @@ def set_submission_status(event: events.Event) -> None:
                 str(e),
             )
     else:
-        submission_status = "processing"
+        submission_status = PROCESSING
     Folder().collection.update_one(
         {"_id": submission_folder["_id"]},
         {"$set": {"meta.status": submission_status}},

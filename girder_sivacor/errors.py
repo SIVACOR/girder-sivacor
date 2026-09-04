@@ -79,6 +79,16 @@ class FailureCode(str, Enum):
     #: or run fault, which is exactly what the reporting data should be able to
     #: separate. ``detail`` is the requested size in GB.
     SIZE_UNAVAILABLE = "size_unavailable"
+    #: The submission folder was deleted while the worker was still writing
+    #: this run's results back, so there is nowhere left to put them. **Not a
+    #: defect**: the researcher cancelled and then deleted inside the ~12 s the
+    #: write-back takes, which is a race they can only lose by being fast.
+    #:
+    #: It has a code of its own purely so it is *countable* apart from genuine
+    #: bugs. Before 2026-09-04 it arrived as ``UNEXPECTED``/``HttpError`` -- the
+    #: code reserved for defects -- on a run where nothing malfunctioned. See
+    #: ``development_notes/incidents/2026-09-03-cancel-delete-race.md``.
+    SUBMISSION_DELETED = "submission_deleted"
     #: Anything not classified above. ``detail`` is the exception class name.
     UNEXPECTED = "unexpected"
 
