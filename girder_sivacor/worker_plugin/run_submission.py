@@ -745,7 +745,7 @@ def execute_workflow(task, api, submission, stage, env_vars):
 
     # Placeholder for actual workflow execution logic
     start_time = datetime.datetime.now()
-    ret = recorded_run(api, submission, stage, env_vars, task=task)
+    ret = recorded_run(api, submission, stage, env_vars)
     if ret["StatusCode"] == -123:
         print("Termination requested, stopping execution.")
         # recorded_run has already uploaded this stage's performance data,
