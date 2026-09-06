@@ -1023,12 +1023,22 @@ class SIVACOR(Resource):
 
     @access.admin
     @autoDescribeRoute(
-        Description("Record a liveness heartbeat for a running submission.")
+        Description("Check in on behalf of a running submission.")
         .notes(
-            "Called by the worker while a container runs. A submission can "
-            "execute for hours without logging anything, so the job's "
-            "'updated' timestamp is not by itself a liveness signal -- this is "
-            "what tells /sivacor/reap the worker is still there."
+            "Called by the worker while a container runs, and the whole "
+            "conversation between a running submission and the server. It "
+            "carries a signal each way.\n\n"
+            "**Up:** a submission can execute for hours without logging "
+            "anything, so the job's 'updated' timestamp is not by itself a "
+            "liveness signal -- this is what tells /sivacor/reap the worker is "
+            "still there.\n\n"
+            "**Down:** the response reports the job's current status, which is "
+            "how the worker learns it has been cancelled. Deliberately answered "
+            "here rather than read off the celery control channel, for the same "
+            "reason /sivacor/claim exists: a worker whose broker connection has "
+            "died cannot ask the broker anything, and that is exactly when the "
+            "answer matters. Costs nothing -- the job is already loaded, and "
+            "without its log."
         )
         .modelParam(
             "id",
@@ -1047,7 +1057,10 @@ class SIVACOR(Resource):
         Job().collection.update_one(
             {"_id": job["_id"]}, {"$set": {"meta.heartbeat": now}}
         )
-        return {"heartbeat": now}
+        # Read from the document the route already loaded, not re-fetched: the
+        # write above touches only meta.heartbeat, so this is as current as any
+        # second read would be, and one round trip cheaper.
+        return {"heartbeat": now, "status": job["status"]}
 
     @access.admin
     @autoDescribeRoute(

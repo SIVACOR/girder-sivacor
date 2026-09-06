@@ -22,6 +22,7 @@ import numpy as np
 import pandas as pd
 import redis
 import requests
+from girder_worker.utils import JobStatus
 
 from ..errors import FailureCode, SubmissionError
 
@@ -32,9 +33,23 @@ _master_key = bytes.fromhex(MASTER_KEY_HEX)
 MASTER_AES = AESGCM(_master_key)
 MASK = "***SECRET_REDACTED***"
 
-#: Seconds between liveness pings while a user's container runs. Cheap enough
-#: to be frequent; the server's staleness threshold is a large multiple of it.
+#: Seconds between liveness pings during an image pull. Cheap enough to be
+#: frequent; the server's staleness threshold is a large multiple of it.
 HEARTBEAT_INTERVAL = 60
+
+#: Seconds between check-ins while a user's container runs. The same request is
+#: both the liveness heartbeat and the cancel channel (see
+#: :class:`CancelWatcher`), so this is also the worst-case delay between a user
+#: pressing Cancel and the container being stopped. Shorter than
+#: :data:`HEARTBEAT_INTERVAL` for that reason and no other: the reaper is happy
+#: with anything well under ``sivacor.heartbeat_timeout``, but a researcher
+#: watching a spinner is not.
+CHECKIN_INTERVAL = 10
+
+#: Seconds between walks of the workspace to sample its peak size. Deliberately
+#: NOT tied to the check-in: the walk is ~0.4s over a 100k-file tree, which is
+#: nothing once a minute and a meaningful tax six times more often.
+DISK_SAMPLE_INTERVAL = 60
 
 
 class NpEncoder(json.JSONEncoder):
@@ -356,8 +371,198 @@ class DockerStatsCollectorThread(Thread):
         ), self.convert_size(memory.get("limit", 0), binary=True)
 
 
-class DummyTask:
-    canceled = False
+class CancelWatcher:
+    """Answers "has this submission been cancelled?" -- from Girder, tolerantly.
+
+    Girder is the authority on cancellation: ``jobs.cancel`` moves the
+    submission job out of ``RUNNING`` before anything else happens, and
+    :func:`~girder_sivacor.worker_plugin.run_submission.submission_task`
+    already reads that status over HTTP as its pre-flight. This asks the same
+    question, on the same transport, for the one place that used to ask it a
+    different way: ``recorded_run``'s poll loop.
+
+    **What it replaces, and why.** That loop used to evaluate
+    ``girder_worker``'s ``task.canceled`` once a second. That property is not
+    local state -- it is a synchronous ``inspect().revoked()`` broadcast over
+    the celery pidbox, i.e. a round trip through the redis broker, per second,
+    for the whole run. It went wrong in both directions:
+
+    * **Silently, when the broker connection was merely deaf.** ``revoked()``
+      returns ``None``, ``_revoked_tasks`` turns that into ``[]``, and the
+      answer is "not cancelled" -- so a cancelled run kept going for 30 hours
+      (``2026-09-03-cancel-during-wedge.md``).
+    * **Loudly, when the broker connection was reset.** The read raises, and
+      nothing in that loop caught it, so a healthy 60-hour run was destroyed by
+      one TCP RST -- the tenth time that had happened
+      (``2026-09-06-broker-blip-kills-run.md``).
+
+    Reading the cancel off Girder fixes both, because it stops routing a
+    control signal through a connection whose failure is the thing being
+    signalled about. Same argument as ``/sivacor/claim``, which is recorded
+    server-side rather than read back with ``celery inspect`` for exactly this
+    reason.
+
+    **Three properties this class exists to guarantee:**
+
+    1. *It never raises.* A check-in that fails leaves the answer unchanged and
+       is retried on the next tick. There is no failure of this class that is
+       worth destroying a run over -- which is the whole lesson of 2026-09-06,
+       and the same rule every other remote call in the loop already follows.
+    2. *An unreachable server is not a cancellation.* "I could not ask" and
+       "the answer is no" are the same return value here, deliberately: the
+       only safe default is to keep running. If Girder is really gone the
+       reaper settles the submission from the other side.
+    3. *The answer latches.* Once cancelled, always cancelled -- so the poll
+       loop, the exit-code branch and the failure classification downstream of
+       it cannot disagree with each other, and a blip after the cancel cannot
+       resurrect a run that has already been stopped.
+
+    It is also its own heartbeat: the check-in *is*
+    ``POST /sivacor/heartbeat/:id``, whose response carries the job status. So
+    this costs no requests that the run was not already making -- it makes them
+    :data:`CHECKIN_INTERVAL` apart instead of :data:`HEARTBEAT_INTERVAL`, and
+    reads the reply.
+    """
+
+    #: Consecutive failures logged in full before the log starts skipping. An
+    #: outage should be obvious in the log, not the only thing in it.
+    NOISY_FAILURES = 3
+    #: After that, one line per this many failures.
+    QUIET_EVERY = 30
+    #: First retry delay after a failed check-in, doubling up to ``interval``.
+    #: Faster than the normal cadence because a missed check-in is also a missed
+    #: heartbeat, and the reaper is counting; capped there because a long outage
+    #: must not cost more traffic than a healthy run.
+    RETRY_BACKOFF_BASE = 2
+    #: Doublings before the backoff stops growing. Only ever reached when
+    #: ``interval`` is large; it exists so the arithmetic stays bounded.
+    _MAX_BACKOFF_STEPS = 16
+
+    def __init__(self, api, job_id, interval=CHECKIN_INTERVAL):
+        self.api = api
+        self.job_id = job_id
+        self.interval = interval
+        self._canceled = False
+        self._failures = 0
+        #: None until the first check-in, so it happens immediately rather than
+        #: one interval into the run. Not 0.0: time.monotonic()'s epoch is not
+        #: guaranteed, and a test that patches it should not have to know that.
+        self._next_checkin = None
+        #: False once a server has answered without a status, so the fallback
+        #: below is attempted once per run rather than on every check-in.
+        self._status_in_response = True
+
+    @property
+    def canceled(self):
+        """The latched answer. Pure -- never performs I/O, never raises."""
+        return self._canceled
+
+    def poll(self):
+        """Check in if it is time to, and return the latched answer.
+
+        Safe to call as often as the caller likes; the interval is enforced in
+        here rather than by the caller, so the 1Hz container-status loop can
+        just ask every time round.
+        """
+        if self._canceled:
+            return True
+        now = time.monotonic()
+        if self._next_checkin is not None and now < self._next_checkin:
+            return False
+
+        status = self._ask()
+        if status is None:
+            self._note_failure()
+        else:
+            self._note_success(status)
+
+        # Measured from before the request, not after it, so the cadence does
+        # not drift out by however long the server took to answer -- and so a
+        # request that hangs past the interval is retried at once rather than
+        # having its own latency added to the wait.
+        self._next_checkin = now + self._delay()
+        return self._canceled
+
+    def _ask(self):
+        """Return the job's status, or ``None`` if the server did not answer.
+
+        ``GirderApi.heartbeat`` already swallows its own exceptions; the guard
+        here is deliberate belt-and-braces. This method is the reason the class
+        exists, and "some future caller made it raise again" is exactly the
+        regression that must not be possible.
+        """
+        try:
+            response = self.api.heartbeat(self.job_id)
+            if response is None:
+                return None
+            status = response.get("status")
+            if status is not None:
+                return status
+            # A server too old to answer with the status. Fall back to the job
+            # document, once, so a cancel still lands during a rolling upgrade.
+            if self._status_in_response:
+                self._status_in_response = False
+                logging.info(
+                    "Server does not report status on check-in; falling back to "
+                    "GET /job for job %s",
+                    self.job_id,
+                )
+            return (self.api.job(self.job_id) or {}).get("status")
+        except Exception:
+            logging.warning(
+                "Could not check in for job %s", self.job_id, exc_info=True
+            )
+            return None
+
+    def _note_success(self, status):
+        if self._failures:
+            logging.info(
+                "Check-in for job %s recovered after %d consecutive failures",
+                self.job_id,
+                self._failures,
+            )
+            self._failures = 0
+        if status != JobStatus.RUNNING:
+            # Anything other than RUNNING means the server has stopped
+            # expecting this run -- a cancel, or a failure recorded elsewhere.
+            # Either way there is nothing left to finish, and the same
+            # predicate submission_task uses for its pre-flight.
+            logging.info(
+                "Job %s is no longer RUNNING (status %s); stopping the run",
+                self.job_id,
+                status,
+            )
+            self._canceled = True
+
+    def _note_failure(self):
+        self._failures += 1
+        if self._failures <= self.NOISY_FAILURES:
+            logging.warning(
+                "Check-in %d for job %s failed; assuming NOT cancelled and "
+                "retrying in %ds",
+                self._failures,
+                self.job_id,
+                self._delay(),
+            )
+        elif self._failures % self.QUIET_EVERY == 0:
+            logging.warning(
+                "Still cannot reach Girder for job %s: %d consecutive check-ins "
+                "have failed. The run continues; the server-side reaper will "
+                "settle it if this is permanent.",
+                self.job_id,
+                self._failures,
+            )
+
+    def _delay(self):
+        """Seconds until the next check-in: backoff after a failure."""
+        if not self._failures:
+            return self.interval
+        # The exponent is capped, not just the result. ``_failures`` counts a
+        # whole outage -- 21,600 of them in a two-day one -- and evaluating
+        # ``2 ** 21599`` to then throw it away in min() is a real cost on a
+        # loop that runs every second.
+        steps = min(self._failures - 1, self._MAX_BACKOFF_STEPS)
+        return min(self.interval, self.RETRY_BACKOFF_BASE * 2**steps)
 
 
 def is_stata(image_reference: str) -> bool:
@@ -1217,7 +1422,7 @@ def pull_image(cli, api, submission, image_reference):
     logging.info(msg)
 
 
-def recorded_run(api, submission, stage, env_vars, task=None):
+def recorded_run(api, submission, stage, env_vars):
     cli = docker.from_env()
     info = cli.info()
     cpu_info = cpuinfo.get_cpu_info()
@@ -1286,7 +1491,11 @@ def recorded_run(api, submission, stage, env_vars, task=None):
                 line = line.replace(secret, MASK)
             log_queue.put(line, block=False)
 
-    task = task or DummyTask
+    # The run's link to the server: liveness out, cancellation in. Built here
+    # rather than in the loop so every later reader of `.canceled` -- the exit
+    # code branch and the failure classification at the end -- sees the same
+    # latched answer the loop acted on.
+    checkin = CancelWatcher(api, submission["job_id"])
     log_queue = queue.Queue()
     logging.info("Starting recorded run")
     api.update_job(submission["job_id"], log="Starting recorded run\n")
@@ -1430,24 +1639,23 @@ def recorded_run(api, submission, stage, env_vars, task=None):
         peak_disk = 0
         try:
             container = cli.containers.get(container.id)
-            last_heartbeat = 0.0
+            last_disk_sample = 0.0
             while container.status == "running":
                 while not log_queue.empty():
                     print(log_queue.get_nowait(), flush=True)
-                if task.canceled:
+                # One call, both directions, rate-limited inside the watcher:
+                # it tells the server we are alive -- a replication can run for
+                # hours without writing a line, and the job log is the only
+                # thing that otherwise touches the job, so this is the sole
+                # reason the server can tell a slow run from a dead worker --
+                # and it reads back whether the run has been cancelled. It
+                # cannot raise; see CancelWatcher.
+                if checkin.poll():
                     stop_container(container)
                     break
-                # A replication can run for hours without writing a line, and
-                # the job log is the only thing that otherwise touches the job.
-                # This is the sole reason the server can tell a slow run from a
-                # dead worker.
                 now = time.monotonic()
-                if now - last_heartbeat >= HEARTBEAT_INTERVAL:
-                    last_heartbeat = now
-                    api.heartbeat(submission["job_id"])
-                    # Sampled on the heartbeat tick rather than every second:
-                    # the walk is ~0.4s over a 100k-file tree, which is nothing
-                    # once a minute and a busy loop at 1Hz.
+                if now - last_disk_sample >= DISK_SAMPLE_INTERVAL:
+                    last_disk_sample = now
                     peak_disk = max(peak_disk, workspace_usage(submission))
                     if shortfall := disk_shortfall(submission):
                         stop_container(container)
@@ -1469,7 +1677,11 @@ def recorded_run(api, submission, stage, env_vars, task=None):
         publisher.stop()
         publisher.join()
 
-        if task.canceled:
+        # The latch, not a fresh question: if the loop above stopped the
+        # container because of a cancel, container.wait() would report the
+        # SIGKILL as 137 and the classification below would blame the
+        # researcher's code for it.
+        if checkin.canceled:
             ret = {"StatusCode": -123}
         else:
             ret = container.wait()
@@ -1699,7 +1911,7 @@ def recorded_run(api, submission, stage, env_vars, task=None):
     except docker.errors.NotFound:
         pass
 
-    if not task.canceled:
+    if not checkin.canceled:
         # Before the generic branch: an OOM kill exits 137, which would otherwise
         # be reported as "check stdout/stderr" -- and stdout will say nothing,
         # because the process was killed without warning. This is the one failure

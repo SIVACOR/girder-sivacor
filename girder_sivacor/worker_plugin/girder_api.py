@@ -90,18 +90,27 @@ class GirderApi:
         return self.client.put(f"job/{job_id}", parameters=params)
 
     def heartbeat(self, job_id):
-        """Tell the server this submission's worker is still alive.
+        """Check in with the server on behalf of a running submission.
+
+        Tells it this worker is still alive, and returns what it says back --
+        ``{"heartbeat": ..., "status": <job status>}``. The status is how a
+        running container learns it has been cancelled; see
+        :class:`~girder_sivacor.worker_plugin.lib.CancelWatcher`.
 
         Best effort on purpose: a submission that is running fine should not be
         killed off because one heartbeat request lost a race with a Traefik
         restart. Missing several in a row is what the reaper acts on.
+
+        Returns:
+            The response dict, or ``None`` if the server could not be reached.
+            ``None`` means *unknown*, never *cancelled* -- callers must not read
+            a failed check-in as an answer.
         """
         try:
-            self.client.post(f"sivacor/heartbeat/{job_id}")
-            return True
+            return self.client.post(f"sivacor/heartbeat/{job_id}") or {}
         except Exception:
             logger.warning("Heartbeat failed for job %s", job_id, exc_info=True)
-            return False
+            return None
 
     def claim(self, job_id, queue):
         """Record server-side that ``queue``'s worker has taken this submission.
