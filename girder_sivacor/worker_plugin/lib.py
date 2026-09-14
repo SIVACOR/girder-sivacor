@@ -790,7 +790,7 @@ def _infer_run_command(submission, stage):
 #: On a workspace that has its own filesystem -- a Cinder scratch volume -- none
 #: of that follows: filling it fails one run and wedges nothing, which is the
 #: outcome the floor exists to manufacture. See :func:`disk_floor_bytes`, and
-#: open item 3 of ``development_notes/cinder_volumes_plan.md``.
+#: open item 3 of ``development_notes/05_cinder_volumes_plan.md``.
 DISK_FLOOR_BYTES = int(os.environ.get("SIVACOR_DISK_FLOOR_BYTES", 5 * 1024**3))
 
 #: Container-visible path whose filesystem backs the docker image store.
@@ -801,7 +801,7 @@ DISK_FLOOR_BYTES = int(os.environ.get("SIVACOR_DISK_FLOOR_BYTES", 5 * 1024**3))
 #: filesystem holding ``/var/lib/docker`` (verified against the host's ``df``).
 #:
 #: This rests on one standing decision -- **never move ``/var/lib/docker`` onto
-#: the scratch volume** (cinder_volumes_plan.md's "Do not" block), since the
+#: the scratch volume** (05_cinder_volumes_plan.md's "Do not" block), since the
 #: volume is per-submission and the image store is per-VM. The override exists for
 #: a host that has moved it anyway.
 IMAGE_STORE_PATH = os.environ.get("SIVACOR_IMAGE_STORE_PATH", "/")
@@ -983,7 +983,7 @@ def disk_floor_bytes(submission) -> int:
 
     **What a floor on a volume does and does not buy.** It does leave room for
     ``upload_workspace``, which writes a zip of the project *inside* the
-    project's own filesystem (``workspace_disk_waste.md``) -- and that peak is
+    project's own filesystem (``07_workspace_disk_waste.md``) -- and that peak is
     proportional to the package, which is why a proportional reserve fits it
     better than a constant. It does not *guarantee* that upload: a nearly-full
     20 GB volume needs more headroom than any floor here reserves. The floor is
@@ -1262,7 +1262,7 @@ def pull_space_shortfall(cli, submission, image_reference) -> str | None:
     extracted workspace. The record said the image could not be fetched, which
     reads as *our* registry problem and sent nobody to look at disk.
 
-    See ``development_notes/cinder_volumes_plan.md`` C0.1. The permanent
+    See ``development_notes/05_cinder_volumes_plan.md`` C0.1. The permanent
     consequence of that misattribution: ``out_of_disk`` has never been recorded, so
     any before/after comparison across this change has to read the *old* side as
     ``image_pull_failed`` on large packages.
@@ -1280,7 +1280,7 @@ def pull_space_shortfall(cli, submission, image_reference) -> str | None:
     # empty -- and clear a pull that has to fit on the root disk. That blindness
     # would only show up for exactly the submissions this feature exists for, and
     # first on a multi-stage one: each stage pulls its own image onto the same
-    # per-VM store. See open item 3 of cinder_volumes_plan.md.
+    # per-VM store. See open item 3 of 05_cinder_volumes_plan.md.
     workspace = submission.get("workspace_dir") or "/tmp"
     shared = not workspace_has_own_filesystem(workspace)
     measured = workspace if shared else IMAGE_STORE_PATH
@@ -1453,7 +1453,7 @@ def recorded_run(api, submission, stage, env_vars):
         # prepare_submission defaults it.
         "RequestedMemoryGB": submission.get("telemetry_requested_memory_gb"),
         # The disk story, to the same three parts as the memory one above (V7 of
-        # cinder_volumes_plan.md): what the extra scratch volume was asked for,
+        # 05_cinder_volumes_plan.md): what the extra scratch volume was asked for,
         # what the workspace filesystem actually had, and -- added after the run
         # -- what the run peaked at (MaxDiskUsage).
         #

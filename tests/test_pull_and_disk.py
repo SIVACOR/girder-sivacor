@@ -198,7 +198,7 @@ def test_disk_check_tolerates_a_submission_without_a_workspace():
 # poll loop -- which does not exist until a container is running, i.e. after the
 # pull. The tests below cover both halves of the fix: the estimate that declines
 # to guess, and the observation that cannot be wrong.
-# See development_notes/cinder_volumes_plan.md C0.1.
+# See development_notes/05_cinder_volumes_plan.md C0.1.
 
 DYNARE = "dynare/dynare:6.1-R2024a"
 
@@ -410,7 +410,7 @@ def test_the_preflight_check_never_fails_a_run_by_itself():
 # wedges the VM) does not survive the split, and the pre-pull check was measuring
 # the wrong side of it: the image is unpacked into the per-VM store, never onto
 # the per-submission volume. Answered 2026-08-22; see
-# development_notes/cinder_volumes_plan.md open item 3.
+# development_notes/05_cinder_volumes_plan.md open item 3.
 
 VOLUME_GB = 20
 

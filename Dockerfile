@@ -97,7 +97,7 @@ RUN python3 -m pip install \
 RUN python3 -m pip install --no-cache-dir gunicorn uvicorn[standard] uvicorn-worker
 
 # The fleet controller runs from THIS image rather than its own python:3.12-slim
-# one (worker_sizing_plan.md S3, P0.5). It assigns work through Girder's model
+# one (03_worker_sizing_plan.md S3, P0.5). It assigns work through Girder's model
 # layer in-process, so it needs girder, girder_worker and girder_sivacor
 # importable -- which a standalone controller image cannot have without
 # duplicating this entire install. `beat` and `local_worker` already share this

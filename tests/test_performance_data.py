@@ -414,7 +414,7 @@ def test_performance_data_integration(
                 )
 
                 # The disk story, to the same three parts (V7 of
-                # cinder_volumes_plan.md). This submission asked for no volume,
+                # 05_cinder_volumes_plan.md). This submission asked for no volume,
                 # which is the ~90% case and the one worth pinning: the field has
                 # to be present and None, not absent and not 0 -- absent would
                 # make an older worker indistinguishable from a root-disk run,

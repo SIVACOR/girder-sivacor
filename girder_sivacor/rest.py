@@ -182,7 +182,7 @@ def targeted_assignment():
 #: field and not a group. ``sivacor.worker_size_group_name`` gates a *boolean*
 #: capability, and a Girder group has no per-member payload, so a group cannot
 #: express "Alice may have 200 GB, Bob 50". See V3 in
-#: development_notes/cinder_volumes_plan.md.
+#: development_notes/05_cinder_volumes_plan.md.
 #:
 #: camelCase to match the other plugin-owned user fields (``lastJobId``,
 #: ``lastProjectId``); a dotted key would be a Mongo field-name hazard.
@@ -285,7 +285,7 @@ def _volume_hours(job, now):
 
 
 def volume_usage():
-    """Per-user scratch-volume accounting: C5.2 of cinder_volumes_plan.md.
+    """Per-user scratch-volume accounting: C5.2 of 05_cinder_volumes_plan.md.
 
     The precondition for approving a second account, because the first question a
     second approved user creates is "who is spending the storage grant" -- and
@@ -521,7 +521,7 @@ def verify_upload_complete(file):
     one upload let the aborted one's rollback delete bytes the other had already
     written, while the ``received`` counter it finalises on keeps the advanced
     value. Full mechanism, evidence and the upstream fix:
-    ``development_notes/girder_upload_race_plan.md``.
+    ``development_notes/08_girder_upload_race_plan.md``.
 
     Nothing else notices. The download route builds ``Content-Length`` from the
     document and streams from disk, so the *client* is the first thing to see a
@@ -550,7 +550,7 @@ def verify_upload_complete(file):
 
     logger.error(
         "Refusing submission for file %s: document says %d bytes, blob has %d "
-        "(short by %d). See development_notes/girder_upload_race_plan.md",
+        "(short by %d). See development_notes/08_girder_upload_race_plan.md",
         file["_id"],
         declared,
         stored,
@@ -576,7 +576,7 @@ def build_submission_chain(job, file, stages, secrets):
     publish it straight to that instance's private queue. There must be exactly
     one builder: a second copy in another repo is a scheduling policy that can
     drift, which is the thing S2/S3 exist to prevent. See P2 in
-    development_notes/worker_sizing_plan.md.
+    development_notes/03_worker_sizing_plan.md.
 
     Builds only -- the caller publishes. Under targeted assignment the claim and
     the publish have to be ordered against each other (claim first, always: the
@@ -807,7 +807,7 @@ class SIVACOR(Resource):
             "answered (a linkUrl file, a non-filesystem assetstore, an "
             "unreadable path). 'complete' is true in that case: this reports a "
             "specific corruption, and 'cannot tell' must not read as 'broken'. "
-            "See development_notes/girder_upload_race_plan.md."
+            "See development_notes/08_girder_upload_race_plan.md."
         )
         .modelParam(
             "id",
@@ -882,7 +882,7 @@ class SIVACOR(Resource):
         # Same reasoning as the size above, and the same place: server-side,
         # before anything is created. Unlike the size this can be None, meaning
         # no volume -- which is every submission on a deployment that has not
-        # turned the feature on. C1 in development_notes/cinder_volumes_plan.md.
+        # turned the feature on. C1 in development_notes/05_cinder_volumes_plan.md.
         requested_disk_gb = resolve_volume_gb(workflow, user)
 
         assigned = targeted_assignment()
@@ -1071,7 +1071,7 @@ class SIVACOR(Resource):
             "available one: an ephemeral worker stops consuming the dispatch "
             "queue the moment it claims a submission, so counting it as capacity "
             "makes the controller refuse to create the instance the next "
-            "submission needs. See D8 in autoscaling_plan.md.\n\n"
+            "submission needs. See D8 in 01_autoscaling_plan.md.\n\n"
             "Deliberately recorded server-side rather than read back over the "
             "broker: 'celery inspect active_queues' would answer the same "
             "question, but a worker whose broker connection has died cannot "
@@ -1325,7 +1325,7 @@ class SIVACOR(Resource):
             # instance for it -- there is no worker to have a heartbeat and no
             # run to overrun. Judging that wait by either of the rules below
             # fails a healthy submission and names the wrong cause; it gets its
-            # own, longer bound instead. See P2 in worker_sizing_plan.md.
+            # own, longer bound instead. See P2 in 03_worker_sizing_plan.md.
             assigned_at = meta.get("assigned_at")
             if meta.get("awaiting_assignment") and not assigned_at:
                 # A rung withdrawn from the catalogue while this waited. The
@@ -1638,7 +1638,7 @@ class SIVACOR(Resource):
     @access.admin
     @autoDescribeRoute(
         Description("Per-user scratch-volume accounting, in GB-hours.").notes(
-            "C5.2 of cinder_volumes_plan.md, and the precondition for approving "
+            "C5.2 of 05_cinder_volumes_plan.md, and the precondition for approving "
             "a second account: it answers 'who is spending the storage grant'.\n\n"
             "Admin-only and deliberately user-attributed -- unlike "
             "/sivacor/execution_record, which is anonymous by design and must "

@@ -340,7 +340,7 @@ def test_a_full_disk_is_recorded_as_a_full_disk_not_as_a_bug():
     one filesystem: an archive beside its extracted tree, and a zip of the whole
     project *inside* that project. A disk that filled there raised ``OSError`` and
     was recorded as ``UNEXPECTED``/``OSError``, indistinguishable from a bug in
-    our own code. See workspace_disk_waste.md.
+    our own code. See 07_workspace_disk_waste.md.
     """
     exc = OSError(errno.ENOSPC, "No space left on device")
 

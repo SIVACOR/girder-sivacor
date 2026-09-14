@@ -6,7 +6,7 @@ upload let the aborted one's rollback delete bytes the other had already
 written, while the ``received`` counter it finalises on keeps the advanced
 value. It happened twice in production on 2026-09-02, to the same 1.66 GB
 archive, losing 10 485 760 and 134 938 624 bytes. Mechanism, evidence and the
-upstream fix: ``development_notes/girder_upload_race_plan.md``.
+upstream fix: ``development_notes/08_girder_upload_race_plan.md``.
 
 Nothing downstream notices until something reads the whole file, and by then a
 fleet instance has been created and an image pulled. The failure surfaced on the

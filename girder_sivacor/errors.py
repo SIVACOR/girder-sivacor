@@ -161,8 +161,8 @@ def classify(exc):
     classifying error strings after the fact does not apply -- an errno is not a
     string, and nothing about the researcher's data reaches the record.
 
-    See ``development_notes/cinder_volumes_plan.md`` C0.1 and
-    ``workspace_disk_waste.md`` for the two writes this covers.
+    See ``development_notes/05_cinder_volumes_plan.md`` C0.1 and
+    ``07_workspace_disk_waste.md`` for the two writes this covers.
     """
     if isinstance(exc, SubmissionError):
         return exc.code, exc.detail

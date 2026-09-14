@@ -36,7 +36,7 @@ class PluginSettings:
     #: processes need it and they share no other config channel: this plugin
     #: validates submissions against it, and the fleet controller reads it out
     #: of Mongo to know which flavour to boot. See P0.3 in
-    #: development_notes/worker_sizing_plan.md.
+    #: development_notes/03_worker_sizing_plan.md.
     #:
     #: ``vcpus`` is duplicated here deliberately. This plugin holds no
     #: OpenStack credential, so it cannot ask Nova for a flavour's shape, yet
@@ -73,7 +73,7 @@ class PluginSettings:
     #: workspace; if neither does, nothing runs at all and the fleet looks like
     #: a healthy idle system. Two environment variables in two services can
     #: disagree about that; one setting cannot. See P2 in
-    #: development_notes/worker_sizing_plan.md.
+    #: development_notes/03_worker_sizing_plan.md.
     #:
     #: A submission already in flight is never picked up by the other path:
     #: each one records which way it was routed in ``meta.awaiting_assignment``,
@@ -96,7 +96,7 @@ class PluginSettings:
     #: ``resources.disk_gb`` on a deployment with this false is refused at
     #: submit time; a submission that does not ask is unaffected either way, and
     #: takes a code path with no volume in it. See V1/V8 in
-    #: development_notes/cinder_volumes_plan.md.
+    #: development_notes/05_cinder_volumes_plan.md.
     #:
     #: Separate from :attr:`VOLUME_TOTAL_GB` on purpose, even though a zero
     #: reservation would also refuse everything: "the operator has not turned

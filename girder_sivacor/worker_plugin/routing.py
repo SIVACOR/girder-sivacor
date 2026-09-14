@@ -161,7 +161,7 @@ def stop_accepting_submissions(app, task) -> str | None:
 
     Closing it properly means ``task_acks_late`` on the dispatch-queue task, so the
     message stays unacked while ``prepare_submission`` runs and prefetch=1 actually
-    binds. See D8 in ``autoscaling_plan.md`` -- not done, and it has a Redis
+    binds. See D8 in ``01_autoscaling_plan.md`` -- not done, and it has a Redis
     ``visibility_timeout`` interaction that has to be settled first.
     """
     if not is_ephemeral_worker():
