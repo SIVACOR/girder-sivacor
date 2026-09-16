@@ -573,6 +573,45 @@ def is_matlab(image_reference: str) -> bool:
     return image_reference.startswith("dynare")
 
 
+def is_julia(image_reference: str) -> bool:
+    """Whether this is one of our Julia images.
+
+    Registry-qualified, unlike every other family here, because these are the
+    only images SIVACOR builds and publishes itself (10-D14 in
+    development_notes/10_julia_support_plan.md). The bare ``julia`` prefix spans
+    every per-line repo -- ``julia1.10``, ``julia1.11``, ``julia1.13`` -- the
+    same way one ``dataeditors/stata`` prefix spans stata15 through
+    stata19_5-mp-i-python.
+    """
+    return image_reference.startswith("ghcr.io/sivacor/julia")
+
+
+def _nearest_project_toml(base_path: Path, main_relative: Path) -> Path | None:
+    """Directory of the ``Project.toml`` that governs ``main_relative``.
+
+    Searches upward from the main file's own directory, nearest first, stopping
+    at the package root -- exactly what Julia's own ``--project=@.`` does.
+    Returns the directory relative to ``base_path``, or ``None`` if there is no
+    ``Project.toml`` anywhere above the main file.
+
+    **Several ``Project.toml`` files in one package is the normal Julia layout,
+    not an ambiguity**, which is why this searches rather than collecting
+    candidates the way the main-file lookup below does. ``docs/Project.toml``
+    and ``test/Project.toml`` are documented conventions -- DataFrames.jl and
+    GLM.jl ship two apiece, CSV.jl ships four -- so refusing a package for
+    having more than one, as MAIN_FILE_AMBIGUOUS does for main files, would
+    reject packages laid out exactly as Julia tells people to lay them out.
+    Nearest-upward is unambiguous by construction and needs no such rule.
+    """
+    directory = (base_path / main_relative).parent
+    while True:
+        if (directory / "Project.toml").is_file():
+            return directory.relative_to(base_path)
+        if directory == base_path:
+            return None
+        directory = directory.parent
+
+
 def stata_license_mount_source(api, submission, host_tmp_root: str) -> str:
     """Host path to bind at ``/usr/local/stata/stata.lic``, materializing it if needed.
 
@@ -710,6 +749,16 @@ def _infer_run_command(submission, stage):
     elif image_name.startswith("dynare"):
         entrypoint = ["/usr/local/bin/matlab", "-batch"]
         home_dir = "/home/matlab"
+    elif is_julia(image_name):
+        # --startup-file=no keeps a stray startup.jl out of a certified run.
+        # --project=. rather than @.: the working directory is already set to
+        # the Project.toml's own directory below, so the upward search would
+        # only find the same answer more slowly and less explicitly.
+        entrypoint = [
+            "/usr/local/julia/bin/julia",
+            "--startup-file=no",
+            "--project=.",
+        ]
     else:
         raise SubmissionError(
             FailureCode.NO_ENTRYPOINT,
@@ -749,8 +798,24 @@ def _infer_run_command(submission, stage):
         )
 
     sub_dir = ""
+    if is_julia(image_name):
+        # The working directory is the Project.toml's, not the main file's:
+        # `--project=.` resolves against the cwd, and both the resolve phase and
+        # the analysis have to agree on which environment they are talking about.
+        project_rel = _nearest_project_toml(base_path, relative_paths[0])
+        if project_rel is None:
+            raise SubmissionError(
+                FailureCode.PROJECT_FILE_MISSING,
+                "This Julia submission has no Project.toml. SIVACOR resolves "
+                "the environment you declare, so a Project.toml listing your "
+                "dependencies is required -- place one beside "
+                f"{stage['main_file']} or at the top of your package. Include "
+                "Manifest.toml too if you have one: it pins the exact versions.",
+            )
+        sub_dir = "" if project_rel == Path(".") else str(project_rel)
+        command = relative_paths[0].relative_to(project_rel).as_posix()
     # If renv.lock is found override sub_dir and command to use it
-    if len(renv_paths) == 1:
+    elif len(renv_paths) == 1:
         print(
             "Found renv.lock, adjusting command to use its location as working directory."
         )
@@ -1199,6 +1264,24 @@ _IMAGE_FAMILY_COMPRESSED_GB = {
 }
 
 
+def image_family(image_reference: str) -> str:
+    """The namespace key :data:`_IMAGE_FAMILY_COMPRESSED_GB` is keyed by.
+
+    A bare Docker Hub reference starts with its namespace -- ``dataeditors``,
+    ``rocker``, ``dynare`` -- but a registry-qualified one starts with the
+    *host*, so ``ghcr.io/sivacor/julia1.11`` would key on ``ghcr.io``: a
+    registry, not a family. An entry under that key would then claim to know the
+    size of every GHCR image SIVACOR ever adds, whatever it contained.
+
+    A leading host is a first segment carrying a ``.`` or a ``:``, which is how
+    the OCI spec itself tells a registry from a namespace.
+    """
+    parts = str(image_reference).split("/")
+    if len(parts) > 1 and ("." in parts[0] or ":" in parts[0]):
+        parts = parts[1:]
+    return parts[0].lower()
+
+
 def image_on_disk_estimate(cli, image_reference) -> tuple[int, str] | None:
     """Estimate what pulling ``image_reference`` will add to the disk.
 
@@ -1235,7 +1318,7 @@ def image_on_disk_estimate(cli, image_reference) -> tuple[int, str] | None:
     else:
         return 0, "already present locally"
 
-    family = str(image_reference).split("/", 1)[0].lower()
+    family = image_family(image_reference)
     compressed_gb = _IMAGE_FAMILY_COMPRESSED_GB.get(family)
     if compressed_gb is None:
         logging.info(

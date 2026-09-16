@@ -86,6 +86,17 @@ RAISE_SITES = [
         id="main_file_missing",  # lib.py:528, detail omitted
     ),
     pytest.param(
+        FailureCode.PROJECT_FILE_MISSING,
+        "This Julia submission has no Project.toml. SIVACOR resolves the "
+        "environment you declare, so a Project.toml listing your dependencies "
+        "is required -- place one beside main.jl or at the top of your package. "
+        "Include Manifest.toml too if you have one: it pins the exact versions.",
+        None,
+        # detail omitted: the only thing it could carry is a path out of the
+        # researcher's package.
+        id="project_file_missing",
+    ),
+    pytest.param(
         FailureCode.MAIN_FILE_AMBIGUOUS,
         "Cannot infer run command for submission. Multiple main.do files "
         "found: a/main.do, b/main.do",

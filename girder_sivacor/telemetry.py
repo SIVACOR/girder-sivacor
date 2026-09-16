@@ -182,6 +182,11 @@ def _stata_detail(value):
 _DETAIL_VALIDATORS = {
     FailureCode.STATA_ERROR: _stata_detail,
     FailureCode.NONZERO_EXIT: lambda v: _safe_int(v),
+    # Same shape as NONZERO_EXIT: the exit code of the resolve container.
+    # PROJECT_FILE_MISSING deliberately has no entry -- its only possible detail
+    # would be a path out of the researcher's package, and a code absent from
+    # this table stores detail=None, which is the answer we want.
+    FailureCode.DEPENDENCY_RESOLUTION_FAILED: lambda v: _safe_int(v),
     # The memory cap the run exceeded. A machine fact -- it is derived from the
     # worker's flavor, identically for every submission that lands on one -- so
     # it says nothing about the researcher, and it is the number that makes the

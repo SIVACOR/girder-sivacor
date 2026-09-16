@@ -31,6 +31,7 @@ from .girder_api import GirderApi, dump_to_zip
 from .lib import (
     _redis_client_sync,
     get_project_dir,
+    is_julia,
     reap_orphaned_containers,
     recorded_run,
     zip_symlink,
@@ -518,6 +519,14 @@ def create_workspace(task, api, submission):
     for stage in submission.get("stages", []):
         if stage["image_name"].startswith("rocker/"):
             os.makedirs(os.path.join(workspace_dir, "R", "library"), exist_ok=True)
+        # The Julia depot, for the same reason and in the same place: a sibling
+        # of project/, never inside it. Arrangements are built by walking
+        # project_dir, so a depot under it would hash every package the resolve
+        # phase downloads into the TRO composition and ship them inside the
+        # researcher's replication package. HOME is /workspace in the container,
+        # so ~/.julia lands here.
+        if is_julia(stage["image_name"]):
+            os.makedirs(os.path.join(workspace_dir, ".julia"), exist_ok=True)
 
     fobj = api.file(submission["file_id"])
     temp_filename = os.path.join(workspace_dir, fobj["name"])
