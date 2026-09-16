@@ -367,7 +367,7 @@ def test_schema_carries_a_workflow_level_resources_object(server):
     is a published contract -- the schema is served to clients and an exported
     workflow carries these keys -- so adding one should be a deliberate edit to
     this line, not something a change slips past. ``disk_gb`` was added by C1
-    of cinder_volumes_plan.md and is workflow-level for the same reason
+    of 05_cinder_volumes_plan.md and is workflow-level for the same reason
     ``memory_gb`` is: one submission gets one machine, and one volume.
     """
     resources = stage_schema["properties"]["resources"]

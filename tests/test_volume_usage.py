@@ -1,4 +1,4 @@
-"""Per-user scratch-volume accounting: C5.2 of cinder_volumes_plan.md.
+"""Per-user scratch-volume accounting: C5.2 of 05_cinder_volumes_plan.md.
 
 The gate on approving a *second* account, because the first question a second
 approved user creates is "who is spending the storage grant". These tests pin the

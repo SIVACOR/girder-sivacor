@@ -9,7 +9,7 @@ this feature inert by default.
 The resource being guarded is not merely expensive, it is *shared*: the
 gigabytes come out of the same 1000 GB of OpenStack Cinder quota that
 production's 800 GB assetstore volume draws on (see
-development_notes/cinder_volumes_plan.md section 2). So every uncertain input
+development_notes/05_cinder_volumes_plan.md section 2). So every uncertain input
 here has to fail closed, and several tests exist only to pin that direction.
 """
 

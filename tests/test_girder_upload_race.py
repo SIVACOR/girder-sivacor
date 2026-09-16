@@ -15,7 +15,7 @@ already counted.
 Production consequence, twice on 2026-09-02: an upload finalises with a blob
 short of its document's ``size``, and nothing notices until something reads the
 whole file. Full write-up, log evidence and the upstream plan:
-``development_notes/girder_upload_race_plan.md``.
+``development_notes/08_girder_upload_race_plan.md``.
 
 **No threads are needed to demonstrate it.** Concurrency is only how two
 requests come to hold the same ``received``; the defect is what the rollback
@@ -60,7 +60,7 @@ def _send(upload, payload):
 @pytest.mark.xfail(
     strict=True,
     reason="Upstream girder bug: the rollback truncates to a stale 'received'. "
-    "A PASS means upstream fixed it -- see girder_upload_race_plan.md",
+    "A PASS means upstream fixed it -- see 08_girder_upload_race_plan.md",
 )
 def test_a_failed_chunk_does_not_delete_another_chunks_bytes(
     server, db, user, fsAssetstore, uploads_folder
@@ -92,7 +92,7 @@ def test_a_failed_chunk_does_not_delete_another_chunks_bytes(
 @pytest.mark.xfail(
     strict=True,
     reason="Upstream girder bug: an upload finalises with a blob shorter than "
-    "its document's size -- see girder_upload_race_plan.md",
+    "its document's size -- see 08_girder_upload_race_plan.md",
 )
 def test_an_upload_cannot_finalise_shorter_than_its_document(
     server, db, user, fsAssetstore, uploads_folder

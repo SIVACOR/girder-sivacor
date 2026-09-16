@@ -2,7 +2,7 @@
 
 Under targeted assignment ``submit_job`` stops publishing: the fleet controller
 picks an instance for a submission and publishes the chain to that instance's
-private queue instead. See P2 in development_notes/worker_sizing_plan.md.
+private queue instead. See P2 in development_notes/03_worker_sizing_plan.md.
 
 Two failure shapes drive everything here, and both are silent in production:
 

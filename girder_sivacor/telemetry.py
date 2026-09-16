@@ -182,6 +182,11 @@ def _stata_detail(value):
 _DETAIL_VALIDATORS = {
     FailureCode.STATA_ERROR: _stata_detail,
     FailureCode.NONZERO_EXIT: lambda v: _safe_int(v),
+    # Same shape as NONZERO_EXIT: the exit code of the resolve container.
+    # PROJECT_FILE_MISSING deliberately has no entry -- its only possible detail
+    # would be a path out of the researcher's package, and a code absent from
+    # this table stores detail=None, which is the answer we want.
+    FailureCode.DEPENDENCY_RESOLUTION_FAILED: lambda v: _safe_int(v),
     # The memory cap the run exceeded. A machine fact -- it is derived from the
     # worker's flavor, identically for every submission that lands on one -- so
     # it says nothing about the researcher, and it is the number that makes the
@@ -222,10 +227,18 @@ def _catalogue_size(value, allowed):
     return value if value in allowed else None
 
 
+#: The phases one stage can run through. A closed set of two machine-chosen
+#: words, not researcher content -- the same class as ``network_isolation``.
+#: A row with no phase is from before the resolve phase existed and is an
+#: analysis by definition.
+_PHASES = frozenset({"analysis", "resolve"})
+
+
 def _sanitize_stage(stage, allowed_sizes=()):
     if not isinstance(stage, dict):
         return None
     return {
+        "phase": _one_of(stage.get("phase", "analysis"), _PHASES) or "analysis",
         # What the submission *asked* for, beside mem_limit_bytes -- what it got.
         # Same class as mem_limit_bytes: a machine capability shared by every
         # submission at that size, not an identifier. Validated against the
@@ -320,7 +333,11 @@ def sanitize_record(payload, date, allowed_sizes=()):
         "date": date,
         "status": status,
         "stack_version": _matching(payload.get("stack_version"), _TAG),
-        "n_stages": len(stages),
+        # Analysis phases only. A Julia submission records two rows per stage --
+        # the dependency resolve and the run -- and counting both would report a
+        # one-stage submission as two, silently changing what every historical
+        # n_stages means relative to a new one.
+        "n_stages": sum(1 for s in stages if s["phase"] == "analysis"),
         "total_duration_seconds": _safe_number(payload.get("total_duration_seconds")),
         "package_size_bucket": bucket,
         "requested_disk_gb": _volume_gb(payload.get("requested_disk_gb")),

@@ -126,7 +126,7 @@ leaving a file document larger than its blob. Both tests are
 `xfail(strict=True)`, so **a pass is a failure** — it means upstream fixed the
 bug and the mitigation in `rest.py` (`verify_upload_complete`, and
 `GET /sivacor/upload_integrity`) can be reconsidered. If you see `xpassed`, read
-`../development_notes/girder_upload_race_plan.md` before deleting anything.
+`../development_notes/08_girder_upload_race_plan.md` before deleting anything.
 
 ## `tools/` — operator scripts, and not scratch
 
@@ -135,7 +135,7 @@ against the blob it points at, and separately looks for uploads whose
 `received` counter has outrun their temp file. Read-only. It exists because
 Girder can finalise an upload whose stored copy is *shorter* than its
 document, and nothing else in the stack notices until something reads the whole
-file — see `../development_notes/girder_upload_race_plan.md`.
+file — see `../development_notes/08_girder_upload_race_plan.md`.
 
 Run it inside the girder container, which already has pymongo and the
 assetstore mounted:

@@ -55,6 +55,22 @@ class FailureCode(str, Enum):
     IMAGE_PULL_FAILED = "image_pull_failed"
     #: No run command could be inferred for the image family.
     NO_ENTRYPOINT = "no_entrypoint"
+    #: The submission declares no dependency manifest for a stack that requires
+    #: one. Julia is the first: SIVACOR resolves the environment the researcher
+    #: declares, so there has to be a declaration.
+    #:
+    #: Named for the concept rather than for Julia, like the code below it.
+    #: ``renv::restore()`` is the same shape for R, and a code renamed later
+    #: silently reinterprets every record already written under the old name.
+    PROJECT_FILE_MISSING = "project_file_missing"
+    #: Dependency resolution failed before the researcher's code ever ran.
+    #: ``detail`` is the exit code.
+    #:
+    #: Separate from NONZERO_EXIT on purpose: folded into it, "your declared
+    #: environment could not be assembled" would be indistinguishable from "your
+    #: code raised", and telling those apart is the entire reason the resolve
+    #: phase is a phase of its own.
+    DEPENDENCY_RESOLUTION_FAILED = "dependency_resolution_failed"
     #: The declared main file is not in the package.
     MAIN_FILE_MISSING = "main_file_missing"
     #: The declared main file appears more than once. ``detail`` is the count.
@@ -161,8 +177,8 @@ def classify(exc):
     classifying error strings after the fact does not apply -- an errno is not a
     string, and nothing about the researcher's data reaches the record.
 
-    See ``development_notes/cinder_volumes_plan.md`` C0.1 and
-    ``workspace_disk_waste.md`` for the two writes this covers.
+    See ``development_notes/05_cinder_volumes_plan.md`` C0.1 and
+    ``07_workspace_disk_waste.md`` for the two writes this covers.
     """
     if isinstance(exc, SubmissionError):
         return exc.code, exc.detail
