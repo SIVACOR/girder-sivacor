@@ -67,7 +67,10 @@ def julia_is_allow_listed():
 JSON_UUID = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
 
 
-def julia_package(uploads_folder, user, main_file="main.jl", project=None, script=None):
+def julia_package(
+    uploads_folder, user, main_file="main.jl", project=None, script=None,
+    manifest=None,
+):
     """Build and upload a Julia replication package.
 
     ``project=None`` ships no ``Project.toml`` at all, which is the case
@@ -84,6 +87,9 @@ def julia_package(uploads_folder, user, main_file="main.jl", project=None, scrip
         if project is not None:
             with open(os.path.join(directory, "Project.toml"), "w") as handle:
                 handle.write(project)
+        if manifest is not None:
+            with open(os.path.join(directory, "Manifest.toml"), "w") as handle:
+                handle.write(manifest)
         with tarfile.open(archive.name, "w:gz") as tar:
             tar.add(directory, arcname=".")
         return upload_test_file(uploads_folder, user, archive.name)
@@ -208,6 +214,52 @@ def test_the_resolve_phase_is_what_produces_the_manifest(
     }
     assert "performance_data_stage_1.json" in names
     assert "performance_data_stage_1_resolve.json" in names
+
+    # 10-D2: a generated manifest is a weaker guarantee than a supplied one, and
+    # the researcher has to be told which they got, in the place they are
+    # already reading.
+    fetched = server.request(path=f"/job/{job['_id']}", method="GET", user=user).json
+    log = "".join(fetched["log"])
+    assert "No Manifest.toml was supplied" in log
+    assert "does not pin them in advance" in log
+
+
+@pytest.mark.plugin("sivacor")
+def test_a_supplied_manifest_is_reported_as_such(
+    server, db, user, eagerWorkerTasks, fsAssetstore, patched_gpg,
+    uploads_folder, submission_collection,
+):
+    """The other half of 10-D2 -- and a resolve with nothing to do still runs.
+
+    An empty environment on purpose: it exercises the "supplied" branch without
+    a download, and it checks the claim that the resolve phase is unconditional.
+    Making it conditional on having something to fetch would make the TRO's
+    shape depend on cache contents.
+    """
+    fobj = julia_package(
+        uploads_folder,
+        user,
+        project="[deps]\n",
+        manifest='julia_version = "1.11.9"\nmanifest_format = "2.0"\n\n[deps]\n',
+        script='println("no dependencies here")\n',
+    )
+    stages = [{"image_name": IMAGE, "image_tag": TAG, "main_file": "main.jl"}]
+    resp = submit_sivacor_job(server, user, fobj, stages)
+    assertStatusOk(resp)
+    job = Job().load(resp.json["_id"], force=True)
+    assert job["status"] == JobStatus.SUCCESS
+
+    fetched = server.request(path=f"/job/{job['_id']}", method="GET", user=user).json
+    log = "".join(fetched["log"])
+    assert "Manifest.toml was supplied" in log
+    assert "No Manifest.toml was supplied" not in log
+
+    # The resolve still ran, and still has a performance of its own.
+    resp = get_submission_folder(server, user, job["_id"], submission_collection)
+    metadata = resp.json[0]["meta"]
+    tro = json.loads(read(File().load(metadata["tro_file_id"], force=True)))
+    performances = listify(tro["@graph"][0].get("trov:hasPerformance"))
+    assert len(performances) == 2
 
 
 @pytest.mark.plugin("sivacor")

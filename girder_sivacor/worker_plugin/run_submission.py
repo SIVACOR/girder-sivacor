@@ -808,6 +808,11 @@ def resolve_dependencies(task, api, submission, stage, env_vars):
     can run for minutes without writing a line.
     """
     report(api, submission["job_id"], "Resolving declared dependencies.")
+    # Whether the researcher pinned their environment or merely declared it.
+    # Read before the resolve, because the resolve is what creates the manifest
+    # when there is none -- afterwards the two cases are indistinguishable.
+    project_dir = pathlib.Path(get_project_dir(submission))
+    supplied_manifest = any(project_dir.rglob("Manifest.toml"))
     start_time = datetime.datetime.now()
     ret = recorded_run(api, submission, stage, env_vars, phase=PHASE_RESOLVE)
     if ret["StatusCode"] == -123:
@@ -821,6 +826,29 @@ def resolve_dependencies(task, api, submission, stage, env_vars):
     # which is the only place that sees a non-zero exit. (execute_workflow's
     # equivalent check is unreachable for the same reason, and predates this.)
     end_time = datetime.datetime.now()
+
+    # 10-D2: a submission without a Manifest.toml still runs, with a weaker
+    # guarantee -- the environment is whatever resolved that day. Say so where
+    # the researcher is already looking. The job log rather than a field on the
+    # folder, because the difference is only actionable while they are reading
+    # about this run, and a flag nobody surfaces is not a disclosure.
+    if supplied_manifest:
+        report(
+            api,
+            submission["job_id"],
+            "Manifest.toml was supplied: dependencies resolved to the versions "
+            "it pins.",
+        )
+    else:
+        report(
+            api,
+            submission["job_id"],
+            "No Manifest.toml was supplied, so one was generated from "
+            "Project.toml and is included in your results. It records the "
+            "versions this run used; it does not pin them in advance. Ship a "
+            "Manifest.toml to get the same versions next year as today.",
+        )
+
     if telemetry_stages := submission.get("telemetry_stages"):
         telemetry_stages[-1]["duration_seconds"] = (
             end_time - start_time
