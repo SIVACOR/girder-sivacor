@@ -99,10 +99,13 @@ RAISE_SITES = [
     pytest.param(
         FailureCode.DEPENDENCY_RESOLUTION_FAILED,
         "Could not resolve the dependencies declared in Project.toml. Check "
-        "stdout/stderr for which package failed -- a name that is not "
-        "registered, a version bound nothing satisfies, or a package whose "
-        "build step failed are the usual causes.",
+        "stderr for which package failed -- a name that is not registered, a "
+        "version bound nothing satisfies, or a package whose build step failed "
+        "are the usual causes. Note Pkg writes its progress to stderr, not "
+        "stdout.",
         1,
+        # Raised by recorded_run, not by resolve_dependencies: recorded_run
+        # raises before returning, so the caller never sees a non-zero exit.
         id="dependency_resolution_failed",  # detail=ret["StatusCode"]
     ),
     pytest.param(

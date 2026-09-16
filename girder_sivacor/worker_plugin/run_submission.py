@@ -814,18 +814,12 @@ def resolve_dependencies(task, api, submission, stage, env_vars):
         print("Termination requested, stopping dependency resolution.")
         return abandon(task, api, submission)
 
-    if ret["StatusCode"] != 0:
-        # Its own code, not NONZERO_EXIT: "the environment you declared could
-        # not be assembled" and "your code raised" are different problems with
-        # different fixes, and telling them apart is why this phase exists.
-        raise SubmissionError(
-            FailureCode.DEPENDENCY_RESOLUTION_FAILED,
-            "Could not resolve the dependencies declared in Project.toml. "
-            "Check stdout/stderr for which package failed -- a name that is not "
-            "registered, a version bound nothing satisfies, or a package whose "
-            "build step failed are the usual causes.",
-            detail=ret["StatusCode"],
-        )
+    # No StatusCode check here, deliberately. recorded_run raises before it
+    # returns, so this would be unreachable -- and writing it anyway is how the
+    # resolve phase first shipped reporting NONZERO_EXIT: the branch existed,
+    # looked right, and never ran. The classification lives in recorded_run,
+    # which is the only place that sees a non-zero exit. (execute_workflow's
+    # equivalent check is unreachable for the same reason, and predates this.)
     end_time = datetime.datetime.now()
     if telemetry_stages := submission.get("telemetry_stages"):
         telemetry_stages[-1]["duration_seconds"] = (

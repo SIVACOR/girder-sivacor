@@ -2081,6 +2081,22 @@ def recorded_run(api, submission, stage, env_vars, phase=PHASE_ANALYSIS):
                 detail=mem_limit,
             )
         if ret["StatusCode"] != 0:
+            # Classified HERE, not by the caller. recorded_run raises before it
+            # returns, so a caller checking StatusCode itself never sees a
+            # non-zero one -- which is how the resolve phase first shipped
+            # reporting NONZERO_EXIT, the one code it exists to be distinguished
+            # from.
+            if phase == PHASE_RESOLVE:
+                raise SubmissionError(
+                    FailureCode.DEPENDENCY_RESOLUTION_FAILED,
+                    "Could not resolve the dependencies declared in "
+                    "Project.toml. Check stderr for which package failed -- a "
+                    "name that is not registered, a version bound nothing "
+                    "satisfies, or a package whose build step failed are the "
+                    "usual causes. Note Pkg writes its progress to stderr, not "
+                    "stdout.",
+                    detail=ret["StatusCode"],
+                )
             raise SubmissionError(
                 FailureCode.NONZERO_EXIT,
                 "Error executing recorded run. Check stdout/stderr for details.",
