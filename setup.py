@@ -42,7 +42,7 @@ setup(
     name="girder-sivacor",
     packages=find_packages(exclude=["test", "test.*"]),
     url="https://github.com/SIVACOR/girder-sivacor",
-    version="0.1.3",
+    version="0.2.0",
     zip_safe=False,
     entry_points={
         "girder.plugin": ["sivacor = girder_sivacor:SIVACORPlugin"],
