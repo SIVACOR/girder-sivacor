@@ -6,6 +6,7 @@ import math
 import os
 import queue
 import re
+import shlex
 import shutil
 import socket
 import stat
@@ -584,6 +585,41 @@ def is_julia(image_reference: str) -> bool:
     stata19_5-mp-i-python.
     """
     return image_reference.startswith("ghcr.io/sivacor/julia")
+
+
+#: The analysis itself -- the researcher's code, the thing being certified.
+PHASE_ANALYSIS = "analysis"
+#: Assembling the environment the researcher declared, before their code runs.
+#: A separate container with the network on, and a separate performance in the
+#: TRO, so ``InternetIsolation`` can be claimed for the analysis and not for
+#: this. See 10-D1/10-D4 in development_notes/10_julia_support_plan.md.
+PHASE_RESOLVE = "resolve"
+
+
+def performance_data_name(stage_num: int, phase: str = PHASE_ANALYSIS) -> str:
+    """Filename for one phase's performance data in the submission folder.
+
+    The phase has to be in the name. Both phases of a stage run through
+    :func:`recorded_run`, which uploads this file by name, so without the
+    suffix the analysis would overwrite the resolve's metrics and the TRO would
+    describe one performance twice.
+    """
+    suffix = "" if phase == PHASE_ANALYSIS else f"_{phase}"
+    return f"performance_data_stage_{stage_num}{suffix}.json"
+
+
+def resolve_entrypoint() -> tuple[list[str], str]:
+    """What the resolve phase runs: instantiate the declared environment, nothing else.
+
+    No researcher entry point -- but **this is not code-free**. Julia runs each
+    package's ``deps/build.jl`` on install, so what executes here is the
+    researcher's dependency tree, with the network on, inside the same hardened
+    container as the analysis.
+    """
+    return (
+        ["/usr/local/julia/bin/julia", "--startup-file=no", "--project=.", "-e"],
+        shlex.quote("using Pkg; Pkg.instantiate()"),
+    )
 
 
 def _nearest_project_toml(base_path: Path, main_relative: Path) -> Path | None:
@@ -1505,7 +1541,7 @@ def pull_image(cli, api, submission, image_reference):
     logging.info(msg)
 
 
-def recorded_run(api, submission, stage, env_vars):
+def recorded_run(api, submission, stage, env_vars, phase=PHASE_ANALYSIS):
     cli = docker.from_env()
     info = cli.info()
     cpu_info = cpuinfo.get_cpu_info()
@@ -1636,6 +1672,11 @@ def recorded_run(api, submission, stage, env_vars):
     pull_image(cli, api, submission, image_reference)
 
     entrypoint, command, sub_dir, home_dir = _infer_run_command(submission, stage)
+    if phase == PHASE_RESOLVE:
+        # Same working directory as the analysis -- _infer_run_command put it at
+        # the Project.toml -- so `--project=.` means the same environment in
+        # both phases. Only what runs there differs.
+        entrypoint, command = resolve_entrypoint()
     project_dir = get_project_dir(submission)
     logging.info(
         "Setting working directory to: "
@@ -1667,7 +1708,12 @@ def recorded_run(api, submission, stage, env_vars):
         "command": command,
         "detach": True,
         "mounts": mounts,
-        "network_disabled": stage.get("network_isolation", False),
+        # The resolve phase is never isolated: it exists to fetch. The claim
+        # stays honest because it is a performance of its own and does not carry
+        # the InternetIsolation attribute (10-D4) -- the analysis below does.
+        "network_disabled": (
+            False if phase == PHASE_RESOLVE else stage.get("network_isolation", False)
+        ),
         "read_only": read_only,
         "working_dir": os.path.join(target_workspace_dir, "project", sub_dir),
         "user": user,
@@ -1857,6 +1903,10 @@ def recorded_run(api, submission, stage, env_vars):
                 # actually got: mem_limit_bytes alone cannot say whether a run
                 # was sized deliberately or simply landed on whatever was free.
                 "requested_memory_gb": submission.get("telemetry_requested_memory_gb"),
+                # Which phase this row is. Two rows per Julia stage, one per
+                # stage for every other stack -- so a consumer counting stages
+                # has to filter, and sanitize_record's n_stages does.
+                "phase": phase,
                 "image_name": stage.get("image_name"),
                 "image_tag": stage.get("image_tag"),
                 "network_isolation": bool(stage.get("network_isolation", False)),
@@ -1883,7 +1933,7 @@ def recorded_run(api, submission, stage, env_vars):
             json.dumps(performance_data, cls=NpEncoder, allow_nan=False).encode(
                 "utf-8"
             ),
-            f"performance_data_stage_{stage_num}.json",
+            performance_data_name(stage_num, phase),
             mime_type="text/plain",
             item_type="performance_data",
         )
@@ -1967,7 +2017,11 @@ def recorded_run(api, submission, stage, env_vars):
             if log_obj:
                 api.download_file(log_obj["_id"], log_file)
 
-            stage_stamp = f"\n\n===== Stage {stage_num} Output =====\n\n"
+            stage_stamp = (
+                f"\n\n===== Stage {stage_num} Output =====\n\n"
+                if phase == PHASE_ANALYSIS
+                else f"\n\n===== Stage {stage_num} Dependency Resolution =====\n\n"
+            )
             with open(target_file, "rb") as fp:
                 logging.info(
                     f"Reading {key} from {target_file} and appending to {log_file}..."

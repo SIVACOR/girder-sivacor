@@ -29,9 +29,12 @@ from ..statuses import CANCELING, FAILED
 from ..telemetry import size_bucket
 from .girder_api import GirderApi, dump_to_zip
 from .lib import (
+    PHASE_ANALYSIS,
+    PHASE_RESOLVE,
     _redis_client_sync,
     get_project_dir,
     is_julia,
+    performance_data_name,
     reap_orphaned_containers,
     recorded_run,
     zip_symlink,
@@ -568,7 +571,10 @@ def skip_condition(condition, submission):
     return False
 
 
-def _run_tro(task, api, submission, action, inumber, condition):
+def _run_tro(
+    task, api, submission, action, inumber, condition, stage_index=None,
+    phase=PHASE_ANALYSIS,
+):
     """Body shared by :func:`run_tro` and :func:`sign_tro`.
 
     Split out so the signing action can be its own celery task on
@@ -659,15 +665,25 @@ def _run_tro(task, api, submission, action, inumber, condition):
         )
     elif action == "add_performance":
         stages = submission.get("stages", [])
-        main_file = stages[inumber].get("main_file", "unknown")
+        # inumber is the ARRANGEMENT counter, which stopped being the stage
+        # index the moment a stage could produce two performances. stage_index
+        # is passed explicitly by the chain builder; falling back to inumber
+        # keeps a chain built before that change meaning what it meant.
+        index = inumber if stage_index is None else stage_index
+        main_file = stages[index].get("main_file", "unknown")
         runs = submission.get("runs", [])
         run = runs[-1] if runs else {}
-        extra_attributes = _performance_attributes(api, folder_id, inumber + 1)
+        extra_attributes = _performance_attributes(api, folder_id, index + 1, phase)
 
+        comment = (
+            f"SIVACOR workflow execution ({main_file}) step {index + 1}"
+            if phase == PHASE_ANALYSIS
+            else f"SIVACOR dependency resolution ({main_file}) step {index + 1}"
+        )
         tro.add_performance(
             datetime.datetime.fromisoformat(run["run_start_time"]),
             datetime.datetime.fromisoformat(run["run_end_time"]),
-            comment=f"SIVACOR workflow execution ({main_file}) step {inumber + 1}",
+            comment=comment,
             accessed_arrangement=(f"arrangement/{inumber}", "/workspace"),
             modified_arrangement=(f"arrangement/{inumber + 1}", "/workspace"),
             attrs=run.get("run_attrs", []),
@@ -707,8 +723,10 @@ def _run_tro(task, api, submission, action, inumber, condition):
 
 @app.task(queue=DISPATCH_QUEUE, bind=True)
 @submission_task("Failed to run TRO utilities")
-def run_tro(task, api, submission, action, inumber, condition):
-    return _run_tro(task, api, submission, action, inumber, condition)
+def run_tro(task, api, submission, action, inumber, condition, stage_index=None, phase=PHASE_ANALYSIS):
+    return _run_tro(
+        task, api, submission, action, inumber, condition, stage_index, phase
+    )
 
 
 @app.task(queue=LOCAL_QUEUE, bind=True)
@@ -734,9 +752,9 @@ def sign_tro(task, api, submission):
     return _run_tro(task, api, submission, "sign", 0, None)
 
 
-def _performance_attributes(api, folder_id, stage_num):
-    """Read back the performance data recorded_run uploaded for a stage."""
-    item = api.find_child_item(folder_id, f"performance_data_stage_{stage_num}.json")
+def _performance_attributes(api, folder_id, stage_num, phase=PHASE_ANALYSIS):
+    """Read back the performance data recorded_run uploaded for one phase of a stage."""
+    item = api.find_child_item(folder_id, performance_data_name(stage_num, phase))
     if not item:
         return None
     files = api.item_files(item["_id"])
@@ -745,6 +763,81 @@ def _performance_attributes(api, folder_id, stage_num):
     data = json.loads(b"".join(api.file_chunks(files[0]["_id"])))
     # Namespace the bare keys; anything already prefixed is left alone.
     return {f"sivacor:{key}": value for key, value in data.items() if ":" not in key}
+
+
+def needs_resolve_phase(stage) -> bool:
+    """Whether this stage's dependencies must be assembled before it can run.
+
+    Julia today, and the name says "resolve" rather than "julia" because R's
+    ``renv::restore()`` is the same shape: a declared environment that has to be
+    materialised before the researcher's code can load anything. Today
+    ``renv.lock`` only relocates the working directory -- nothing restores it --
+    so R is not in here yet.
+    """
+    return is_julia(stage.get("image_name", ""))
+
+
+@app.task(queue=DISPATCH_QUEUE, bind=True)
+@submission_task("Failed to resolve dependencies")
+def resolve_dependencies(task, api, submission, stage, env_vars):
+    """Assemble the environment the researcher declared, before their code runs.
+
+    A container of its own, with the network **on** regardless of what the stage
+    asked for -- resolution needs the network, and ``InternetIsolation`` is a
+    claim about one performance. Splitting the phases is what lets the analysis
+    keep the attribute while dependencies stay resolvable; the run this appends
+    deliberately never carries it. See 10-D1/10-D4 in
+    development_notes/10_julia_support_plan.md.
+
+    It runs through :func:`recorded_run` rather than a bespoke ``docker run``,
+    and that is not tidiness: it is how the phase inherits heartbeat ticking,
+    cancellation, secret-redacted log streaming, OOM detection and the disk
+    floor. A hand-rolled call would silently have none of them, and a resolve
+    can run for minutes without writing a line.
+    """
+    report(api, submission["job_id"], "Resolving declared dependencies.")
+    start_time = datetime.datetime.now()
+    ret = recorded_run(api, submission, stage, env_vars, phase=PHASE_RESOLVE)
+    if ret["StatusCode"] == -123:
+        print("Termination requested, stopping dependency resolution.")
+        return abandon(task, api, submission)
+
+    if ret["StatusCode"] != 0:
+        # Its own code, not NONZERO_EXIT: "the environment you declared could
+        # not be assembled" and "your code raised" are different problems with
+        # different fixes, and telling them apart is why this phase exists.
+        raise SubmissionError(
+            FailureCode.DEPENDENCY_RESOLUTION_FAILED,
+            "Could not resolve the dependencies declared in Project.toml. "
+            "Check stdout/stderr for which package failed -- a name that is not "
+            "registered, a version bound nothing satisfies, or a package whose "
+            "build step failed are the usual causes.",
+            detail=ret["StatusCode"],
+        )
+    end_time = datetime.datetime.now()
+    if telemetry_stages := submission.get("telemetry_stages"):
+        telemetry_stages[-1]["duration_seconds"] = (
+            end_time - start_time
+        ).total_seconds()
+
+    if submission.get("runs") is None:
+        submission["runs"] = []
+    submission["runs"].append(
+        {
+            "run_start_time": start_time.isoformat(),
+            "run_end_time": end_time.isoformat(),
+            # ENV_ISOLATION, NON_INTERACTIVE and MACHINE_ENFORCEMENT all hold
+            # here -- the container is as hardened as the analysis one. What is
+            # deliberately absent is NET_ISOLATION, whatever the stage asked
+            # for, because this phase had the network.
+            "run_attrs": [
+                TRPAttribute.ENV_ISOLATION.value,
+                TRPAttribute.NON_INTERACTIVE.value,
+                TRPAttribute.MACHINE_ENFORCEMENT.value,
+            ],
+        }
+    )
+    return submission
 
 
 @app.task(queue=DISPATCH_QUEUE, bind=True)

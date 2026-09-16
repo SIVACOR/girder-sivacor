@@ -97,6 +97,15 @@ RAISE_SITES = [
         id="project_file_missing",
     ),
     pytest.param(
+        FailureCode.DEPENDENCY_RESOLUTION_FAILED,
+        "Could not resolve the dependencies declared in Project.toml. Check "
+        "stdout/stderr for which package failed -- a name that is not "
+        "registered, a version bound nothing satisfies, or a package whose "
+        "build step failed are the usual causes.",
+        1,
+        id="dependency_resolution_failed",  # detail=ret["StatusCode"]
+    ),
+    pytest.param(
         FailureCode.MAIN_FILE_AMBIGUOUS,
         "Cannot infer run command for submission. Multiple main.do files "
         "found: a/main.do, b/main.do",

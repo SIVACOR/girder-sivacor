@@ -227,10 +227,18 @@ def _catalogue_size(value, allowed):
     return value if value in allowed else None
 
 
+#: The phases one stage can run through. A closed set of two machine-chosen
+#: words, not researcher content -- the same class as ``network_isolation``.
+#: A row with no phase is from before the resolve phase existed and is an
+#: analysis by definition.
+_PHASES = frozenset({"analysis", "resolve"})
+
+
 def _sanitize_stage(stage, allowed_sizes=()):
     if not isinstance(stage, dict):
         return None
     return {
+        "phase": _one_of(stage.get("phase", "analysis"), _PHASES) or "analysis",
         # What the submission *asked* for, beside mem_limit_bytes -- what it got.
         # Same class as mem_limit_bytes: a machine capability shared by every
         # submission at that size, not an identifier. Validated against the
@@ -325,7 +333,11 @@ def sanitize_record(payload, date, allowed_sizes=()):
         "date": date,
         "status": status,
         "stack_version": _matching(payload.get("stack_version"), _TAG),
-        "n_stages": len(stages),
+        # Analysis phases only. A Julia submission records two rows per stage --
+        # the dependency resolve and the run -- and counting both would report a
+        # one-stage submission as two, silently changing what every historical
+        # n_stages means relative to a new one.
+        "n_stages": sum(1 for s in stages if s["phase"] == "analysis"),
         "total_duration_seconds": _safe_number(payload.get("total_duration_seconds")),
         "package_size_bucket": bucket,
         "requested_disk_gb": _volume_gb(payload.get("requested_disk_gb")),
