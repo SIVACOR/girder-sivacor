@@ -14,6 +14,7 @@ import os
 import tarfile
 import tempfile
 
+import mock
 import pytest
 from girder.models.file import File
 from girder_jobs.constants import JobStatus
@@ -21,6 +22,7 @@ from girder_jobs.models.job import Job
 from pytest_girder.assertions import assertStatusOk
 
 from girder_sivacor.errors import FailureCode
+from girder_sivacor.rest import SIVACOR
 from girder_sivacor.models.execution_record import ExecutionRecord
 
 from .conftest import (
@@ -32,6 +34,32 @@ from .conftest import (
 
 IMAGE = "ghcr.io/sivacor/julia1.11"
 TAG = "1.11.9-20260916"
+
+
+@pytest.fixture(autouse=True)
+def julia_is_allow_listed():
+    """Put the Julia image on the allow-list for the duration of these tests.
+
+    ``submit_job`` validates against ``allowed_repos.yaml``, fetched from the
+    ``sivacor-repo-choice`` repo's **main branch**, and the Julia images are
+    deliberately not there yet: merging that entry arms Julia in *production*
+    within a four-hour cache window, with no deploy and no review gate, so it is
+    the last thing to land. Until then a real submission here is refused with
+    ``Invalid image``.
+
+    Stubbing rather than seeding ``/tmp/sivacor_image_tags.json`` on purpose --
+    that file is ``_get_tags``' cache, it is shared with anything else using the
+    host's ``/tmp``, and a test that depends on it passes or fails according to
+    what happened to be lying around. These tests failed in CI for exactly that
+    reason while passing on a workstation that had the file.
+
+    It also takes the network out of these tests: without it every submission
+    test reaches raw.githubusercontent before it can start.
+    """
+    with mock.patch.object(
+        SIVACOR, "_get_tags", staticmethod(lambda: {IMAGE: [TAG]})
+    ):
+        yield
 
 #: A real, tiny, pure-Julia dependency. Small enough that the resolve phase is
 #: seconds rather than minutes, and registered, so resolution genuinely succeeds
