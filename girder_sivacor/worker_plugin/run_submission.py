@@ -646,9 +646,21 @@ def _run_tro(
                 ignore_dirs=IGNORE_DIRS,
             )
         else:
+            # The step number is the STAGE, not the arrangement counter. They
+            # were the same until a stage could contribute two arrangements,
+            # and reading the counter here labelled a Julia stage's
+            # after-resolve snapshot "After executing workflow step 1" when no
+            # workflow had executed -- the resolve had. A wrong comment in a
+            # signed document is worth no less care than a wrong number.
+            step = inumber if stage_index is None else stage_index + 1
+            comment = (
+                f"After executing workflow step {step}"
+                if phase == PHASE_ANALYSIS
+                else f"After resolving dependencies for workflow step {step}"
+            )
             tro.add_arrangement(
                 project_dir,
-                comment=f"After executing workflow step {inumber}",
+                comment=comment,
                 ignore_dirs=IGNORE_DIRS,
                 resolve_symlinks=False,
             )

@@ -642,7 +642,13 @@ def build_submission_chain(job, file, stages, secrets):
                 resolve_dependencies.s(stage, secrets), "Resolve declared dependencies"
             )
             workflow |= step(
-                run_tro.s("add_arrangement", arrangement + 1, None),
+                run_tro.s(
+                    "add_arrangement",
+                    arrangement + 1,
+                    None,
+                    stage_index=i,
+                    phase=PHASE_RESOLVE,
+                ),
                 "Record arrangement after dependency resolution",
             )
             workflow |= step(
@@ -660,7 +666,13 @@ def build_submission_chain(job, file, stages, secrets):
             execute_workflow.s(stage, secrets), "Execute SIVACOR Workflow"
         )
         workflow |= step(
-            run_tro.s("add_arrangement", arrangement + 1, None),
+            run_tro.s(
+                "add_arrangement",
+                arrangement + 1,
+                None,
+                stage_index=i,
+                phase=PHASE_ANALYSIS,
+            ),
             "Record final arrangement",
         )
         workflow |= step(

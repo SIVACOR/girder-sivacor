@@ -125,6 +125,32 @@ def test_mixed_stages_keep_one_contiguous_arrangement_sequence(
 
 
 @pytest.mark.plugin("sivacor")
+def test_arrangements_are_labelled_by_stage_and_phase(server, db, admin):
+    """A wrong comment in a signed document is worth no less care than a wrong number.
+
+    The arrangement comment used to be built from the arrangement counter, which
+    was the stage number only while the two could not diverge. On a Julia stage
+    it labelled the after-resolve snapshot "After executing workflow step 1"
+    when no workflow had executed -- the resolve had, and the very next
+    arrangement was the real step 1.
+    """
+    steps = chain_for([JULIA_STAGE, R_STAGE], admin)
+    arrangements = [
+        (args[1], kwargs.get("stage_index"), kwargs.get("phase"))
+        for name, args, kwargs in steps
+        if name == "run_tro" and args[0] == "add_arrangement"
+    ]
+    # initial (no phase), after-resolve of stage 0, after-run of stage 0,
+    # after-run of stage 1, pruned.
+    assert [a for a, _, _ in arrangements] == [0, 1, 2, 3, 4]
+    assert [(s, p) for _, s, p in arrangements[1:4]] == [
+        (0, PHASE_RESOLVE),
+        (0, PHASE_ANALYSIS),
+        (1, PHASE_ANALYSIS),
+    ]
+
+
+@pytest.mark.plugin("sivacor")
 def test_the_resolve_step_carries_the_same_credentials_as_every_other(server, db, admin):
     """girder_worker copies headers from a *running* task; a chain is built in one go."""
     steps = chain_for([JULIA_STAGE], admin)
