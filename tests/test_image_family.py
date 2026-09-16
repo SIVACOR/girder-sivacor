@@ -50,3 +50,31 @@ def test_image_family(reference, expected):
 )
 def test_is_julia(reference, expected):
     assert is_julia(reference) is expected
+
+
+def test_the_julia_family_has_a_measured_entry():
+    """10-P4: the size table must actually reach our images.
+
+    The family key and the table entry were added in different phases, and the
+    failure mode if they disagree is silent -- ``image_on_disk_estimate``
+    returns ``None`` for an unknown family and the pull simply goes unchecked,
+    which looks exactly like working.
+    """
+    from girder_sivacor.worker_plugin.lib import (
+        IMAGE_ON_DISK_MULTIPLIER,
+        _IMAGE_FAMILY_COMPRESSED_GB,
+    )
+
+    family = image_family("ghcr.io/sivacor/julia1.13:1.13.0-20260916")
+    assert family in _IMAGE_FAMILY_COMPRESSED_GB
+
+    # Bracketed rather than pinned: the point is that it is the smallest family
+    # and stays that way. A Julia image big enough to break the upper bound
+    # would mean packages had been baked back in, which is a decision to make
+    # deliberately (10-D8), not to discover from a disk failure.
+    compressed = _IMAGE_FAMILY_COMPRESSED_GB[family]
+    assert 0.3 <= compressed <= 1.0
+    assert compressed < min(
+        v for k, v in _IMAGE_FAMILY_COMPRESSED_GB.items() if k != family
+    )
+    assert compressed * IMAGE_ON_DISK_MULTIPLIER < 2.0

@@ -1297,6 +1297,29 @@ _IMAGE_FAMILY_COMPRESSED_GB = {
     # ~1.3 GiB, which is affordable precisely because Stata footprints are small:
     # the check has ~6 GiB of slack in the cases where a Stata pull is decided.
     "dataeditors": 0.9,
+    # SIVACOR's own Julia images, keyed on the namespace after image_family()
+    # strips the ``ghcr.io`` host -- see that function for why the host must go.
+    #
+    # Measured 2026-09-16 from the registry manifests, largest tag in the family:
+    # julia1.13:1.13.0-20260916 is 0.343 GiB compressed, julia1.11 0.333,
+    # julia1.10 0.209. Rounded up, because the rule above is "the largest tag"
+    # and the check exists to catch what will not fit.
+    #
+    # **Julia has the highest unpack ratio of any family here, and the shared
+    # multiplier under-estimates it.** 0.343 GiB compressed unpacks to 1.163 GiB
+    # (3.39x, against dynare's 1.01x and rocker's 2.58x -- Julia ships a great
+    # many small source files, which compress far better than a MATLAB runtime).
+    # With the containerd store keeping both copies, a worker's resting
+    # footprint is ~1.51 GiB, i.e. 4.39x compressed, where
+    # IMAGE_ON_DISK_MULTIPLIER estimates 3.5x = 1.40 GiB.
+    #
+    # Left alone deliberately. The shortfall is ~0.1 GiB against a 5 GiB floor,
+    # it errs in the safe direction (under-estimating lets a pull proceed; the
+    # docstring on image_on_disk_estimate explains why over-estimating is the
+    # worse mistake), and Julia is by a wide margin the smallest family -- 1.5
+    # GiB against dynare's 21. It would matter only if these images ever grew,
+    # which they would if a package cache were baked back in.
+    "sivacor": 0.4,
 }
 
 
