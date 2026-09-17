@@ -18,6 +18,13 @@ new way to fail, and both are tested here:
   SIGKILL, and the container's own logs say nothing, because the process is
   killed without warning -- so this is the one failure whose cause is invisible
   from inside the container and has to be read from the daemon.
+
+That last reading is not always available. On a cgroup v2 host the daemon can
+miss the OOM event for a container that dies quickly and report
+``OOMKilled: false`` for a kill the kernel certainly performed -- which is how
+CI failed on 2026-09-16 while this file passed on a cgroup v1 workstation. So
+the diagnosis has two routes, the flag and a bare exit of 137, and both are
+tested here.
 """
 
 import os
@@ -42,6 +49,19 @@ from .conftest import (
 )
 
 GIB = 1024**3
+
+
+def single_file_package(uploads_folder, user, main_file, source):
+    """Upload a replication package holding one script, and return its file."""
+    with (
+        tempfile.NamedTemporaryFile(suffix=".tar.gz") as temp_archive,
+        tempfile.TemporaryDirectory() as temp_dir,
+    ):
+        with open(os.path.join(temp_dir, main_file), "w") as f:
+            f.write(source)
+        with tarfile.open(temp_archive.name, "w:gz") as tar:
+            tar.add(temp_dir, arcname=".")
+        return upload_test_file(uploads_folder, user, temp_archive.name)
 
 
 # --- how much to allow -------------------------------------------------------
@@ -177,19 +197,16 @@ def test_an_oom_killed_analysis_is_reported_as_one(
     not about R: the kernel kills a process, and Docker only reports
     ``OOMKilled`` when that maps onto the container. An entrypoint that forked
     would break this silently, in the one direction nothing else can catch.
+
+    This says nothing about *which* route produced the diagnosis, and cannot:
+    which one fires depends on the host's cgroup version and on how quickly the
+    payload dies. The flag is what makes it certain; the fallback below is what
+    makes it arrive.
     """
     stages = [
         {"image_name": image_name, "image_tag": image_tag, "main_file": main_file}
     ]
-    with (
-        tempfile.NamedTemporaryFile(suffix=".tar.gz") as temp_archive,
-        tempfile.TemporaryDirectory() as temp_dir,
-    ):
-        with open(os.path.join(temp_dir, main_file), "w") as f:
-            f.write(source)
-        with tarfile.open(temp_archive.name, "w:gz") as tar:
-            tar.add(temp_dir, arcname=".")
-        fobj = upload_test_file(uploads_folder, user, temp_archive.name)
+    fobj = single_file_package(uploads_folder, user, main_file, source)
 
     with mock.patch(
         "girder_sivacor.worker_plugin.lib.container_memory_limit",
@@ -217,6 +234,70 @@ def test_an_oom_killed_analysis_is_reported_as_one(
     resp = get_submission_folder(server, user, job["_id"], submission_collection)
     assertStatusOk(resp)
     assert resp.json[0]["meta"]["status"] == "failed"
+
+
+#: Exit 137 and nothing else to go on -- the state the daemon reports for an OOM
+#: kill it failed to observe. It has to be produced this way rather than by a
+#: real kill: PID 1 of a pid namespace ignores a SIGKILL sent from inside it, so
+#: the analysis cannot kill itself, and on a cgroup v1 host a genuine OOM always
+#: carries the flag, so the fallback would never be the thing under test.
+_R_EXITS_137 = 'quit(save = "no", status = 137)\n'
+
+
+@pytest.mark.plugin("sivacor")
+def test_a_bare_137_is_reported_as_memory_without_the_daemon_flag(
+    server,
+    db,
+    user,
+    eagerWorkerTasks,
+    fsAssetstore,
+    patched_gpg,
+    uploads_folder,
+    submission_collection,
+):
+    """A bare 137 carries the diagnosis when the daemon's flag does not.
+
+    Under cgroup v2 the daemon learns of an OOM kill by observing
+    ``memory.events`` on a cgroup that is already being torn down, so a
+    container that dies a second in can have its exit processed first and report
+    ``OOMKilled: false``. That is not hypothetical: it is how the ``rocker`` case
+    above failed in CI on 2026-09-16 -- stdout cut off mid-allocation, reported
+    as "check stdout/stderr" -- while the ``stata`` case, which lives eight times
+    as long, was flagged correctly in the same run, and while a cgroup v1
+    workstation could not reproduce either.
+
+    Nothing else in the pipeline SIGKILLs a running analysis: a cancel is
+    latched to -123 before the exit code is read, and the orphan sweep only
+    touches containers left by a previous worker incarnation. So 137 is taken as
+    an OOM kill, and the cost of that is the case this test is written as -- a
+    payload that exits 137 by itself is told it ran out of memory. That is the
+    deliberate trade: a wrong diagnosis for code that chose a suggestive exit
+    code, against no diagnosis at all for every OOM on a cgroup v2 host.
+    """
+    main_file = "main.R"
+    stages = [
+        {"image_name": "rocker/r-ver", "image_tag": "4.3.1", "main_file": main_file}
+    ]
+    fobj = single_file_package(uploads_folder, user, main_file, _R_EXITS_137)
+
+    with mock.patch(
+        "girder_sivacor.worker_plugin.lib.container_memory_limit",
+        return_value=256 * 1024**2,
+    ):
+        resp = submit_sivacor_job(server, user, fobj, stages)
+    assertStatusOk(resp)
+
+    resp = server.request(path=f"/job/{resp.json['_id']}", method="GET", user=user)
+    assertStatusOk(resp)
+    job = resp.json
+
+    assert job["status"] == JobStatus.ERROR
+    log = "".join(job["log"])
+    # The cap has to be quoted here too: an inferred OOM is reported as the same
+    # failure, because the researcher's next move is the same either way.
+    assert "memory" in log.lower()
+    assert "GiB" in log
+    assert "Check stdout/stderr" not in log
 
 
 @pytest.mark.plugin("sivacor")

@@ -1842,7 +1842,36 @@ def recorded_run(api, submission, stage, env_vars, phase=PHASE_ANALYSIS):
         # Read before container.remove() further down, which takes the state with
         # it. Docker sets this when the kernel OOM-killed the container's cgroup;
         # the exit code is an indistinguishable 137, the same as any SIGKILL.
-        oom_killed = bool((container.attrs.get("State") or {}).get("OOMKilled"))
+        oom_flagged = bool((container.attrs.get("State") or {}).get("OOMKilled"))
+        # The flag is not trustworthy enough to be the only evidence. Under
+        # cgroup v2 the daemon learns of the kill by observing
+        # ``memory.events:oom_kill`` on a cgroup that is already being torn down,
+        # so a container that dies a second into its run can have its exit
+        # processed first and report ``OOMKilled: false`` for a kill the kernel
+        # certainly performed. Under cgroup v1 the eventfd latches before the
+        # exit and the flag is deterministic -- which is why this is invisible on
+        # a dev box booted with ``systemd.unified_cgroup_hierarchy=0`` and shows
+        # up only in CI. Seen 2026-09-16 on ubuntu-24.04: the R case of
+        # test_an_oom_killed_analysis_is_reported_as_one died mid-allocation with
+        # its stdout cut off and was reported as "check stdout/stderr", while the
+        # Stata case -- which lives ~8 s rather than ~1 s -- was flagged
+        # correctly in the same run.
+        #
+        # So an exit of 137 is taken as the same failure. A cancel is latched to
+        # -123 above, and nothing else in this process kills the analysis
+        # container: the orphan sweep only touches containers left behind by a
+        # *previous* worker incarnation. On this fleet an unordered SIGKILL is
+        # the OOM killer. Being wrong here costs a researcher who really did
+        # ``kill -9`` their own analysis a misleading diagnosis; being wrong the
+        # other way costs every OOM on a cgroup v2 host the only explanation it
+        # can ever have, which is the failure this branch exists to prevent.
+        oom_killed = oom_flagged or ret["StatusCode"] == 137
+        if oom_killed and not oom_flagged:
+            logging.warning(
+                "Container exited 137 without the daemon's OOMKilled flag; "
+                "reporting it as an OOM kill. Expected on cgroup v2, where the "
+                "flag is lost for short-lived containers."
+            )
         logging.info(f"Container exited with status: {ret['StatusCode']}")
         logging.info("Collecting performance data...")
         performance_data.update(
@@ -2075,7 +2104,10 @@ def recorded_run(api, submission, stage, env_vars, phase=PHASE_ANALYSIS):
         # Before the generic branch: an OOM kill exits 137, which would otherwise
         # be reported as "check stdout/stderr" -- and stdout will say nothing,
         # because the process was killed without warning. This is the one failure
-        # whose cause is invisible from inside the container.
+        # whose cause is invisible from inside the container. Reached by either
+        # route above, the daemon's flag or the bare 137; the researcher's next
+        # move is the same for both, so they get the same message and the
+        # distinction is kept in the worker log.
         if oom_killed:
             raise SubmissionError(
                 FailureCode.OUT_OF_MEMORY,
