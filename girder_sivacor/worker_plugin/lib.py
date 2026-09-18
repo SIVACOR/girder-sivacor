@@ -1923,18 +1923,28 @@ def recorded_run(api, submission, stage, env_vars, phase=PHASE_ANALYSIS):
     }
     environment.update(user_env)
 
+    # Whether THIS container is isolated, which is not the same as what the
+    # submission asked for: the resolve phase exists to fetch, so it never is
+    # (10-D4). Computed once because it has two consumers -- the container and
+    # the execution record -- and they disagreed for as long as the record read
+    # the stage's request directly. The signed TRO was right and the anonymous
+    # store, which outlives the submission and cannot be recomputed, said every
+    # Julia resolve ran isolated. See open item 5 in
+    # development_notes/10_julia_support_plan.md.
+    network_isolated = (
+        False if phase == PHASE_RESOLVE else bool(stage.get("network_isolation", False))
+    )
+
     container_kwargs = {
         "image": image_reference,
         "entrypoint": entrypoint,
         "command": command,
         "detach": True,
         "mounts": mounts,
-        # The resolve phase is never isolated: it exists to fetch. The claim
-        # stays honest because it is a performance of its own and does not carry
-        # the InternetIsolation attribute (10-D4) -- the analysis below does.
-        "network_disabled": (
-            False if phase == PHASE_RESOLVE else stage.get("network_isolation", False)
-        ),
+        # The claim stays honest because the resolve is a performance of its
+        # own and does not carry the InternetIsolation attribute (10-D4) -- the
+        # analysis does.
+        "network_disabled": network_isolated,
         "read_only": read_only,
         "working_dir": os.path.join(target_workspace_dir, "project", sub_dir),
         "user": user,
@@ -2009,7 +2019,12 @@ def recorded_run(api, submission, stage, env_vars, phase=PHASE_ANALYSIS):
             "phase": phase,
             "image_name": stage.get("image_name"),
             "image_tag": stage.get("image_tag"),
-            "network_isolation": bool(stage.get("network_isolation", False)),
+            # The phase's actual setting, not the submission's request: a
+            # resolve row saying True would make "how many runs executed under
+            # network isolation?" over-count every Julia submission, in a store
+            # that is kept indefinitely and cannot be re-derived once the
+            # submission is gone.
+            "network_isolation": network_isolated,
             # The cap this run was given, so max_memory_bytes can be read as
             # a fraction of what was allowed rather than an absolute number.
             # Without it, a future flavor change silently re-baselines every

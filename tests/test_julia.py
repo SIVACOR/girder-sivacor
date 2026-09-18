@@ -165,6 +165,20 @@ def test_a_julia_run_isolates_the_analysis_but_not_the_resolve(
     assert json.loads(resolve["sivacor:DockerRunArgs"])["network_disabled"] is False
     assert json.loads(analysis["sivacor:DockerRunArgs"])["network_disabled"] is True
 
+    # The same fact in the other store, which is written by a different code
+    # path and disagreed with this one in production: both rows read True,
+    # because the record copied what the SUBMISSION asked for rather than what
+    # the phase got (job 6aad4ceb4b3c91605cb6fa92, open item 5). The TRO is
+    # signed and can be re-read; execution records are anonymous, kept
+    # indefinitely, and outlive the submission -- so a wrong value there is
+    # permanent and silently over-counts isolated runs.
+    records = list(ExecutionRecord().find({}))
+    assert len(records) == 1
+    rows = {stage["phase"]: stage for stage in records[0]["stages"]}
+    assert set(rows) == {"resolve", "analysis"}
+    assert rows["resolve"]["network_isolation"] is False
+    assert rows["analysis"]["network_isolation"] is True
+
 
 @pytest.mark.plugin("sivacor")
 def test_the_resolve_phase_is_what_produces_the_manifest(
