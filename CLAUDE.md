@@ -3,51 +3,68 @@
 Architecture, endpoints, and the cross-repo picture live in the workspace guide at
 `../CLAUDE.md`. This file covers only what bites you when running the tests here.
 
-## Before running the test suite: provide the Stata license
+## Running the tests — do this exactly, before anything else
 
-**Without a Stata license, 13 tests fail in a way that looks like a code
-regression.** Counted by running the suite without one on 2026-08-01, not estimated.
+**Copy this block verbatim.** There is no shorter correct version. A bare `tox -e test`, or any
+direct `pytest`, produces a dozen failures that look precisely like a code regression and are not.
 
 ```sh
-export STATA_LICENSE_HOSTPATH=/path/to/deploy-dev/volumes/licenses/stata.lic.19
+docker rm -f test-mongo test-redis 2>/dev/null            # stale containers hold the names
+docker run -d --name test-mongo -p 27017:27017 --ulimit nofile=64000:64000 mongo:4.4
+docker run -d --name test-redis -p 6379:6379 redis:7-alpine
+
+export DOCKER_HOST="unix:///var/run/docker.sock"
+export GIRDER_NOTIFICATION_REDIS_URL="redis://localhost:6379/"
+export STATA_LICENSE_HOSTPATH="/home/xarth/codes/sivacor/deploy-dev/volumes/licenses/stata.lic.19"
+
+tox -e test -- test_stata.py    # CHECK FIRST: must print "5 passed"
+tox -e test                     # only meaningful once the line above passes
 ```
 
-Exactly 13 tests submit real jobs against `dataeditors/stata18_5-mp`: all 5 of
-`test_stata.py`, 5 of the 7 in `test_email_notifications.py`,
-`test_multistage.py::test_multistage_run`,
-`test_ignore.py::test_ignore[test_stata.tar.gz]`, and
-`test_concurrent_submissions.py::test_submit_job_allowed_after_previous_finished`
-— that last one is easy to miss, because nothing in its name suggests Stata; it
-just happens to run a submission end to end.
+### The check line is the whole point
 
-**11 of the 13 surface as `assert 4 == 3`** (`JobStatus.ERROR` vs `SUCCESS`). The
-other two fail on unrelated-looking string assertions:
-`test_stata.py::test_secrets` (`assert 'SECRET_REDACTED' in ...`) and
-`test_stata.py::test_error_detection` (`assert 'stdout_file_id' in ...`).
+`tox -e test -- test_stata.py` printing **5 passed** is the one signal that the environment is
+wired up. Run it *before* the full suite, every time.
 
-**The underlying error now names the problem, which it did not used to.** Since the
-run-time license fetch landed, `lib.py::stata_license_mount_source` raises *before
-the container is created*:
+**If it does not print 5 passed, stop. Fix the environment. Do not read the full suite's output,
+and do not begin diagnosing a regression** — a broken environment and a broken commit are not
+distinguishable from the failure list, and the failure list is where the time goes.
 
-```
-ValueError: A Stata image was requested but this deployment has no Stata license:
-set the 'sivacor.stata_license' Girder setting, or STATA_LICENSE_HOSTPATH on the worker.
-```
+This file used to try to make that distinction *for* you by naming how many tests fail without a
+license. Three documents ended up carrying three different numbers (12, 13, and the 14 actually
+observed on 2026-09-18) because each new Stata-backed test silently invalidated all of them —
+`test_memory_limit.py::test_an_oom_killed_analysis_is_reported_as_one[stata]` was the one that
+broke it last. **A count is a symptom-matcher and it rots.** The check line cannot rot, so it
+replaced the count deliberately; please do not reintroduce one.
 
-That text reaches the job log, so a failing test's captured output says what is
-wrong. The top-level assertion is still the unhelpful `assert 4 == 3`, so the advice
-below stands — but if you do look at the log, the answer is now in it.
+### Why each line is there
 
-**Two ways to satisfy it**, and the tests only use the first:
+- **`STATA_LICENSE_HOSTPATH`** — the path above exists on this machine and is gitignored, so it
+  never arrives with a fresh clone. Without it, every test that submits a real
+  `dataeditors/stata18_5-mp` job fails as `assert 4 == 3` (`JobStatus.ERROR` vs `SUCCESS`), and a
+  few on unrelated-looking string assertions. None of them mention licensing at the assertion.
+  Since the run-time license fetch landed, `lib.py::stata_license_mount_source` does raise a clear
+  `ValueError` naming the missing setting, and it reaches the job log — so if you *are* already
+  staring at a failure, read the captured log rather than the assertion.
+- **`tox`, not `pytest`** — only `tox.ini`'s `passenv` forwards `STATA_LICENSE_HOSTPATH`, and it
+  sets `changedir = tests`, so posargs are relative to `tests/`. Passing `tests/test_foo.py`
+  silently collects nothing and exits 4.
+- **`--ulimit nofile=64000:64000`** — load-bearing above `-n 8`. Every test gets its own database,
+  so a wide run holds hundreds of WiredTiger files open; a default-limit mongod aborts
+  (`Too many open files` → `WT_PANIC` → exit 14) and every remaining test then errors against a
+  dead database, reading like a mass regression. 64000 is MongoDB's own recommendation.
+- **`docker rm -f` first** — a stale `test-mongo` from a previous session keeps the name, the new
+  `docker run` fails, and the suite runs against nothing.
 
-- `STATA_LICENSE_HOSTPATH` — a path on this host. `tox.ini` forwards it via
-  `passenv` and nothing defaults it, so it must be exported.
-- the `sivacor.stata_license` Girder setting — the license text, stored server-side
-  and materialised into the job's `tmp_dir` at run time. This is what ephemeral
-  workers use in production (they have no license on disk), but no test seeds it.
+There is a second way to satisfy the license — the `sivacor.stata_license` Girder setting, holding
+the license text server-side and materialised into the job's `tmp_dir` at run time. That is what
+ephemeral production workers use, since they have no license on disk. **No test seeds it**, so it
+is not an option for the suite.
 
-Do not start debugging Stata-backed test failures until one of those is in place.
-Verify with `tox -e test -- test_stata.py` — **5 passed** means it is wired up.
+### Expected healthy result
+
+Everything passes except **2 `xfailed`** in `test_girder_upload_race.py`. Those are
+`xfail(strict=True)` and are *supposed* to fail; see the section on them below.
 
 ## Commands
 

@@ -24,7 +24,7 @@ health-checked before the steps run.
 
 | Secret | Purpose |
 |---|---|
-| `STATA_LIC` | The Stata license file, **base64-encoded**. Without it, 12 tests fail — see below. |
+| `STATA_LIC` | The Stata license file, **base64-encoded**. Without it every Stata-backed test fails — see below. |
 | `CODECOV_TOKEN` | Upload token for Codecov. |
 
 ## Environment variables
@@ -107,7 +107,7 @@ resolves on its own. It is not the failure, and raising
 
 export DOCKER_HOST="unix:///var/run/docker.sock"
 export GIRDER_NOTIFICATION_REDIS_URL="redis://localhost:6379/"
-# Required, or 12 Stata-backed tests fail with a misleading `assert 4 == 3`
+# Required, or every Stata-backed test fails with a misleading `assert 4 == 3`
 export STATA_LICENSE_HOSTPATH="/path/to/deploy-dev/volumes/licenses/stata.lic.19"
 
 tox -e test
@@ -122,36 +122,29 @@ Coverage is written three ways: `term-missing` to the terminal, `coverage.xml`
 
 There are two distinct classes of failure that look like code regressions and are not.
 
-### 1. Missing Stata license — 12 deterministic failures
+### 1. Missing Stata license
 
-**Always export `STATA_LICENSE_HOSTPATH` before running the suite.** This is the
-single most common cause of a "broken" local test run. Exactly 12 tests submit
-real jobs against `dataeditors/stata18_5-mp`, and without a license Stata exits
-non-zero inside the container:
+**This is the single most common cause of a "broken" local run, and it is not a code problem.**
 
-- all 5 of `test_stata.py`
-- 5 of the 7 in `test_email_notifications.py` — all except
-  `test_email_content_for_multistage_job` and
-  `test_email_urls_follow_the_deployment_domain`
-- `test_multistage.py::test_multistage_run`
-- `test_ignore.py::test_ignore[test_stata.tar.gz]`
+The canonical setup block lives in `CLAUDE.md` in this repo ("Running the tests — do this exactly").
+Use it; do not reconstruct the commands from this file.
 
-The failures do **not** mention licensing. `lib.py` only bind-mounts the license
-when the variable is set, so the license error stays buried in the captured job
-log. Nine of the twelve surface as `assert 4 == 3` (`JobStatus.ERROR` vs
-`SUCCESS`); the other three (`test_stata.py::test_error_detection`,
-`test_stata.py::test_secrets`,
-`test_email_notifications.py::test_email_notification_error_handling`) fail on
-unrelated-looking string assertions, which makes them even easier to misread as
-real regressions.
+The check that settles it:
 
 ```sh
-export STATA_LICENSE_HOSTPATH=/path/to/deploy-dev/volumes/licenses/stata.lic.19
+tox -e test -- test_stata.py     # must print "5 passed"
 ```
 
-Verify with `tox -e test -- test_stata.py`: **5 passed** means it is wired up.
-(Paths in posargs are relative to `tests/`, because `tox.ini` sets
-`changedir = tests`.)
+If that does not print 5 passed, the environment is wrong and **the full suite's failure list
+carries no information** — stop and fix the environment first.
+
+Tests that submit real `dataeditors/stata18_5-mp` jobs fail without a license, most as
+`assert 4 == 3` (`JobStatus.ERROR` vs `SUCCESS`) and a few on unrelated-looking string assertions.
+None of them mention licensing at the assertion, which is what makes them easy to misread.
+
+**There is deliberately no count here.** This file, `CLAUDE.md` and the git history each ended up
+claiming a different one (12, 13, and the 14 actually observed on 2026-09-18) because every new
+Stata-backed test invalidates them all silently. Use the check line, which cannot drift.
 
 ### 2. Timing-sensitive Docker tests — intermittent failures under load
 
