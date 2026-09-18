@@ -566,6 +566,69 @@ class CancelWatcher:
         return min(self.interval, self.RETRY_BACKOFF_BASE * 2**steps)
 
 
+def aggregate_container_stats(dstats_path, performance_data):
+    """Fold the stats collector's CSV into ``performance_data`` in place.
+
+    Extracted from ``recorded_run`` so the failure path can call it too: when a
+    run is torn down by something other than its container finishing, this is the
+    last chance to read that CSV, because it lives in the
+    ``tempfile.TemporaryDirectory`` that the unwinding is about to delete.
+
+    Never raises. On the success path a bad read would be worth hearing about,
+    but on the failure path an exception here would replace the real cause with
+    a pandas error, so both callers get the tolerant version.
+    """
+    try:
+        if not os.path.isfile(dstats_path + ".csv"):
+            return
+        df = pd.read_csv(dstats_path + ".csv")
+        # The header is written when the collector starts, so the file exists
+        # even when no reading was ever taken. Aggregating that empty frame
+        # yields NaN, and json.dumps happily writes a bare `NaN` literal --
+        # invalid JSON, inside a file that gets hashed into a signed TRO and
+        # read back by strict parsers years later. Say what is missing instead.
+        if df.empty:
+            performance_data["MetricsUnavailable"] = (
+                "container exited before Docker emitted a stats reading"
+            )
+            return
+        performance_data.update(
+            {
+                "MaxCPUPercent": float(df["CPU %"].max()),
+                "MaxMemoryUsage": int(df["Memory Usage"].max()),
+            }
+        )
+        # max() of a cumulative counter is its final value, which is also
+        # correct if the last row is truncated or the rows are unordered.
+        # Guarded on the column: a CSV written by an older worker image does
+        # not have it, and a KeyError here would lose the whole aggregation.
+        if "CPU Seconds" in df.columns:
+            performance_data["CPUSecondsTotal"] = float(df["CPU Seconds"].max())
+    except Exception:
+        logging.warning(
+            "Could not aggregate container stats from %s", dstats_path, exc_info=True
+        )
+
+
+def measured_stage_telemetry(performance_data, exit_code=None):
+    """The measured half of a ``telemetry_stages`` row.
+
+    Split from the static half so a stage that died can publish whatever was
+    measured before it did, without having to invent the rest.
+    """
+    return {
+        "exit_code": exit_code,
+        "max_cpu_percent": performance_data.get("MaxCPUPercent"),
+        # The denominator-free primitive: divide by duration_seconds for mean
+        # cores. Kept as seconds rather than a precomputed mean so the two can
+        # never disagree, and so it stays meaningful when duration is unknown.
+        "cpu_seconds_total": performance_data.get("CPUSecondsTotal"),
+        "max_memory_bytes": performance_data.get("MaxMemoryUsage"),
+        "max_disk_bytes": performance_data.get("MaxDiskUsage"),
+        "image_size_bytes": performance_data.get("ImageSize"),
+    }
+
+
 class LogRelay:
     """Relays container output into the job log -- tolerantly.
 
@@ -1924,6 +1987,38 @@ def recorded_run(api, submission, stage, env_vars, phase=PHASE_ANALYSIS):
         publisher.start()
 
         peak_disk = 0
+        # Appended *before* the run rather than after it. This used to be built
+        # and appended once, at the end -- so any exception in between left
+        # `stages: []` on the execution record, and a run that failed recorded
+        # nothing at all about itself. That is what happened to `ferocious-fader`
+        # on 2026-09-18: 20 h of compute on a 16 vCPU worker, and the one store
+        # that outlives the submission got an empty list, which is precisely the
+        # case post-mortem telemetry exists for
+        # (``2026-09-18-log-flush-502-kills-run.md``).
+        #
+        # Everything here is known before the container runs; the measured half
+        # is filled in below, or salvaged by the handler if the run is torn down.
+        stage_telemetry = {
+            # The size the submission asked for, recorded beside the cap it
+            # actually got: mem_limit_bytes alone cannot say whether a run
+            # was sized deliberately or simply landed on whatever was free.
+            "requested_memory_gb": submission.get("telemetry_requested_memory_gb"),
+            # Which phase this row is. Two rows per Julia stage, one per
+            # stage for every other stack -- so a consumer counting stages
+            # has to filter, and sanitize_record's n_stages does.
+            "phase": phase,
+            "image_name": stage.get("image_name"),
+            "image_tag": stage.get("image_tag"),
+            "network_isolation": bool(stage.get("network_isolation", False)),
+            # The cap this run was given, so max_memory_bytes can be read as
+            # a fraction of what was allowed rather than an absolute number.
+            # Without it, a future flavor change silently re-baselines every
+            # comparison against older records.
+            "mem_limit_bytes": mem_limit,
+            **measured_stage_telemetry(performance_data),
+        }
+        submission.setdefault("telemetry_stages", []).append(stage_telemetry)
+
         try:
             container = cli.containers.get(container.id)
             last_disk_sample = 0.0
@@ -1950,6 +2045,20 @@ def recorded_run(api, submission, stage, env_vars, phase=PHASE_ANALYSIS):
                 container = cli.containers.get(container.id)
         except docker.errors.NotFound:
             pass
+        except BaseException:
+            # The run is being torn down by something that is not its container
+            # finishing -- a failed job-log write, a disk shortfall, a cancel, a
+            # bug. Everything below this handler is skipped, and the enclosing
+            # TemporaryDirectory is deleted as this frame unwinds, so this is the
+            # last moment the stats CSV can be read at all.
+            #
+            # Best-effort by construction: it only fills in a row that already
+            # exists, and both calls swallow their own errors, so a failure here
+            # cannot replace the exception being propagated. Re-raised unchanged.
+            performance_data["MaxDiskUsage"] = peak_disk
+            aggregate_container_stats(dstats_tmppath, performance_data)
+            stage_telemetry.update(measured_stage_telemetry(performance_data))
+            raise
 
         # A run shorter than one heartbeat never sampled above, and would report
         # nothing at all. This also catches output written right at the end,
@@ -2055,61 +2164,14 @@ def recorded_run(api, submission, stage, env_vars, phase=PHASE_ANALYSIS):
             logging.warning(
                 "Could not determine size of %s", image_reference, exc_info=True
             )
-        if os.path.isfile(dstats_tmppath + ".csv"):
-            df = pd.read_csv(dstats_tmppath + ".csv")
-            # The header is written when the collector starts, so the file exists
-            # even when no reading was ever taken. Aggregating that empty frame
-            # yields NaN, and json.dumps happily writes a bare `NaN` literal --
-            # invalid JSON, inside a file that gets hashed into a signed TRO and
-            # read back by strict parsers years later. Say what is missing instead.
-            if df.empty:
-                performance_data["MetricsUnavailable"] = (
-                    "container exited before Docker emitted a stats reading"
-                )
-            else:
-                performance_data.update(
-                    {
-                        "MaxCPUPercent": float(df["CPU %"].max()),
-                        "MaxMemoryUsage": int(df["Memory Usage"].max()),
-                    }
-                )
-                # max() of a cumulative counter is its final value, which is also
-                # correct if the last row is truncated or the rows are unordered.
-                # Guarded on the column: a CSV written by an older worker image does
-                # not have it, and a KeyError here would lose the whole aggregation.
-                if "CPU Seconds" in df.columns:
-                    performance_data["CPUSecondsTotal"] = float(df["CPU Seconds"].max())
-        # Same numbers, kept where finalize_job can still reach them. The
-        # performance_data file itself lives in the submission folder and is
-        # deleted with it, which is precisely the gap the record fills.
-        submission.setdefault("telemetry_stages", []).append(
-            {
-                # The size the submission asked for, recorded beside the cap it
-                # actually got: mem_limit_bytes alone cannot say whether a run
-                # was sized deliberately or simply landed on whatever was free.
-                "requested_memory_gb": submission.get("telemetry_requested_memory_gb"),
-                # Which phase this row is. Two rows per Julia stage, one per
-                # stage for every other stack -- so a consumer counting stages
-                # has to filter, and sanitize_record's n_stages does.
-                "phase": phase,
-                "image_name": stage.get("image_name"),
-                "image_tag": stage.get("image_tag"),
-                "network_isolation": bool(stage.get("network_isolation", False)),
-                "exit_code": ret.get("StatusCode"),
-                "max_cpu_percent": performance_data.get("MaxCPUPercent"),
-                # The denominator-free primitive: divide by duration_seconds for mean
-                # cores. Kept as seconds rather than a precomputed mean so the two can
-                # never disagree, and so it stays meaningful when duration is unknown.
-                "cpu_seconds_total": performance_data.get("CPUSecondsTotal"),
-                "max_memory_bytes": performance_data.get("MaxMemoryUsage"),
-                # The cap this run was given, so max_memory_bytes can be read as
-                # a fraction of what was allowed rather than an absolute number.
-                # Without it, a future flavor change silently re-baselines every
-                # comparison against older records.
-                "mem_limit_bytes": mem_limit,
-                "max_disk_bytes": performance_data.get("MaxDiskUsage"),
-                "image_size_bytes": performance_data.get("ImageSize"),
-            }
+        aggregate_container_stats(dstats_tmppath, performance_data)
+        # Completes the row appended before the run, rather than adding a second
+        # one -- the static half is already in it. Same numbers, kept where
+        # finalize_job can still reach them: the performance_data file itself
+        # lives in the submission folder and is deleted with it, which is
+        # precisely the gap the execution record fills.
+        stage_telemetry.update(
+            measured_stage_telemetry(performance_data, ret.get("StatusCode"))
         )
         api.upload_bytes(
             folder_id,
