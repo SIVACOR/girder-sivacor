@@ -107,6 +107,14 @@ def _validate_worker_sizes(doc):
     of those trip the circuit breaker and stop the *entire* fleet. A typo in
     this setting must not be able to do that, and catching it here is far
     cheaper than catching it at create time.
+
+    **This normalises as well as validates**, which is unusual for a Girder
+    validator and is why it is called out: an entry with no ``su_per_hour``
+    gets one, equal to its ``vcpus``. Storing the resolved value rather than
+    defaulting at every read means the stored catalogue is the whole truth, so
+    an operator reading the setting sees the rate they are being billed at
+    instead of an absence they have to know the meaning of. See 09-U3 in
+    development_notes/09_user_usage_accounting_plan.md.
     """
     value = doc.get("value")
     if not isinstance(value, list) or not value:
@@ -130,6 +138,18 @@ def _validate_worker_sizes(doc):
             raise ValidationException("vcpus must be a positive integer.")
         if not isinstance(entry.get("gated"), bool):
             raise ValidationException("gated must be a boolean.")
+        # Absent means "the m3 rate", which is vcpus. Present means somebody
+        # declared it, and it is then held to the same standard as the rest.
+        # Floats are allowed where vcpus is not: a GPU flavour's rate need not
+        # be a whole number, while a fractional core would be a typo.
+        su_per_hour = entry.get("su_per_hour", vcpus)
+        if (
+            isinstance(su_per_hour, bool)
+            or not isinstance(su_per_hour, (int, float))
+            or su_per_hour <= 0
+        ):
+            raise ValidationException("su_per_hour must be a positive number.")
+        entry["su_per_hour"] = su_per_hour
     # The default size is derived as the smallest non-gated entry, so a
     # catalogue that gates everything locks every non-member out of submitting
     # at all -- and the failure would look like a broken picker rather than a

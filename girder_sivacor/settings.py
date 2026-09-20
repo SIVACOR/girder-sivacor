@@ -29,8 +29,8 @@ class PluginSettings:
     #: One object per rung: ``memory_gb`` (the advertised RAM figure, which is
     #: also the value that travels on the wire and in an exported workflow),
     #: ``flavor`` (the OpenStack name, server-side only -- nothing
-    #: provider-specific may become visible to a researcher), ``vcpus`` and
-    #: ``gated``.
+    #: provider-specific may become visible to a researcher), ``vcpus``,
+    #: ``gated`` and ``su_per_hour``.
     #:
     #: A Girder setting rather than a file or a fetched YAML because two
     #: processes need it and they share no other config channel: this plugin
@@ -42,9 +42,21 @@ class PluginSettings:
     #: OpenStack credential, so it cannot ask Nova for a flavour's shape, yet
     #: it has to render "16 cores" in the picker. The controller -- the one
     #: process that *does* have credentials -- is what checks the duplicate
-    #: against Nova at startup. Nothing else derivable is stored: root disk is
-    #: flat at 60 GB across the ladder, SU/hr equals vCPU on Jetstream2, and
-    #: usable memory is an approximation that must not be frozen into config.
+    #: against Nova at startup. Root disk is not stored because it is flat at
+    #: 60 GB across the ladder, and usable memory is not stored because it is
+    #: an approximation that must not be frozen into config.
+    #:
+    #: ``su_per_hour`` is the allocation's cost rate for this rung, and is
+    #: **declared rather than derived** even though it currently equals
+    #: ``vcpus`` on every rung we run. That equality is a property of the
+    #: Jetstream2 ``m3`` family alone: ``r3`` bills 2 SU per vCPU-hour and GPU
+    #: flavours are flat rates, so a derived figure would be silently wrong the
+    #: first day a rung outside ``m3`` is added -- and per 09-U4 in
+    #: development_notes/09_user_usage_accounting_plan.md there is no backfill,
+    #: so every hour recorded against a wrong rate is an hour nobody can
+    #: repair. The validator fills it from ``vcpus`` when a catalogue is
+    #: written without it, which is correct for today's ladder and keeps the
+    #: field from being a flag day; see 09-U3.
     WORKER_SIZES = "sivacor.worker_sizes"
 
     #: The Girder group whose members may select a ``gated`` worker size.
@@ -174,7 +186,13 @@ SettingDefault.defaults.update(
         # exercised before any user can choose. Rungs are added once the
         # controller can boot a heterogeneous fleet.
         PluginSettings.WORKER_SIZES: [
-            {"memory_gb": 60, "flavor": "m3.large", "vcpus": 16, "gated": False},
+            {
+                "memory_gb": 60,
+                "flavor": "m3.large",
+                "vcpus": 16,
+                "gated": False,
+                "su_per_hour": 16,
+            },
         ],
         PluginSettings.IMAGE_TAGS: {
             "dataeditors/stata15": ["latest", "2023-01-27"],

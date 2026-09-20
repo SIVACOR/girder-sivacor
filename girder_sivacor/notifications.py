@@ -25,7 +25,9 @@ from girder.utility import mail_utils
 from girder_jobs.constants import JobStatus
 from girder_jobs.models.job import Job
 
+from . import usage
 from .statuses import CANCELING, COMPLETED, FAILED, PROCESSING
+from .worker_plugin.routing import instance_id_of
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +202,22 @@ def set_submission_status(event: events.Event) -> None:
     if not job or job.get("type") != "sivacor_submission":
         return
 
+    # First, and in a try of its own, because it depends on *nothing else in
+    # this handler*. Everything below is about the submission folder, and two of
+    # those steps return early when the folder cannot be found -- which would
+    # silently make usage accounting conditional on a folder it has no interest
+    # in. A job can reach a terminal status before its folder exists at all
+    # (``prepare_submission`` creates it, and can fail first), and that run still
+    # burned an instance.
+    try:
+        record_usage_attribution(job, job.get("status"))
+    except Exception:
+        logger.exception(
+            "Could not record usage attribution for job %s; its instance's SU "
+            "will fall to the house at accrual",
+            str(job["_id"]),
+        )
+
     root_collection = Collection().findOne(
         {"name": Setting().get(PluginSettings.SUBMISSION_COLLECTION_NAME)}
     )
@@ -264,4 +282,51 @@ def set_submission_status(event: events.Event) -> None:
     Folder().collection.update_one(
         {"_id": submission_folder["_id"]},
         {"$set": {"meta.status": submission_status}},
+    )
+
+def record_usage_attribution(job, status) -> None:
+    """Snapshot who this submission's worker instance belongs to (09-A2/W1).
+
+    **This is the only writer of the user↔instance join, and this hook is the
+    only moment it can be written.** The job document carries both halves --
+    ``userId`` and ``meta.worker_queue`` -- but it is deleted the moment the
+    researcher deletes their submission, routinely well before the instance is
+    reaped ~18 minutes later. Reading the join at accrual time would therefore
+    lose usage for exactly the users who tidy up (09-U5).
+
+    Every terminal path reaches a terminal job status through Girder -- the
+    worker's ``submission_task`` except, ``prepare_submission``'s own except,
+    ``finalize_job``'s success branch, a cancel, and the server-side reaper --
+    so one hook covers all five and nothing has to be added to the worker.
+
+    Two things it deliberately does not do. It does not consult the failure
+    code, which it cannot see: ``billable`` is derived from the *status* alone
+    and left false for an ERROR, which :func:`~girder_sivacor.usage.stamp_outcome`
+    raises later if the code turns out to be the researcher's fault. And it does
+    not care how many times it runs -- the row is an idempotent upsert and
+    ``billable`` only ever goes up.
+    """
+    if status not in (JobStatus.SUCCESS, JobStatus.ERROR, JobStatus.CANCELED):
+        # Fires on every job update, including every log line. Only a terminal
+        # status means the instance is finished with.
+        return
+
+    meta = job.get("meta") or {}
+    instance_id = instance_id_of(meta.get("worker_queue") or "")
+    if not instance_id:
+        # No private queue means no instance ever ran this: a submission refused
+        # at submit_job, one reaped as REAPED_NO_WORKER, or a deployment on the
+        # shared-queue path. There is no SU to attribute and no row to write.
+        return
+
+    usage.record_attribution(
+        instance_id,
+        job.get("userId"),
+        meta.get("requested_memory_gb"),
+        meta.get("requested_disk_gb"),
+        # A cancel is charged: the compute was spent on the researcher's behalf
+        # before they stopped it, and making it free would make "cancel" a way
+        # to run twenty-five minutes of analysis for nothing. A success is
+        # charged for the obvious reason. An ERROR waits for its code.
+        billable=status in (JobStatus.SUCCESS, JobStatus.CANCELED),
     )

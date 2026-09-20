@@ -26,13 +26,14 @@ from girder_jobs.constants import REST_CREATE_JOB_TOKEN_SCOPE, JobStatus
 from girder_jobs.models.job import Job
 from girder_plugin_worker.utils import getWorkerApiUrl
 
+from . import usage
 from .errors import FailureCode
 from .models.execution_record import ExecutionRecord
 from .settings import PluginSettings
 from .statuses import CANCELING, DELETABLE, FAILED
 from .telemetry import sanitize_record
 from .utils import encrypt_job_secrets
-from .worker_plugin.routing import DISPATCH_QUEUE
+from .worker_plugin.routing import DISPATCH_QUEUE, instance_id_of
 from .worker_plugin.run_submission import (
     create_workspace,
     execute_workflow,
@@ -56,8 +57,19 @@ def worker_sizes():
 
     Sorted by ``memory_gb`` so "the smallest" is well defined however the
     setting was written.
+
+    ``su_per_hour`` is filled from ``vcpus`` when absent, which the validator
+    also does on write. The duplication is deliberate and it is not belt and
+    braces: a catalogue written *before* the field existed is never re-validated
+    until someone writes it again, so production would otherwise hand the
+    accrual an entry with no rate at all. Defaulting here means every reader
+    sees a rate, and the validator's copy means every *newly written* catalogue
+    stores one explicitly rather than relying on this. 09-U3.
     """
-    sizes = Setting().get(PluginSettings.WORKER_SIZES) or []
+    sizes = [
+        {**entry, "su_per_hour": entry.get("su_per_hour", entry["vcpus"])}
+        for entry in Setting().get(PluginSettings.WORKER_SIZES) or []
+    ]
     return sorted(sizes, key=lambda entry: entry["memory_gb"])
 
 
@@ -795,6 +807,9 @@ class SIVACOR(Resource):
         self.route("POST", ("heartbeat", ":id"), self.heartbeat)
         self.route("POST", ("claim", ":id"), self.claim)
         self.route("POST", ("execution_record",), self.record_execution)
+        self.route("PUT", ("outcome", ":id"), self.record_outcome)
+        self.route("POST", ("usage", "drain"), self.drain_usage)
+        self.route("GET", ("usage",), self.get_usage)
         self.route("GET", ("execution_record",), self.list_execution_records)
         self.route(
             "GET", ("execution_record", "summary"), self.summarise_execution_records
@@ -1136,6 +1151,85 @@ class SIVACOR(Resource):
     )
     def record_execution(self, record):
         return self.store_execution_record(record)
+
+    @access.admin
+    @autoDescribeRoute(
+        Description("Record why a submission failed, for usage accounting.")
+        .notes(
+            "Called by the worker on its failure paths, and used in-process by "
+            "the reaper. Sets 'billable' on the submission's attribution row if "
+            "the code is one the researcher pays for -- it never clears it, so "
+            "this can arrive before or after the job's terminal transition and "
+            "cannot un-charge a run.\n\n"
+            "**Deliberately separate from /sivacor/execution_record**, which is "
+            "anonymous by design and documents that no identity flows through "
+            "it. The code alone is the same closed operator vocabulary that "
+            "store keeps forever; what makes this endpoint different is that it "
+            "names a job, and therefore a person. Folding the two together "
+            "would make that contract untrue for a reader who relied on it."
+        )
+        .modelParam(
+            "id",
+            "The ID of the submission job.",
+            model=Job,
+            force=True,
+            required=True,
+        )
+        .param("code", "A FailureCode value.", required=True)
+    )
+    def record_outcome(self, job, code):
+        # Validated against the enum rather than accepted as free text, because
+        # `code` becomes a Mongo field name in the house bucket's byReason. A
+        # code from a newer worker than this server is rejected loudly and the
+        # run falls to the house, which is the direction 09-U13 wants to fail.
+        try:
+            code = FailureCode(code)
+        except ValueError:
+            raise ValidationException(f"Unknown failure code: {code!r}")
+        instance_id = instance_id_of((job.get("meta") or {}).get("worker_queue") or "")
+        if not instance_id:
+            # Nothing booted, so there is no attribution row and no SU to argue
+            # over. Not an error: the shared-queue path reaches here routinely.
+            return {"stamped": False}
+        usage.stamp_outcome(instance_id, code)
+        return {"stamped": True, "billable": usage.is_billable(code)}
+
+    @access.admin
+    @autoDescribeRoute(
+        Description("Accrue every reaped instance's usage that is waiting.")
+        .notes(
+            "Driven from the celery beat every ten minutes. Safe to call by "
+            "hand and safe to call twice: each lifetime row is claimed with "
+            "find_one_and_delete, so a second caller finds nothing rather than "
+            "charging anybody twice.\n\n"
+            "Returns how many instances were accrued. Zero is the ordinary "
+            "answer on a quiet fleet -- it means no instance has been reaped "
+            "since the last run, not that anything is wrong."
+        )
+    )
+    def drain_usage(self):
+        return {"accrued": usage.drain()}
+
+    @access.admin
+    @autoDescribeRoute(
+        Description("Cumulative per-user resource usage.").notes(
+            "The permanent sibling of /sivacor/volume_usage. That one is "
+            "derived from job documents and reaches back exactly "
+            "sivacor.retention_days; these counters outlive every submission "
+            "behind them, which is what makes them answerable for a quota.\n\n"
+            "'house' is listed beside the users on purpose: fleet burn with no "
+            "submission behind it, and runs we declined to charge because they "
+            "were our own defects, are real SU against the same allocation. "
+            "The sum will still be smaller than the ACCESS dashboard's -- see "
+            "'What this deliberately does not measure' in "
+            "development_notes/09_user_usage_accounting_plan.md, and note the "
+            "dashboard lags 12-24 h.\n\n"
+            "'pending' counts rows waiting on the next drain. A lifetime count "
+            "that only grows means the beat task is not running."
+        )
+    )
+    def get_usage(self):
+        return usage.report()
 
     @staticmethod
     def store_execution_record(payload):
@@ -1502,7 +1596,40 @@ class SIVACOR(Resource):
         logger.warning("Reaping stranded submission %s: %s", job["_id"], reason)
         cls._fail_stranded(job, reason)
         cls._record_reaped(job, code, elapsed, detail)
+        cls._stamp_outcome(job, code)
         reaped.append(str(job["_id"]))
+
+    @classmethod
+    def _stamp_outcome(cls, job, code):
+        """The reaper's half of 09-A2b -- in-process, with no round trip.
+
+        The worker has to send its code over REST because it is on another
+        machine; the reaper is already inside Girder holding both the job and
+        the code, so it just writes.
+
+        Ordered **after** ``_fail_stranded``, which is what transitions the job
+        and so fires the hook that creates the attribution row. Stamping first
+        would write a code onto a row that does not exist yet, and the upsert
+        that followed would overwrite it. Two of the reaper's four codes --
+        ``SIZE_UNAVAILABLE`` and ``REAPED_NO_WORKER`` -- fire before anything
+        booted, so there is no row and ``stamp_outcome`` is a no-op.
+
+        Best effort: a reaper that stops sweeping because a counter failed
+        strands every other submission it was about to settle.
+        """
+        try:
+            instance_id = instance_id_of(
+                (job.get("meta") or {}).get("worker_queue") or ""
+            )
+            if instance_id:
+                usage.stamp_outcome(instance_id, code)
+        except Exception:
+            logger.warning(
+                "Could not stamp the outcome of reaped job %s; its instance's SU "
+                "will fall to the house",
+                job["_id"],
+                exc_info=True,
+            )
 
     @classmethod
     def _record_reaped(cls, job, code, elapsed, detail=None):
@@ -1610,7 +1737,11 @@ class SIVACOR(Resource):
             "machine shape must not become visible to a researcher or "
             "load-bearing in an exported workflow. 'vcpus' is here because the "
             "label needs it; usable memory is not, because it is an "
-            "approximation that would go stale in a cache."
+            "approximation that would go stale in a cache. 'su_per_hour' is "
+            "not here either -- it is an allocation-accounting figure with no "
+            "meaning to a researcher, and showing a price beside a control "
+            "that has no price attached invites a question nobody can answer "
+            "until a quota exists."
         )
     )
     def get_worker_sizes(self):

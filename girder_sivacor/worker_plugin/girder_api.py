@@ -146,6 +146,21 @@ class GirderApi:
             headers={"Content-Type": "application/json"},
         )
 
+    def record_outcome(self, job_id, code):
+        """Tell the server why this submission failed, for usage accounting.
+
+        A separate call from :meth:`record_execution` on purpose. That endpoint
+        is anonymous by design and says so; this one names a job, and therefore
+        a person. The two carry the same failure code and it would be tempting
+        to send it once -- but a reader who trusted the anonymity contract would
+        then be wrong, and a refactor honouring it would break billability
+        silently.
+        """
+        return self.client.put(
+            f"sivacor/outcome/{job_id}",
+            parameters={"code": getattr(code, "value", code)},
+        )
+
     # -- collections, groups and access -----------------------------------
 
     def _find_collection(self, name):

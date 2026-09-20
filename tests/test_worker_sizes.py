@@ -62,7 +62,13 @@ def test_default_catalogue_matches_production(server):
     fleet, a submission can ask for a shape that will never be created.
     """
     assert worker_sizes() == [
-        {"memory_gb": 60, "flavor": "m3.large", "vcpus": 16, "gated": False}
+        {
+            "memory_gb": 60,
+            "flavor": "m3.large",
+            "vcpus": 16,
+            "gated": False,
+            "su_per_hour": 16,
+        }
     ]
     assert default_worker_size() == 60
 
@@ -110,6 +116,44 @@ def test_default_is_the_smallest_ungated_entry(server):
         [{"memory_gb": 60, "flavor": "", "vcpus": 16, "gated": False}],
         [{"memory_gb": 60, "flavor": "m3.large", "vcpus": 0, "gated": False}],
         [{"memory_gb": 60, "flavor": "m3.large", "vcpus": 16, "gated": "no"}],
+        # su_per_hour may be absent, but not nonsense. A zero or negative rate
+        # would make a rung free or pay the user, and a bool would bill at 1.
+        [
+            {
+                "memory_gb": 60,
+                "flavor": "m3.large",
+                "vcpus": 16,
+                "gated": False,
+                "su_per_hour": 0,
+            }
+        ],
+        [
+            {
+                "memory_gb": 60,
+                "flavor": "m3.large",
+                "vcpus": 16,
+                "gated": False,
+                "su_per_hour": -16,
+            }
+        ],
+        [
+            {
+                "memory_gb": 60,
+                "flavor": "m3.large",
+                "vcpus": 16,
+                "gated": False,
+                "su_per_hour": True,
+            }
+        ],
+        [
+            {
+                "memory_gb": 60,
+                "flavor": "m3.large",
+                "vcpus": 16,
+                "gated": False,
+                "su_per_hour": "16",
+            }
+        ],
         # Two rungs claiming the same wire value: the enum would be ambiguous
         # and the flavour actually booted would depend on ordering.
         [
@@ -145,6 +189,96 @@ def test_an_empty_catalogue_names_the_setting(server):
 def test_validator_accepts_the_real_ladder(server):
     Setting().set(PluginSettings.WORKER_SIZES, LADDER)
     assert len(worker_sizes()) == 3
+
+
+# --- su_per_hour (09-A0) ---------------------------------------------------
+#
+# The rate has to be right before a single number is recorded against it:
+# 09-U4 forbids a backfill, so an hour billed at a wrong rate is an hour nobody
+# can repair.
+
+
+@pytest.mark.plugin("sivacor")
+def test_the_validator_fills_su_per_hour_from_vcpus(server):
+    """Absent means "the m3 rate", and the resolved value is what gets stored.
+
+    Stored rather than defaulted at read time, so an operator inspecting the
+    setting sees the rate they are being billed at instead of an absence whose
+    meaning they have to know.
+    """
+    Setting().set(PluginSettings.WORKER_SIZES, LADDER)
+    stored = Setting().get(PluginSettings.WORKER_SIZES)
+    assert [entry["su_per_hour"] for entry in stored] == [8, 16, 64]
+
+
+@pytest.mark.plugin("sivacor")
+def test_a_declared_rate_is_not_overwritten_by_vcpus(server):
+    """The whole point of 09-U3: the two are equal on m3 and nowhere else.
+
+    An r3 rung bills 2 SU per vCPU-hour. If the validator "corrected" this back
+    to vcpus, every r3 submission would be billed at half what it cost, and
+    nothing downstream would notice -- suHours / instanceHours would simply
+    agree with the wrong ladder.
+    """
+    Setting().set(
+        PluginSettings.WORKER_SIZES,
+        [{"memory_gb": 60, "flavor": "r3.large", "vcpus": 16, "gated": False, "su_per_hour": 32}],
+    )
+    assert worker_sizes()[0]["su_per_hour"] == 32
+
+
+@pytest.mark.plugin("sivacor")
+def test_a_catalogue_written_before_the_field_existed_still_reads(server):
+    """Production's catalogue was written before su_per_hour, and a validator
+    only runs on write -- so nothing re-normalises it until someone edits it.
+
+    This is the case that would otherwise hand the accrual an entry with no
+    rate at all, on the one deployment where the numbers matter.
+    """
+    Setting().collection.update_one(
+        {"key": PluginSettings.WORKER_SIZES},
+        {
+            "$set": {
+                "key": PluginSettings.WORKER_SIZES,
+                "value": [
+                    {"memory_gb": 30, "flavor": "m3.medium", "vcpus": 8, "gated": False}
+                ],
+            }
+        },
+        upsert=True,
+    )
+    assert worker_sizes() == [
+        {
+            "memory_gb": 30,
+            "flavor": "m3.medium",
+            "vcpus": 8,
+            "gated": False,
+            "su_per_hour": 8,
+        }
+    ]
+
+
+@pytest.mark.plugin("sivacor")
+def test_the_endpoint_never_exposes_the_rate(server):
+    """Same rule as `flavor`, for a different reason: it is an
+    allocation-accounting figure with no meaning to a researcher, and a price
+    shown beside a control that has no price attached invites a question
+    nobody can answer until a quota exists."""
+    Setting().set(PluginSettings.WORKER_SIZES, LADDER)
+    resp = server.request(path="/sivacor/worker_sizes", method="GET")
+    assertStatusOk(resp)
+    assert all("su_per_hour" not in entry for entry in resp.json["sizes"])
+
+
+@pytest.mark.plugin("sivacor")
+def test_a_fractional_rate_is_allowed(server):
+    """GPU flavours are flat rates and need not be whole numbers -- unlike
+    vcpus, where a fraction would be a typo."""
+    Setting().set(
+        PluginSettings.WORKER_SIZES,
+        [{"memory_gb": 60, "flavor": "g3.small", "vcpus": 16, "gated": False, "su_per_hour": 2.5}],
+    )
+    assert worker_sizes()[0]["su_per_hour"] == 2.5
 
 
 # --- the endpoint ---------------------------------------------------------
