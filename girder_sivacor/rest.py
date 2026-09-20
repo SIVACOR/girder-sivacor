@@ -808,6 +808,8 @@ class SIVACOR(Resource):
         self.route("POST", ("claim", ":id"), self.claim)
         self.route("POST", ("execution_record",), self.record_execution)
         self.route("PUT", ("outcome", ":id"), self.record_outcome)
+        self.route("POST", ("usage", "drain"), self.drain_usage)
+        self.route("GET", ("usage",), self.get_usage)
         self.route("GET", ("execution_record",), self.list_execution_records)
         self.route(
             "GET", ("execution_record", "summary"), self.summarise_execution_records
@@ -1191,6 +1193,43 @@ class SIVACOR(Resource):
             return {"stamped": False}
         usage.stamp_outcome(instance_id, code)
         return {"stamped": True, "billable": usage.is_billable(code)}
+
+    @access.admin
+    @autoDescribeRoute(
+        Description("Accrue every reaped instance's usage that is waiting.")
+        .notes(
+            "Driven from the celery beat every ten minutes. Safe to call by "
+            "hand and safe to call twice: each lifetime row is claimed with "
+            "find_one_and_delete, so a second caller finds nothing rather than "
+            "charging anybody twice.\n\n"
+            "Returns how many instances were accrued. Zero is the ordinary "
+            "answer on a quiet fleet -- it means no instance has been reaped "
+            "since the last run, not that anything is wrong."
+        )
+    )
+    def drain_usage(self):
+        return {"accrued": usage.drain()}
+
+    @access.admin
+    @autoDescribeRoute(
+        Description("Cumulative per-user resource usage.").notes(
+            "The permanent sibling of /sivacor/volume_usage. That one is "
+            "derived from job documents and reaches back exactly "
+            "sivacor.retention_days; these counters outlive every submission "
+            "behind them, which is what makes them answerable for a quota.\n\n"
+            "'house' is listed beside the users on purpose: fleet burn with no "
+            "submission behind it, and runs we declined to charge because they "
+            "were our own defects, are real SU against the same allocation. "
+            "The sum will still be smaller than the ACCESS dashboard's -- see "
+            "'What this deliberately does not measure' in "
+            "development_notes/09_user_usage_accounting_plan.md, and note the "
+            "dashboard lags 12-24 h.\n\n"
+            "'pending' counts rows waiting on the next drain. A lifetime count "
+            "that only grows means the beat task is not running."
+        )
+    )
+    def get_usage(self):
+        return usage.report()
 
     @staticmethod
     def store_execution_record(payload):

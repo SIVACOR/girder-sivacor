@@ -516,6 +516,66 @@ def drain(limit=500) -> int:
     return accrued
 
 
+def report() -> dict:
+    """Everything the deployment knows about who spent the allocation (09-A5).
+
+    The permanent sibling of :func:`~girder_sivacor.rest.volume_usage`, and the
+    contrast is the point: that one is derived from job documents and so reaches
+    back exactly ``sivacor.retention_days``, which is the right answer for "who
+    is spending the storage grant right now" and useless for billing. These
+    counters are cumulative and outlive every submission behind them.
+
+    **The house row is listed beside the users, not hidden.** Fleet burn with no
+    submission behind it, and runs we declined to charge because they were our
+    own defects, are real SU against the same allocation -- omitting them makes
+    the per-user total read like the whole bill when it never is (09-U7). Even
+    so the sum will be smaller than the ACCESS dashboard's; "What this
+    deliberately does not measure" in the plan says by how much and why.
+
+    ``since`` is reported per row rather than once for the deployment, because
+    09-U4 starts each user's accounting at their first accrued run, not at
+    deployment. A user with a recent ``since`` is not a light user.
+    """
+    users = []
+    for user in User().find({f"{USER_USAGE_FIELD}.since": {"$exists": True}}):
+        counters = user.get(USER_USAGE_FIELD) or {}
+        users.append(
+            {
+                "user_id": str(user["_id"]),
+                "login": user.get("login"),
+                "since": counters.get("since"),
+                "last_at": counters.get("lastAt"),
+                "submissions": counters.get("submissions", 0),
+                "su_hours": counters.get("suHours", 0.0),
+                "instance_hours": counters.get("instanceHours", 0.0),
+                "volume_gb_hours": counters.get("volumeGbHours", 0.0),
+                "by_size": counters.get("bySize", {}),
+            }
+        )
+    users.sort(key=lambda row: row["su_hours"], reverse=True)
+
+    house = UsageTotals().collection.find_one({"_id": TOTALS_ID}) or {}
+    return {
+        "users": users,
+        "house": {
+            "since": house.get("since"),
+            "last_at": house.get("lastAt"),
+            "instances": house.get("instances", 0),
+            "su_hours": house.get("suHours", 0.0),
+            "instance_hours": house.get("instanceHours", 0.0),
+            "by_reason": house.get("byReason", {}),
+        },
+        # Cheap to compute, and the number an operator actually wants when
+        # reconciling: per-user plus house, before comparing with ACCESS.
+        "total_su_hours": sum(row["su_hours"] for row in users)
+        + house.get("suHours", 0.0),
+        "pending": {
+            "lifetimes": InstanceLifetime().collection.count_documents({}),
+            "attributions": UsageAttribution().collection.count_documents({}),
+        },
+    }
+
+
 # --- small helpers ---------------------------------------------------------
 
 

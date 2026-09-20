@@ -858,3 +858,98 @@ def test_an_unstamped_failure_falls_to_the_house_end_to_end(
     assert usage.USER_USAGE_FIELD not in User().load(user["_id"], force=True)
     house = UsageTotals().collection.find_one({"_id": usage.TOTALS_ID})
     assert house["byReason"]["unstamped"] == pytest.approx(16.0)
+
+
+# --- the drain on the beat, and the report (09-A4, 09-A5) -------------------
+
+
+@pytest.mark.plugin("sivacor")
+def test_the_drain_endpoint_accrues_and_is_safe_to_repeat(
+    server, clean, priced, user, admin
+):
+    """Idempotent because each lifetime row is claimed with find_one_and_delete:
+    a second caller finds nothing rather than charging anybody twice."""
+    usage.record_attribution("i-abc", user["_id"], 60, None, billable=True)
+    InstanceLifetime().collection.insert_one(
+        lifetime_row(instance_id="i-abc", hours=1.0, size=60)
+    )
+    resp = server.request(path="/sivacor/usage/drain", method="POST", user=admin)
+    assertStatusOk(resp)
+    assert resp.json == {"accrued": 1}
+
+    resp = server.request(path="/sivacor/usage/drain", method="POST", user=admin)
+    assertStatusOk(resp)
+    assert resp.json == {"accrued": 0}
+    counters = User().load(user["_id"], force=True)[usage.USER_USAGE_FIELD]
+    assert counters["suHours"] == pytest.approx(16.0)
+
+
+@pytest.mark.plugin("sivacor")
+def test_the_drain_is_scheduled_on_the_beat(server):
+    """Nothing else calls it, so an unscheduled drain means the rows quietly
+    accumulate and expire unread -- numbers that are simply absent rather than
+    wrong, which is the harder kind to notice."""
+    from girder_sivacor.worker_plugin import run_submission
+
+    scheduled = []
+
+    class FakeSender:
+        def add_periodic_task(self, interval, sig, name=None, options=None):
+            scheduled.append((interval, name))
+
+    run_submission.setup_periodic_tasks(FakeSender())
+    assert (10 * 60, "Accrue reaped instances' usage") in scheduled
+
+
+@pytest.mark.plugin("sivacor")
+def test_the_report_lists_users_and_the_house_side_by_side(
+    server, clean, priced, user, admin
+):
+    """09-U7: fleet burn with no submission behind it is real SU against the
+    same allocation. Hiding it makes the per-user total read like the whole
+    bill, which it never is."""
+    usage.accrue(
+        lifetime_row(instance_id="i-1", hours=2.0, size=60),
+        {"userId": user["_id"], "memoryGb": 60, "billable": True},
+    )
+    usage.accrue(lifetime_row(instance_id="i-2", hours=1.0, size=30), None)
+
+    resp = server.request(path="/sivacor/usage", method="GET", user=admin)
+    assertStatusOk(resp)
+    body = resp.json
+    assert [row["login"] for row in body["users"]] == [user["login"]]
+    assert body["users"][0]["su_hours"] == pytest.approx(32.0)
+    assert body["users"][0]["by_size"] == {"60": 1}
+    assert body["users"][0]["since"] is not None
+    assert body["house"]["by_reason"]["unclaimed"] == pytest.approx(8.0)
+    assert body["total_su_hours"] == pytest.approx(40.0)
+
+
+@pytest.mark.plugin("sivacor")
+def test_the_report_counts_what_is_still_waiting(server, clean, priced, user, admin):
+    """A lifetime count that only grows means the beat task is not running --
+    the one failure of this feature that is otherwise completely silent."""
+    usage.record_attribution("i-abc", user["_id"], 60, None, billable=True)
+    InstanceLifetime().collection.insert_one(lifetime_row(instance_id="i-abc"))
+    resp = server.request(path="/sivacor/usage", method="GET", user=admin)
+    assertStatusOk(resp)
+    assert resp.json["pending"] == {"lifetimes": 1, "attributions": 1}
+
+
+@pytest.mark.plugin("sivacor")
+def test_a_user_with_no_accrued_usage_is_not_listed(server, clean, priced, user, admin):
+    """Unlike volume_usage, which lists approved accounts with zeroes because an
+    unspent allowance still counts against the grant. There is no allowance
+    here yet, so a user with no runs is simply not a row."""
+    resp = server.request(path="/sivacor/usage", method="GET", user=admin)
+    assertStatusOk(resp)
+    assert resp.json["users"] == []
+    assert resp.json["total_su_hours"] == 0.0
+
+
+@pytest.mark.plugin("sivacor")
+def test_usage_endpoints_are_admin_only(server, clean, user):
+    """Every row names a researcher and what they spent."""
+    for path, method in (("/sivacor/usage", "GET"), ("/sivacor/usage/drain", "POST")):
+        assertStatus(server.request(path=path, method=method), 401)
+        assertStatus(server.request(path=path, method=method, user=user), 403)

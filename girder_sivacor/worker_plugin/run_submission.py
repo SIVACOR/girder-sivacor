@@ -1207,6 +1207,12 @@ def setup_periodic_tasks(sender, **kwargs):
         name="Reap stranded submissions",
         options={"queue": LOCAL_QUEUE},
     )
+    sender.add_periodic_task(
+        10 * 60,
+        drain_usage.s(),
+        name="Accrue reaped instances' usage",
+        options={"queue": LOCAL_QUEUE},
+    )
 
 
 def _local_admin_token():
@@ -1270,6 +1276,30 @@ def cleanup_submissions():
         )
         return
     api.client.post("sivacor/cleanup")
+
+
+@app.task(queue=LOCAL_QUEUE)
+def drain_usage():
+    """Ask Girder to accrue the usage of every instance reaped since last time.
+
+    Same shape as the two sweeps below, and an HTTP call for the same reason
+    :func:`reap_stranded_submissions` gives: the accrual reads the worker-size
+    catalogue through ``Setting().get()``, whose defaults exist only as an
+    import side effect of ``girder_sivacor.settings``, and writes counters onto
+    user documents. Both are unambiguously wired in the Girder *server*; in a
+    celery worker they are a question about what happens to be imported.
+
+    Ten minutes is ample. The rows are durable, so how often this runs affects
+    how fresh the numbers are and never whether they are right (09-U18) -- and
+    accrual already lags a reap by the ~18 minutes an instance takes to die.
+    """
+    if not (api := _maintenance_api()):
+        logger.info(
+            "Skipping usage accrual: set GIRDER_API_URL on a worker (plus "
+            "GIRDER_API_KEY, unless it can reach MongoDB) to enable it."
+        )
+        return
+    api.client.post("sivacor/usage/drain")
 
 
 @app.task(queue=LOCAL_QUEUE)
