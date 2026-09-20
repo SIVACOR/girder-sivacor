@@ -38,6 +38,20 @@ def tro_steps(steps, action):
     return [(args, kwargs) for name, args, kwargs in steps if name == "run_tro" and args[0] == action]
 
 
+def labels(args):
+    """``(stage_index, phase)`` for a ``run_tro`` signature, or ``(None, None)``.
+
+    Both are passed positionally, and the tests read them positionally, because
+    girder_worker cannot record a child job for a step that carries a keyword
+    argument -- see the comment above the chain in ``rest.py``. Reading them out
+    of ``kwargs`` here would let that regression back in silently: the chain
+    would still be correct and the submission would still run, while the job
+    tree quietly truncated.
+    """
+    padded = list(args) + [None] * (5 - len(args))
+    return padded[3], padded[4]
+
+
 @pytest.mark.plugin("sivacor")
 def test_a_non_julia_stage_is_numbered_exactly_as_before(server, db, admin):
     """The regression guard. Every other stack must be untouched by this."""
@@ -64,13 +78,13 @@ def test_a_julia_stage_adds_a_resolve_before_the_run(server, db, admin):
 
     performances = tro_steps(steps, "add_performance")
     assert [args[1] for args, _ in performances] == [0, 1]
-    assert [kwargs["phase"] for _, kwargs in performances] == [
+    assert [labels(args)[1] for args, _ in performances] == [
         PHASE_RESOLVE,
         PHASE_ANALYSIS,
     ]
     # Both belong to stage 0 -- the stage index and the arrangement counter have
     # parted company, which is the whole point.
-    assert [kwargs["stage_index"] for _, kwargs in performances] == [0, 0]
+    assert [labels(args)[0] for args, _ in performances] == [0, 0]
     assert [args[1] for args, _ in tro_steps(steps, "prune_performance")] == [2]
 
 
@@ -114,8 +128,8 @@ def test_mixed_stages_keep_one_contiguous_arrangement_sequence(
     # Contiguous from 0, with no repeats -- a repeated number is the signature
     # of a counter that failed to advance.
     assert arrangements == list(range(len(arrangements)))
-    assert [kwargs["stage_index"] for _, kwargs in performances] == expected_stage_indices
-    assert [kwargs["phase"] for _, kwargs in performances] == expected_phases
+    assert [labels(args)[0] for args, _ in performances] == expected_stage_indices
+    assert [labels(args)[1] for args, _ in performances] == expected_phases
 
     # Every performance n accesses arrangement n and produces n+1, and the prune
     # picks up exactly where the last one left off.
@@ -136,8 +150,8 @@ def test_arrangements_are_labelled_by_stage_and_phase(server, db, admin):
     """
     steps = chain_for([JULIA_STAGE, R_STAGE], admin)
     arrangements = [
-        (args[1], kwargs.get("stage_index"), kwargs.get("phase"))
-        for name, args, kwargs in steps
+        (args[1], *labels(args))
+        for name, args, _ in steps
         if name == "run_tro" and args[0] == "add_arrangement"
     ]
     # initial (no phase), after-resolve of stage 0, after-run of stage 0,
@@ -170,3 +184,30 @@ def test_the_resolve_step_carries_the_same_credentials_as_every_other(server, db
 def test_an_admin_is_required_to_build_a_chain(db, admin):
     """Guards the fixture, not the code: no admin, no worker token, no chain."""
     assert User().findOne({"admin": True}) is not None
+
+
+@pytest.mark.plugin("sivacor")
+@pytest.mark.parametrize(
+    "stages",
+    [[R_STAGE], [JULIA_STAGE], [JULIA_STAGE, R_STAGE], [R_STAGE, JULIA_STAGE]],
+    ids=["r", "julia", "julia-then-r", "r-then-julia"],
+)
+def test_no_step_carries_a_keyword_argument(server, db, admin, stages):
+    """The guard for a bug that leaves the submission working and the record wrong.
+
+    girder_worker's girder_before_task_publish JSON-encodes a task's args but
+    not its kwargs before putting them in the POST /job query string, and
+    requests turns a dict query param into one repetition per *key*. A single
+    keyword argument anywhere in the chain is therefore a 400 from /job, and no
+    child job is recorded for that step or for any step after it -- while the
+    chain itself runs to completion and signs. Nothing else here would notice:
+    the arrangement numbers stay right, the declaration still validates, and the
+    only symptom is a truncated job tree and a warning stranded in the last step
+    that still had somewhere to log.
+
+    This first bit when `stage_index`/`phase` arrived with Julia support, which
+    is why it is parametrized over the stacks that have no resolve phase too --
+    the next keyword argument is as likely to be added to a shared step.
+    """
+    for name, _, kwargs in chain_for(stages, admin):
+        assert kwargs == {}, f"{name} must pass its arguments positionally"
