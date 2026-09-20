@@ -55,21 +55,17 @@ class FailureCode(str, Enum):
     IMAGE_PULL_FAILED = "image_pull_failed"
     #: No run command could be inferred for the image family.
     NO_ENTRYPOINT = "no_entrypoint"
-    #: The submission declares no dependency manifest for a stack that requires
-    #: one. Julia is the first: SIVACOR resolves the environment the researcher
-    #: declares, so there has to be a declaration.
+    #: **Retired, and kept only so old records still read.** Nothing raises
+    #: either of these since SIVACOR stopped resolving Julia environments on the
+    #: researcher's behalf: a stage that installs dependencies is now a stage
+    #: they wrote, so a missing ``Project.toml`` is their script's problem and a
+    #: failed install is an ordinary :attr:`NONZERO_EXIT` of that stage.
     #:
-    #: Named for the concept rather than for Julia, like the code below it.
-    #: ``renv::restore()`` is the same shape for R, and a code renamed later
-    #: silently reinterprets every record already written under the old name.
+    #: Deleting the members would not delete the records already written under
+    #: these codes, it would only make them unreadable -- an execution record
+    #: outlives the submission and the release that produced it.
     PROJECT_FILE_MISSING = "project_file_missing"
-    #: Dependency resolution failed before the researcher's code ever ran.
-    #: ``detail`` is the exit code.
-    #:
-    #: Separate from NONZERO_EXIT on purpose: folded into it, "your declared
-    #: environment could not be assembled" would be indistinguishable from "your
-    #: code raised", and telling those apart is the entire reason the resolve
-    #: phase is a phase of its own.
+    #: Retired with the code above; ``detail`` was the exit code.
     DEPENDENCY_RESOLUTION_FAILED = "dependency_resolution_failed"
     #: The declared main file is not in the package.
     MAIN_FILE_MISSING = "main_file_missing"

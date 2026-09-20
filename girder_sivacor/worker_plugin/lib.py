@@ -6,7 +6,6 @@ import math
 import os
 import queue
 import re
-import shlex
 import shutil
 import socket
 import stat
@@ -783,65 +782,15 @@ def is_julia(image_reference: str) -> bool:
     return image_reference.startswith("ghcr.io/sivacor/julia")
 
 
-#: The analysis itself -- the researcher's code, the thing being certified.
-PHASE_ANALYSIS = "analysis"
-#: Assembling the environment the researcher declared, before their code runs.
-#: A separate container with the network on, and a separate performance in the
-#: TRO, so ``InternetIsolation`` can be claimed for the analysis and not for
-#: this. See 10-D1/10-D4 in development_notes/10_julia_support_plan.md.
-PHASE_RESOLVE = "resolve"
+def performance_data_name(stage_num: int) -> str:
+    """Filename for a stage's performance data in the submission folder.
 
-
-def performance_data_name(stage_num: int, phase: str = PHASE_ANALYSIS) -> str:
-    """Filename for one phase's performance data in the submission folder.
-
-    The phase has to be in the name. Both phases of a stage run through
-    :func:`recorded_run`, which uploads this file by name, so without the
-    suffix the analysis would overwrite the resolve's metrics and the TRO would
-    describe one performance twice.
+    One stage, one container, one of these. SIVACOR briefly ran Julia stages as
+    two containers and needed a phase suffix here to keep the second from
+    overwriting the first's metrics; environment setup is an ordinary stage of
+    the researcher's own now, and an ordinary stage already has its own number.
     """
-    suffix = "" if phase == PHASE_ANALYSIS else f"_{phase}"
-    return f"performance_data_stage_{stage_num}{suffix}.json"
-
-
-def resolve_entrypoint() -> tuple[list[str], str]:
-    """What the resolve phase runs: instantiate the declared environment, nothing else.
-
-    No researcher entry point -- but **this is not code-free**. Julia runs each
-    package's ``deps/build.jl`` on install, so what executes here is the
-    researcher's dependency tree, with the network on, inside the same hardened
-    container as the analysis.
-    """
-    return (
-        ["/usr/local/julia/bin/julia", "--startup-file=no", "--project=.", "-e"],
-        shlex.quote("using Pkg; Pkg.instantiate()"),
-    )
-
-
-def _nearest_project_toml(base_path: Path, main_relative: Path) -> Path | None:
-    """Directory of the ``Project.toml`` that governs ``main_relative``.
-
-    Searches upward from the main file's own directory, nearest first, stopping
-    at the package root -- exactly what Julia's own ``--project=@.`` does.
-    Returns the directory relative to ``base_path``, or ``None`` if there is no
-    ``Project.toml`` anywhere above the main file.
-
-    **Several ``Project.toml`` files in one package is the normal Julia layout,
-    not an ambiguity**, which is why this searches rather than collecting
-    candidates the way the main-file lookup below does. ``docs/Project.toml``
-    and ``test/Project.toml`` are documented conventions -- DataFrames.jl and
-    GLM.jl ship two apiece, CSV.jl ships four -- so refusing a package for
-    having more than one, as MAIN_FILE_AMBIGUOUS does for main files, would
-    reject packages laid out exactly as Julia tells people to lay them out.
-    Nearest-upward is unambiguous by construction and needs no such rule.
-    """
-    directory = (base_path / main_relative).parent
-    while True:
-        if (directory / "Project.toml").is_file():
-            return directory.relative_to(base_path)
-        if directory == base_path:
-            return None
-        directory = directory.parent
+    return f"performance_data_stage_{stage_num}.json"
 
 
 def stata_license_mount_source(api, submission, host_tmp_root: str) -> str:
@@ -983,13 +932,16 @@ def _infer_run_command(submission, stage):
         home_dir = "/home/matlab"
     elif is_julia(image_name):
         # --startup-file=no keeps a stray startup.jl out of a certified run.
-        # --project=. rather than @.: the working directory is already set to
-        # the Project.toml's own directory below, so the upward search would
-        # only find the same answer more slowly and less explicitly.
+        # --project=@. is Julia's own upward search from the working directory,
+        # which is the main file's, as it is for every other stack. SIVACOR used
+        # to do that search itself and move the working directory to whatever it
+        # found; @. reaches the same environment without SIVACOR having an
+        # opinion about the researcher's layout, and picks up the default depot
+        # when there is no Project.toml at all.
         entrypoint = [
             "/usr/local/julia/bin/julia",
             "--startup-file=no",
-            "--project=.",
+            "--project=@.",
         ]
     else:
         raise SubmissionError(
@@ -1030,24 +982,11 @@ def _infer_run_command(submission, stage):
         )
 
     sub_dir = ""
-    if is_julia(image_name):
-        # The working directory is the Project.toml's, not the main file's:
-        # `--project=.` resolves against the cwd, and both the resolve phase and
-        # the analysis have to agree on which environment they are talking about.
-        project_rel = _nearest_project_toml(base_path, relative_paths[0])
-        if project_rel is None:
-            raise SubmissionError(
-                FailureCode.PROJECT_FILE_MISSING,
-                "This Julia submission has no Project.toml. SIVACOR resolves "
-                "the environment you declare, so a Project.toml listing your "
-                "dependencies is required -- place one beside "
-                f"{stage['main_file']} or at the top of your package. Include "
-                "Manifest.toml too if you have one: it pins the exact versions.",
-            )
-        sub_dir = "" if project_rel == Path(".") else str(project_rel)
-        command = relative_paths[0].relative_to(project_rel).as_posix()
-    # If renv.lock is found override sub_dir and command to use it
-    elif len(renv_paths) == 1:
+    # If renv.lock is found override sub_dir and command to use it. Julia is
+    # excluded rather than merely ordered after: an renv.lock in a Julia package
+    # is someone else's file, and letting it move the working directory would
+    # move the environment `--project=@.` finds.
+    if not is_julia(image_name) and len(renv_paths) == 1:
         print(
             "Found renv.lock, adjusting command to use its location as working directory."
         )
@@ -1760,7 +1699,7 @@ def pull_image(cli, api, submission, image_reference):
     logging.info(msg)
 
 
-def recorded_run(api, submission, stage, env_vars, phase=PHASE_ANALYSIS):
+def recorded_run(api, submission, stage, env_vars):
     cli = docker.from_env()
     info = cli.info()
     cpu_info = cpuinfo.get_cpu_info()
@@ -1893,11 +1832,6 @@ def recorded_run(api, submission, stage, env_vars, phase=PHASE_ANALYSIS):
     pull_image(cli, api, submission, image_reference)
 
     entrypoint, command, sub_dir, home_dir = _infer_run_command(submission, stage)
-    if phase == PHASE_RESOLVE:
-        # Same working directory as the analysis -- _infer_run_command put it at
-        # the Project.toml -- so `--project=.` means the same environment in
-        # both phases. Only what runs there differs.
-        entrypoint, command = resolve_entrypoint()
     project_dir = get_project_dir(submission)
     logging.info(
         "Setting working directory to: "
@@ -1929,12 +1863,11 @@ def recorded_run(api, submission, stage, env_vars, phase=PHASE_ANALYSIS):
         "command": command,
         "detach": True,
         "mounts": mounts,
-        # The resolve phase is never isolated: it exists to fetch. The claim
-        # stays honest because it is a performance of its own and does not carry
-        # the InternetIsolation attribute (10-D4) -- the analysis below does.
-        "network_disabled": (
-            False if phase == PHASE_RESOLVE else stage.get("network_isolation", False)
-        ),
+        # Exactly what the stage asked for, and nothing else. A stage that has
+        # to reach the network -- installing declared dependencies, typically --
+        # is a stage the researcher wrote and left unisolated, so the container
+        # and the InternetIsolation claim below cannot disagree.
+        "network_disabled": stage.get("network_isolation", False),
         "read_only": read_only,
         "working_dir": os.path.join(target_workspace_dir, "project", sub_dir),
         "user": user,
@@ -2003,10 +1936,6 @@ def recorded_run(api, submission, stage, env_vars, phase=PHASE_ANALYSIS):
             # actually got: mem_limit_bytes alone cannot say whether a run
             # was sized deliberately or simply landed on whatever was free.
             "requested_memory_gb": submission.get("telemetry_requested_memory_gb"),
-            # Which phase this row is. Two rows per Julia stage, one per
-            # stage for every other stack -- so a consumer counting stages
-            # has to filter, and sanitize_record's n_stages does.
-            "phase": phase,
             "image_name": stage.get("image_name"),
             "image_tag": stage.get("image_tag"),
             "network_isolation": bool(stage.get("network_isolation", False)),
@@ -2180,7 +2109,7 @@ def recorded_run(api, submission, stage, env_vars, phase=PHASE_ANALYSIS):
             json.dumps(performance_data, cls=NpEncoder, allow_nan=False).encode(
                 "utf-8"
             ),
-            performance_data_name(stage_num, phase),
+            performance_data_name(stage_num),
             mime_type="text/plain",
             item_type="performance_data",
         )
@@ -2264,11 +2193,7 @@ def recorded_run(api, submission, stage, env_vars, phase=PHASE_ANALYSIS):
             if log_obj:
                 api.download_file(log_obj["_id"], log_file)
 
-            stage_stamp = (
-                f"\n\n===== Stage {stage_num} Output =====\n\n"
-                if phase == PHASE_ANALYSIS
-                else f"\n\n===== Stage {stage_num} Dependency Resolution =====\n\n"
-            )
+            stage_stamp = f"\n\n===== Stage {stage_num} Output =====\n\n"
             with open(target_file, "rb") as fp:
                 logging.info(
                     f"Reading {key} from {target_file} and appending to {log_file}..."
@@ -2331,22 +2256,9 @@ def recorded_run(api, submission, stage, env_vars, phase=PHASE_ANALYSIS):
                 detail=mem_limit,
             )
         if ret["StatusCode"] != 0:
-            # Classified HERE, not by the caller. recorded_run raises before it
+            # Classified HERE, not by the caller: recorded_run raises before it
             # returns, so a caller checking StatusCode itself never sees a
-            # non-zero one -- which is how the resolve phase first shipped
-            # reporting NONZERO_EXIT, the one code it exists to be distinguished
-            # from.
-            if phase == PHASE_RESOLVE:
-                raise SubmissionError(
-                    FailureCode.DEPENDENCY_RESOLUTION_FAILED,
-                    "Could not resolve the dependencies declared in "
-                    "Project.toml. Check stderr for which package failed -- a "
-                    "name that is not registered, a version bound nothing "
-                    "satisfies, or a package whose build step failed are the "
-                    "usual causes. Note Pkg writes its progress to stderr, not "
-                    "stdout.",
-                    detail=ret["StatusCode"],
-                )
+            # non-zero one.
             raise SubmissionError(
                 FailureCode.NONZERO_EXIT,
                 "Error executing recorded run. Check stdout/stderr for details.",
