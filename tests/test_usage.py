@@ -17,8 +17,11 @@ import datetime
 from types import SimpleNamespace
 
 import pytest
+from girder.models.folder import Folder
 from girder.models.setting import Setting
 from girder.models.user import User
+from girder_jobs.constants import JobStatus
+from girder_jobs.models.job import Job
 from pymongo.collection import Collection
 from girder_sivacor import usage
 from girder_sivacor.errors import FailureCode
@@ -601,3 +604,148 @@ def test_the_transient_rows_expire(db):
         ]
         assert len(ttls) == 1
         assert ttls[0]["expireAfterSeconds"] == usage.TRANSIENT_TTL_SECONDS
+
+
+# --- W1: the attribution hook (09-A2) --------------------------------------
+#
+# These drive the real Girder event, not `record_attribution` directly: the
+# whole claim of 09-A2 is that *one* hook covers every terminal path, and only
+# an actual job transition tests that.
+
+
+def submission_job(user, queue="sivacor.i-abc", memory_gb=60, disk_gb=None):
+    """A sivacor_submission job shaped the way an assigned one really is."""
+    job = Job().createJob(
+        title="usage-test", type="sivacor_submission", user=user, public=False
+    )
+    Job().collection.update_one(
+        {"_id": job["_id"]},
+        {
+            "$set": {
+                "meta.worker_queue": queue,
+                "meta.requested_memory_gb": memory_gb,
+                "meta.requested_disk_gb": disk_gb,
+            }
+        },
+    )
+    # Girder enforces the job state machine, so a terminal status can only be
+    # reached from RUNNING -- which is also what a real submission does.
+    job = Job().load(job["_id"], force=True)
+    return Job().updateJob(job, status=JobStatus.RUNNING)
+
+
+def attribution(db, instance_id="i-abc"):
+    return db[usage.ATTRIBUTION_COLLECTION].find_one({"instanceId": instance_id})
+
+
+@pytest.mark.plugin("sivacor")
+def test_a_finished_submission_is_attributed_to_its_submitter(db, user, submission_collection):
+    job = submission_job(user, disk_gb=100)
+    Job().updateJob(job, status=JobStatus.SUCCESS)
+    row = attribution(db)
+    assert row["userId"] == user["_id"]
+    assert row["memoryGb"] == 60
+    assert row["volumeGb"] == 100
+    assert row["billable"] is True
+
+
+@pytest.mark.plugin("sivacor")
+def test_a_failure_is_attributed_but_not_yet_billable(db, user, submission_collection):
+    """The fail-safe: the row exists so the user *can* be charged, and is not
+    charged until something classifies the outcome (09-U13)."""
+    job = submission_job(user)
+    Job().updateJob(job, status=JobStatus.ERROR)
+    row = attribution(db)
+    assert row["userId"] == user["_id"]
+    assert row["billable"] is False
+
+
+@pytest.mark.plugin("sivacor")
+def test_a_cancel_is_billable_from_the_status_alone(db, user, submission_collection):
+    """No failure code is involved and nothing has to be reported by the
+    worker: the SU were spent on the researcher's behalf before they stopped
+    the run, and making a cancel free makes it a way to get free compute."""
+    job = submission_job(user)
+    Job().updateJob(job, status=JobStatus.CANCELED)
+    assert attribution(db)["billable"] is True
+
+
+@pytest.mark.plugin("sivacor")
+def test_a_running_submission_is_not_attributed_yet(db, user, submission_collection):
+    """The hook fires on every job update, including every log line. Only a
+    terminal status means the instance is finished with."""
+    job = submission_job(user)
+    Job().updateJob(job, log="still going\n")
+    assert attribution(db) is None
+
+
+@pytest.mark.plugin("sivacor")
+def test_a_submission_that_never_got_an_instance_is_not_attributed(
+    db, user, submission_collection
+):
+    """No private queue means nothing booted -- refused at submit_job, reaped as
+    REAPED_NO_WORKER, or a deployment on the shared-queue path. No SU to
+    attribute and no row to write."""
+    job = submission_job(user, queue=None)
+    Job().updateJob(job, status=JobStatus.SUCCESS)
+    assert db[usage.ATTRIBUTION_COLLECTION].count_documents({}) == 0
+
+
+@pytest.mark.plugin("sivacor")
+def test_a_later_job_update_cannot_un_charge_a_stamped_failure(
+    db, user, submission_collection
+):
+    """The reason `billable` is written with $max and not $set.
+
+    The hook fires on *every* job update. A failed submission whose outcome has
+    already been stamped as the researcher's fault gets re-attributed the next
+    time anything touches the job -- and with $set that second write would
+    silently make a charged run free. Rather than trace every call path that
+    might log after a terminal status, the invariant is structural.
+    """
+    job = submission_job(user)
+    Job().updateJob(job, status=JobStatus.ERROR)
+    usage.stamp_outcome(db, "i-abc", FailureCode.STATA_ERROR)
+    assert attribution(db)["billable"] is True
+
+    Job().updateJob(job, log="a line that arrives after the failure\n")
+    assert attribution(db)["billable"] is True
+
+
+@pytest.mark.plugin("sivacor")
+def test_attribution_failure_never_breaks_the_folder_status(
+    db, user, submission_collection, monkeypatch
+):
+    """The folder write is the 2026-09-04 delete guard. An accounting failure
+    must not be able to leave a submission transitional and undeletable --
+    counters are the least important thing that handler does, and they run
+    first, so a raise there would otherwise take the folder update with it."""
+    from girder_sivacor import notifications
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("no room at the inn")
+
+    monkeypatch.setattr(notifications.usage, "record_attribution", explode)
+    job = submission_job(user)
+    folder = Folder().createFolder(
+        submission_collection, f"sub-{job['_id']}", parentType="collection"
+    )
+    Folder().setMetadata(folder, {"job_id": str(job["_id"]), "creator_id": user["_id"]})
+
+    Job().updateJob(job, status=JobStatus.ERROR)
+
+    assert Folder().load(folder["_id"], force=True)["meta"]["status"] == "failed"
+
+
+@pytest.mark.plugin("sivacor")
+def test_the_indexes_exist_after_a_plugin_load(db):
+    """Wired at load, not left to whoever writes the first row. Without the TTL
+    index the transient rows are permanent and the privacy argument for holding
+    a user id in one of them is not true."""
+    for name in (usage.ATTRIBUTION_COLLECTION, usage.LIFETIME_COLLECTION):
+        ttls = [
+            idx
+            for idx in db[name].list_indexes()
+            if idx.get("expireAfterSeconds") is not None
+        ]
+        assert len(ttls) == 1, f"{name} has no TTL index after plugin load"

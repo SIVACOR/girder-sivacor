@@ -295,6 +295,15 @@ def record_attribution(db, instance_id, user_id, memory_gb, volume_gb, billable)
     :func:`stamp_outcome` if the code turns out to be one the researcher pays
     for. The default is the fail-safe: a stamp that never arrives leaves the
     house paying (09-U13), which is the direction 09-U9 wants to err in.
+
+    **``billable`` is written with ``$max``, never ``$set``, so it can only ever
+    go up.** The hook that calls this fires on *every* job update, not only the
+    one that made the status terminal -- so a failed submission that has already
+    had its outcome stamped will be re-attributed with ``billable=False`` the
+    next time anything touches the job, and a ``$set`` would silently un-charge
+    it. ``$max`` makes that impossible rather than leaving it to depend on
+    whether any call path happens to log after a terminal status. (BSON orders
+    ``False`` before ``True``, so this is exactly "raise, never lower".)
     """
     db[ATTRIBUTION_COLLECTION].update_one(
         {"instanceId": instance_id},
@@ -304,9 +313,9 @@ def record_attribution(db, instance_id, user_id, memory_gb, volume_gb, billable)
                 "userId": user_id,
                 "memoryGb": memory_gb,
                 "volumeGb": volume_gb,
-                "billable": bool(billable),
                 "at": _now(),
-            }
+            },
+            "$max": {"billable": bool(billable)},
         },
         upsert=True,
     )
@@ -320,15 +329,17 @@ def stamp_outcome(db, instance_id, code) -> None:
     Making the code ride the status transition instead would mean getting the
     ordering right on five separate terminal paths.
 
-    **Only ever raises ``billable``, never lowers it.** A success is billable
-    from the moment the attribution row is written, and nothing about a later
-    code should be able to make an already-charged run free.
+    **Only ever raises ``billable``, never lowers it**, by the same ``$max`` as
+    :func:`record_attribution`. A success is billable from the moment its
+    attribution row is written, and nothing about a later code should be able to
+    make an already-charged run free.
     """
-    update = {"code": getattr(code, "value", code)}
-    if is_billable(code):
-        update["billable"] = True
     db[ATTRIBUTION_COLLECTION].update_one(
-        {"instanceId": instance_id}, {"$set": update}
+        {"instanceId": instance_id},
+        {
+            "$set": {"code": getattr(code, "value", code)},
+            "$max": {"billable": bool(is_billable(code))},
+        },
     )
 
 

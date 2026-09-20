@@ -20,6 +20,7 @@ from girder_jobs.models.job import Job as JobModel
 from girder_oauth.providers import addProvider
 from girder_oauth.settings import PluginSettings as OAuthSettings
 
+from . import usage
 from .auth.orcid import ORCID
 from .notifications import (
     _createMessage,
@@ -411,6 +412,14 @@ class SIVACORPlugin(GirderPlugin):
         User().exposeFields(level=AccessType.ADMIN, fields=("oauth"))
 
         info["apiRoot"].sivacor = SIVACOR()
+        # The accounting collections have no Girder Model to hang an
+        # ``ensureIndices`` off, because the fleet controller writes one of them
+        # with a plain pymongo handle and no plugin load -- so the indexes are
+        # created here instead. It has to happen before the first row is
+        # written: without the TTL index the "transient" rows are permanent, and
+        # the privacy argument for holding a user id in one of them stops being
+        # true. See development_notes/09_user_usage_accounting_plan.md.
+        usage.ensure_indices(User().collection.database)
         getPlugin("jobs").load(info)
         events.bind("jobs.cancel", "sivacor", cancel_jobs)
         # Workers report progress over REST, so this fires here rather than in
