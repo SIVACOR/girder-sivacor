@@ -25,7 +25,19 @@ What it can and cannot prove, stated plainly because the difference matters:
   accident.
 * It **cannot** prove the lifetime matches what Nova saw. That needs
   ``openstack server show <uuid> -f json | jq .created`` taken *before* the
-  reap, from a host with cloud credentials. The plan's playbook has it.
+  reap, from a host with cloud credentials. The plan's playbook has it. On
+  2026-09-20 that comparison was the whole of 09-U2: Nova's ``created`` and the
+  job document's ``created`` were twenty seconds apart, and only the direct
+  reading could say which one the lifetime row had used.
+
+**If you are timing the beat rather than just observing totals, start the clock
+when the lifetime row appears, not when the job reached a terminal status.** The
+gap between the two is the instance's idle tail -- around eighteen minutes -- so
+a grace period measured from the job expires before the row it is waiting for
+exists. That produced a confident "the beat is not running" on 2026-09-20 about
+a beat that was running fine; the check had drained by hand eight minutes before
+the next tick. Passing ``--no-drain`` and watching ``pending`` is the honest way
+to test the schedule.
 """
 
 from __future__ import annotations
