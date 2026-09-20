@@ -56,8 +56,19 @@ def worker_sizes():
 
     Sorted by ``memory_gb`` so "the smallest" is well defined however the
     setting was written.
+
+    ``su_per_hour`` is filled from ``vcpus`` when absent, which the validator
+    also does on write. The duplication is deliberate and it is not belt and
+    braces: a catalogue written *before* the field existed is never re-validated
+    until someone writes it again, so production would otherwise hand the
+    accrual an entry with no rate at all. Defaulting here means every reader
+    sees a rate, and the validator's copy means every *newly written* catalogue
+    stores one explicitly rather than relying on this. 09-U3.
     """
-    sizes = Setting().get(PluginSettings.WORKER_SIZES) or []
+    sizes = [
+        {**entry, "su_per_hour": entry.get("su_per_hour", entry["vcpus"])}
+        for entry in Setting().get(PluginSettings.WORKER_SIZES) or []
+    ]
     return sorted(sizes, key=lambda entry: entry["memory_gb"])
 
 
@@ -1610,7 +1621,11 @@ class SIVACOR(Resource):
             "machine shape must not become visible to a researcher or "
             "load-bearing in an exported workflow. 'vcpus' is here because the "
             "label needs it; usable memory is not, because it is an "
-            "approximation that would go stale in a cache."
+            "approximation that would go stale in a cache. 'su_per_hour' is "
+            "not here either -- it is an allocation-accounting figure with no "
+            "meaning to a researcher, and showing a price beside a control "
+            "that has no price attached invites a question nobody can answer "
+            "until a quota exists."
         )
     )
     def get_worker_sizes(self):
