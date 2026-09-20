@@ -195,6 +195,18 @@ def test_a_setup_stage_installs_what_the_isolated_analysis_then_uses(
     assert json.loads(setup["sivacor:DockerRunArgs"])["network_disabled"] is False
     assert json.loads(analysis["sivacor:DockerRunArgs"])["network_disabled"] is True
 
+    # The same fact in the other store, which is written by a different code
+    # path. These two disagreed in production once (job 6aad4ceb4b3c91605cb6fa92):
+    # the resolve phase forced the container's network on while the record
+    # copied what the SUBMISSION asked for, so every Julia resolve was filed as
+    # isolated. One source of truth makes that impossible now rather than fixed,
+    # but the assertion is cheap and the consequence is not: the TRO is signed
+    # and re-readable, while execution records are anonymous, kept indefinitely
+    # and outlive the submission, so a wrong value there is permanent.
+    records = list(ExecutionRecord().find({}))
+    assert len(records) == 1
+    assert [row["network_isolation"] for row in records[0]["stages"]] == [False, True]
+
     # The manifest Pkg wrote appears in the setup stage's own snapshot, so it
     # reads as that stage's output rather than the analysis's.
     arrangements = listify(root.get("trov:hasArrangement"))
