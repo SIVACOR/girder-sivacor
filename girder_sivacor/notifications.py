@@ -320,7 +320,6 @@ def record_usage_attribution(job, status) -> None:
         return
 
     usage.record_attribution(
-        Folder().collection.database,
         instance_id,
         job.get("userId"),
         meta.get("requested_memory_gb"),

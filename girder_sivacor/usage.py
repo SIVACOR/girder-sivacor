@@ -18,9 +18,11 @@ instance's lifetime into counters, and nothing about when that happens.
 **Three stores, and only one of them is permanent.** The counters live on the
 Girder user document, because that is the only place where deleting the user
 already erases them -- a side collection keyed by user id would be a new
-personal-data store with its own erasure obligation (09-U1). The two collections
-below are transient joins, TTL-indexed, and the privacy section of the plan
-treats them as a different thing from the counters for that reason.
+personal-data store with its own erasure obligation (09-U1). The other two are
+transient joins, TTL-indexed, and the privacy section of the plan treats them as
+a different thing from the counters for that reason. All three are Girder
+models; see :mod:`girder_sivacor.models.usage`, including why the one the fleet
+controller writes is a model too.
 
 Nothing here retries. A failed accrual under-counts and says so in the log
 (09-U9): an under-charged user complains to nobody, while an over-charged one is
@@ -36,6 +38,11 @@ from girder.models.setting import Setting
 from girder.models.user import User
 
 from .errors import FailureCode
+from .models.usage import (
+    InstanceLifetime,
+    UsageAttribution,
+    UsageTotals,
+)
 from .settings import PluginSettings
 
 logger = logging.getLogger(__name__)
@@ -53,29 +60,8 @@ logger = logging.getLogger(__name__)
 #: other researcher.
 USER_USAGE_FIELD = "sivacorUsage"
 
-#: The house bucket: one singleton document, no user link, no job link, no
-#: instance id (09-U7, 09-U11). Permanent, and in the same class as
-#: ``sivacor_execution_record`` -- permanent *because* it is not personal data.
-TOTALS_COLLECTION = "sivacor_usage_totals"
+#: The house bucket's ``_id``. One document, addressed by a literal.
 TOTALS_ID = "house"
-
-#: Transient. Written by Girder when a submission's job reaches a terminal
-#: status, consumed at accrual. This is the user↔instance join, and it exists
-#: because the job document that carries it is routinely deleted *before* the
-#: instance is reaped (09-U5).
-ATTRIBUTION_COLLECTION = "sivacor_usage_attribution"
-
-#: Transient. Written by the controller at reap (09-U16).
-LIFETIME_COLLECTION = "sivacor_instance_lifetime"
-
-#: How long a transient row lives before Mongo expires it.
-#:
-#: The same fourteen days, and the same reasoning, as
-#: ``run_submission.SPENT_MARKER_TTL_SECONDS``: it must comfortably exceed the
-#: controller's ``max_lifetime``, which production sets to 180 h. An expired row
-#: costs an under-count (09-U9); a row that expires *before* its partner arrives
-#: would silently move a user's spend to the house.
-TRANSIENT_TTL_SECONDS = 14 * 24 * 60 * 60
 
 
 # --- rates and caps --------------------------------------------------------
@@ -241,7 +227,7 @@ def is_billable(code: FailureCode | str | None) -> bool:
 # --- writing the transient rows --------------------------------------------
 
 
-def record_lifetime(db, instance, deleted_at=None) -> None:
+def record_lifetime(instance, deleted_at=None) -> None:
     """The fleet controller's entire contribution to this feature (09-U16).
 
     Call it in the reap loop **strictly before** ``fleet.delete_instance``,
@@ -253,14 +239,19 @@ def record_lifetime(db, instance, deleted_at=None) -> None:
     read, no user lookup, no billability branch. If a future change adds any of
     those here it is in the wrong process; the accrual runs in Girder, on this.
 
-    ``db`` is a plain pymongo database, not a Girder model, so the controller can
-    call this without a Girder request context. Best effort: a lifetime that
-    cannot be written is an under-count, which 09-U9 permits, and a fleet that
-    stops reaping because a counter failed is not a trade worth making.
+    Goes through Girder's model layer even though the caller is the fleet
+    controller, which is not a Girder server: that process already reaches
+    Girder this way for ``dispatch.publish`` and ``catalogue.load``, so
+    threading a raw pymongo handle in would be a second mechanism for something
+    it already does -- and one that hardcodes a collection name.
+
+    Best effort: a lifetime that cannot be written is an under-count, which
+    09-U9 permits, and a fleet that stops reaping because a counter failed is
+    not a trade worth making.
     """
     deleted_at = deleted_at or _now()
     try:
-        db[LIFETIME_COLLECTION].update_one(
+        InstanceLifetime().collection.update_one(
             {"instanceId": instance.id},
             {
                 "$setOnInsert": {
@@ -283,7 +274,7 @@ def record_lifetime(db, instance, deleted_at=None) -> None:
         )
 
 
-def record_attribution(db, instance_id, user_id, memory_gb, volume_gb, billable) -> None:
+def record_attribution(instance_id, user_id, memory_gb, volume_gb, billable) -> None:
     """Snapshot who a reaped instance's usage belongs to (09-U5).
 
     Written when the submission's job reaches a terminal status, which is the
@@ -305,7 +296,7 @@ def record_attribution(db, instance_id, user_id, memory_gb, volume_gb, billable)
     whether any call path happens to log after a terminal status. (BSON orders
     ``False`` before ``True``, so this is exactly "raise, never lower".)
     """
-    db[ATTRIBUTION_COLLECTION].update_one(
+    UsageAttribution().collection.update_one(
         {"instanceId": instance_id},
         {
             "$set": {
@@ -321,7 +312,7 @@ def record_attribution(db, instance_id, user_id, memory_gb, volume_gb, billable)
     )
 
 
-def stamp_outcome(db, instance_id, code) -> None:
+def stamp_outcome(instance_id, code) -> None:
     """Record why a run failed, and whether that makes it the user's to pay for.
 
     Separate from :func:`record_attribution` so the two are order-independent:
@@ -334,7 +325,7 @@ def stamp_outcome(db, instance_id, code) -> None:
     attribution row is written, and nothing about a later code should be able to
     make an already-charged run free.
     """
-    db[ATTRIBUTION_COLLECTION].update_one(
+    UsageAttribution().collection.update_one(
         {"instanceId": instance_id},
         {
             "$set": {"code": getattr(code, "value", code)},
@@ -346,7 +337,7 @@ def stamp_outcome(db, instance_id, code) -> None:
 # --- the accrual -----------------------------------------------------------
 
 
-def accrue(db, lifetime, attribution) -> None:
+def accrue(lifetime, attribution) -> None:
     """Charge one reaped instance's lifetime to a user, the house, or both.
 
     ``attribution`` of ``None`` is not an error: the instance booted and was
@@ -387,7 +378,6 @@ def accrue(db, lifetime, attribution) -> None:
 
     if over_cap_hours:
         accrue_house(
-            db,
             "over_cap",
             su_hours=over_cap_hours * rate,
             instance_hours=over_cap_hours,
@@ -396,7 +386,6 @@ def accrue(db, lifetime, attribution) -> None:
 
     if attribution is None:
         accrue_house(
-            db,
             "unclaimed",
             su_hours=billable_hours * rate,
             instance_hours=billable_hours,
@@ -405,7 +394,6 @@ def accrue(db, lifetime, attribution) -> None:
 
     if not attribution.get("billable"):
         accrue_house(
-            db,
             attribution.get("code") or "unstamped",
             su_hours=billable_hours * rate,
             instance_hours=billable_hours,
@@ -423,14 +411,6 @@ def accrue(db, lifetime, attribution) -> None:
 
 def accrue_user(user_id, su_hours, instance_hours, volume_gb_hours, memory_gb) -> None:
     """Add one instance's spend to a user's cumulative counters.
-
-    Goes through ``User().collection`` rather than a raw ``db["user"]``, and
-    takes no ``db`` at all as a result. The user collection is Girder's, not
-    ours: its name is Girder's to change, and the model is the supported way to
-    reach it. This is also the line the module's two halves fall on --
-    everything the accrual touches is Girder-side and may use Girder models,
-    while :func:`record_lifetime` is called by the fleet controller, which has
-    no plugin load and must be handed a plain pymongo database.
 
     ``bySize`` is keyed by ``memory_gb`` as a string, never by flavour: S1 of
     ``03_worker_sizing_plan.md`` keeps the provider's name for a machine shape
@@ -469,7 +449,7 @@ def accrue_user(user_id, su_hours, instance_hours, volume_gb_hours, memory_gb) -
     )
 
 
-def accrue_house(db, reason, su_hours, instance_hours, instances=1) -> None:
+def accrue_house(reason, su_hours, instance_hours, instances=1) -> None:
     """Add spend that belongs to nobody, or to us, to the anonymous singleton.
 
     ``reason`` separates three different bills with three different owners: the
@@ -482,7 +462,7 @@ def accrue_house(db, reason, su_hours, instance_hours, instances=1) -> None:
     account that must never be locked out (09-U11).
     """
     now = _now()
-    db[TOTALS_COLLECTION].update_one(
+    UsageTotals().collection.update_one(
         {"_id": TOTALS_ID},
         {
             "$inc": {
@@ -498,7 +478,7 @@ def accrue_house(db, reason, su_hours, instance_hours, instances=1) -> None:
     )
 
 
-def drain(db, limit=500) -> int:
+def drain(limit=500) -> int:
     """Accrue every lifetime waiting to be counted. Returns how many were.
 
     Runs on the beat, not in the reap loop and not in ``submit_job`` (09-U18).
@@ -514,14 +494,14 @@ def drain(db, limit=500) -> int:
     """
     accrued = 0
     for _ in range(limit):
-        lifetime = db[LIFETIME_COLLECTION].find_one_and_delete({})
+        lifetime = InstanceLifetime().collection.find_one_and_delete({})
         if lifetime is None:
             break
-        attribution = db[ATTRIBUTION_COLLECTION].find_one_and_delete(
+        attribution = UsageAttribution().collection.find_one_and_delete(
             {"instanceId": lifetime["instanceId"]}
         )
         try:
-            accrue(db, lifetime, attribution)
+            accrue(lifetime, attribution)
         except Exception:
             # Both rows are already gone, so this is a lost accrual rather than
             # a retryable one -- which is the trade 09-U9 chose deliberately.
@@ -534,19 +514,6 @@ def drain(db, limit=500) -> int:
             continue
         accrued += 1
     return accrued
-
-
-def ensure_indices(db) -> None:
-    """TTL indexes on both transient collections.
-
-    Without these the "transient" rows are permanent, and the privacy argument
-    for keeping a user id in ``sivacor_usage_attribution`` is not true. Expiry
-    has to be a property of the collection rather than a sweep somebody has to
-    remember to run.
-    """
-    for name in (ATTRIBUTION_COLLECTION, LIFETIME_COLLECTION):
-        db[name].create_index("at", expireAfterSeconds=TRANSIENT_TTL_SECONDS)
-        db[name].create_index("instanceId", unique=True)
 
 
 # --- small helpers ---------------------------------------------------------

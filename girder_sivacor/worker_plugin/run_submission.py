@@ -102,6 +102,27 @@ def report_failure(api, job_id, failure, exc):
         logger.exception("Could not mark job %s as failed", job_id)
 
 
+def report_outcome(api, job_id, exc):
+    """Tell the server which failure code this run ended with (09-A2b).
+
+    Without it every failed submission falls to the house at accrual, because an
+    unstamped outcome is not billable (09-U13). That is the safe direction, so
+    this is best effort in the strongest sense: it is called from inside an
+    ``except`` that is already handling the researcher's real problem, and a
+    counter must not be allowed to replace it -- least of all by raising a fresh
+    exception out of an error path.
+    """
+    try:
+        api.record_outcome(job_id, classify(exc)[0])
+    except Exception:
+        logger.warning(
+            "Could not report the outcome of job %s; its instance's SU will "
+            "fall to the house",
+            job_id,
+            exc_info=True,
+        )
+
+
 def build_execution_record(submission, status, step=None, exc=None):
     """Assemble the anonymous record of how this submission went.
 
@@ -270,6 +291,10 @@ def submission_task(failure):
                 # this is the one place that can still tell.
                 failed_with = _classify_vanished_submission(api, submission, exc)
                 report_failure(api, job_id, failure, failed_with)
+                # After report_failure, which is what transitions the job to
+                # ERROR and so fires the hook that creates the attribution row.
+                # Stamping first would write onto a row that does not exist yet.
+                report_outcome(api, job_id, failed_with)
                 # func.__name__ rather than the `failure` prose: the step name
                 # is kept forever, so it has to be a stable identifier we chose,
                 # not a sentence someone may reword later.
@@ -494,6 +519,9 @@ def prepare_submission(
         }
     except Exception as exc:
         report_failure(api, job_id, "Failed to prepare submission", exc)
+        # This step is not wrapped by submission_task, so it needs its own
+        # stamp -- the head of the chain does its own job bookkeeping.
+        report_outcome(api, job_id, exc)
         record_execution(api, telemetry, "failed", "prepare_submission", exc)
         raise
 

@@ -25,7 +25,14 @@ from girder_jobs.models.job import Job
 from pymongo.collection import Collection
 from girder_sivacor import usage
 from girder_sivacor.errors import FailureCode
+from girder_sivacor.models.usage import (
+    TRANSIENT_TTL_SECONDS,
+    InstanceLifetime,
+    UsageAttribution,
+    UsageTotals,
+)
 from girder_sivacor.settings import PluginSettings
+from pytest_girder.assertions import assertStatus, assertStatusOk
 
 LADDER = [
     {"memory_gb": 30, "flavor": "m3.medium", "vcpus": 8, "gated": False},
@@ -47,17 +54,15 @@ def fake_instance(instance_id="i-1", created=None, size=60, volume_gb=None):
 
 
 @pytest.fixture
-def db(server):
-    """The raw pymongo database, which is what the controller passes in.
+def clean(server):
+    """Empty the three accounting collections between tests.
 
-    ``record_lifetime`` deliberately takes this rather than a Girder model, so
-    the fleet controller can call it with no Girder request context (09-U16).
+    They are plugin-owned Girder models, so nothing else clears them, and the
+    house singleton in particular accumulates across a module.
     """
-    handle = User().collection.database
-    for name in (usage.ATTRIBUTION_COLLECTION, usage.LIFETIME_COLLECTION):
-        handle[name].delete_many({})
-    handle[usage.TOTALS_COLLECTION].delete_many({})
-    return handle
+    for model in (UsageAttribution(), InstanceLifetime(), UsageTotals()):
+        model.collection.delete_many({})
+    return None
 
 
 # --- the billability table -------------------------------------------------
@@ -221,79 +226,82 @@ def test_an_unknown_rung_has_no_rate(server):
 
 
 @pytest.mark.plugin("sivacor")
-def test_record_lifetime_writes_what_the_controller_saw(db):
+def test_record_lifetime_writes_what_the_controller_saw(clean):
     usage.record_lifetime(
-        db, fake_instance(size=30, volume_gb=100), deleted_at=utc(2026, 9, 20, 12, 30)
+        fake_instance(size=30, volume_gb=100), deleted_at=utc(2026, 9, 20, 12, 30)
     )
-    row = db[usage.LIFETIME_COLLECTION].find_one({"instanceId": "i-1"})
-    assert row["createdAt"] == utc(2026, 9, 20, 12, 0).replace(tzinfo=None)
-    assert row["deletedAt"] == utc(2026, 9, 20, 12, 30).replace(tzinfo=None)
+    row = InstanceLifetime().collection.find_one({"instanceId": "i-1"})
+    # Aware, not naive: Girder's MongoClient is tz_aware, so reading through the
+    # model layer gives UTC back rather than a bare datetime a reader has to
+    # know the zone of. (``_as_utc`` copes with either, for rows written before
+    # this went through a model.)
+    assert row["createdAt"] == utc(2026, 9, 20, 12, 0)
+    assert row["deletedAt"] == utc(2026, 9, 20, 12, 30)
     assert row["sizeGb"] == 30
     assert row["volumeGb"] == 100
 
 
 @pytest.mark.plugin("sivacor")
-def test_record_lifetime_never_raises():
+def test_record_lifetime_never_raises(clean, monkeypatch):
     """Best effort on purpose: a fleet that stops reaping because a counter
     failed is not a trade worth making (09-U9).
 
-    A stub rather than a monkeypatched collection, because ``db[name]`` builds a
-    *new* ``Collection`` object on every call -- patching one instance patches
-    something ``record_lifetime`` will never see, and the test passes without
-    having exercised anything.
+    Patched on the class, because ``Model().collection`` is resolved fresh on
+    every call -- patching one instance patches something ``record_lifetime``
+    will never see, and the test then passes without exercising anything.
     """
 
-    class ExplodingDb:
-        def __getitem__(self, name):
-            raise RuntimeError("mongo is having a day")
+    def explode(self, *args, **kwargs):
+        raise RuntimeError("mongo is having a day")
 
-    usage.record_lifetime(ExplodingDb(), fake_instance())  # must not raise
+    monkeypatch.setattr(Collection, "update_one", explode)
+    usage.record_lifetime(fake_instance())  # must not raise
 
 
 @pytest.mark.plugin("sivacor")
-def test_a_second_reap_of_one_instance_does_not_overwrite_the_first(db):
+def test_a_second_reap_of_one_instance_does_not_overwrite_the_first(clean):
     """``$setOnInsert``: the first observation is the true one. A controller
     that re-decides the same reap must not move the timestamps."""
-    usage.record_lifetime(db, fake_instance(), deleted_at=utc(2026, 9, 20, 12, 30))
-    usage.record_lifetime(db, fake_instance(), deleted_at=utc(2026, 9, 20, 23, 0))
-    row = db[usage.LIFETIME_COLLECTION].find_one({"instanceId": "i-1"})
-    assert row["deletedAt"] == utc(2026, 9, 20, 12, 30).replace(tzinfo=None)
+    usage.record_lifetime(fake_instance(), deleted_at=utc(2026, 9, 20, 12, 30))
+    usage.record_lifetime(fake_instance(), deleted_at=utc(2026, 9, 20, 23, 0))
+    row = InstanceLifetime().collection.find_one({"instanceId": "i-1"})
+    assert row["deletedAt"] == utc(2026, 9, 20, 12, 30)
 
 
 @pytest.mark.plugin("sivacor")
-def test_a_failure_starts_unbillable(db):
+def test_a_failure_starts_unbillable(clean):
     """The fail-safe is the column default, not a code path someone has to
     remember to take (09-U13)."""
-    usage.record_attribution(db, "i-1", "u-1", 60, None, billable=False)
-    row = db[usage.ATTRIBUTION_COLLECTION].find_one({"instanceId": "i-1"})
+    usage.record_attribution("i-1", "u-1", 60, None, billable=False)
+    row = UsageAttribution().collection.find_one({"instanceId": "i-1"})
     assert row["billable"] is False
 
 
 @pytest.mark.plugin("sivacor")
-def test_stamping_a_user_fault_makes_it_billable(db):
-    usage.record_attribution(db, "i-1", "u-1", 60, None, billable=False)
-    usage.stamp_outcome(db, "i-1", FailureCode.STATA_ERROR)
-    row = db[usage.ATTRIBUTION_COLLECTION].find_one({"instanceId": "i-1"})
+def test_stamping_a_user_fault_makes_it_billable(clean):
+    usage.record_attribution("i-1", "u-1", 60, None, billable=False)
+    usage.stamp_outcome("i-1", FailureCode.STATA_ERROR)
+    row = UsageAttribution().collection.find_one({"instanceId": "i-1"})
     assert row["billable"] is True
     assert row["code"] == "stata_error"
 
 
 @pytest.mark.plugin("sivacor")
-def test_stamping_our_own_fault_leaves_it_unbillable(db):
-    usage.record_attribution(db, "i-1", "u-1", 60, None, billable=False)
-    usage.stamp_outcome(db, "i-1", FailureCode.IMAGE_PULL_FAILED)
-    row = db[usage.ATTRIBUTION_COLLECTION].find_one({"instanceId": "i-1"})
+def test_stamping_our_own_fault_leaves_it_unbillable(clean):
+    usage.record_attribution("i-1", "u-1", 60, None, billable=False)
+    usage.stamp_outcome("i-1", FailureCode.IMAGE_PULL_FAILED)
+    row = UsageAttribution().collection.find_one({"instanceId": "i-1"})
     assert row["billable"] is False
     assert row["code"] == "image_pull_failed"
 
 
 @pytest.mark.plugin("sivacor")
-def test_a_stamp_never_makes_a_charged_run_free(db):
+def test_a_stamp_never_makes_a_charged_run_free(clean):
     """Only ever raises. A success is billable from the moment its attribution
     row is written, and no later code should be able to reverse that."""
-    usage.record_attribution(db, "i-1", "u-1", 60, None, billable=True)
-    usage.stamp_outcome(db, "i-1", FailureCode.UNEXPECTED)
-    row = db[usage.ATTRIBUTION_COLLECTION].find_one({"instanceId": "i-1"})
+    usage.record_attribution("i-1", "u-1", 60, None, billable=True)
+    usage.stamp_outcome("i-1", FailureCode.UNEXPECTED)
+    row = UsageAttribution().collection.find_one({"instanceId": "i-1"})
     assert row["billable"] is True
 
 
@@ -318,9 +326,8 @@ def lifetime_row(instance_id="i-1", hours=1.0, size=60, volume_gb=None):
 
 
 @pytest.mark.plugin("sivacor")
-def test_a_billable_run_lands_on_the_user(db, priced, user):
+def test_a_billable_run_lands_on_the_user(clean, priced, user):
     usage.accrue(
-        db,
         lifetime_row(hours=2.0, size=60, volume_gb=50),
         {"instanceId": "i-1", "userId": user["_id"], "memoryGb": 60, "billable": True},
     )
@@ -334,12 +341,11 @@ def test_a_billable_run_lands_on_the_user(db, priced, user):
 
 
 @pytest.mark.plugin("sivacor")
-def test_instance_hours_makes_a_wrong_rate_visible(db, priced, user):
+def test_instance_hours_makes_a_wrong_rate_visible(clean, priced, user):
     """The redundancy earns its bytes: suHours / instanceHours has to equal the
     rung's rate, so a catalogue that drifts says so instead of quietly
     mis-billing."""
     usage.accrue(
-        db,
         lifetime_row(hours=3.0, size=30),
         {"instanceId": "i-1", "userId": user["_id"], "memoryGb": 30, "billable": True},
     )
@@ -348,10 +354,9 @@ def test_instance_hours_makes_a_wrong_rate_visible(db, priced, user):
 
 
 @pytest.mark.plugin("sivacor")
-def test_two_submissions_accumulate(db, priced, user):
+def test_two_submissions_accumulate(clean, priced, user):
     for i in (1, 2):
         usage.accrue(
-            db,
             lifetime_row(instance_id=f"i-{i}", hours=1.0, size=60),
             {"userId": user["_id"], "memoryGb": 60, "billable": True},
         )
@@ -362,17 +367,15 @@ def test_two_submissions_accumulate(db, priced, user):
 
 
 @pytest.mark.plugin("sivacor")
-def test_since_is_written_once_and_never_moves(db, priced, user):
+def test_since_is_written_once_and_never_moves(clean, priced, user):
     """09-U4: an honest `since` is the whole substitute for a backfill. If it
     advanced with each accrual it would claim to cover a window it does not."""
     usage.accrue(
-        db,
         lifetime_row(instance_id="i-1"),
         {"userId": user["_id"], "memoryGb": 60, "billable": True},
     )
     first = User().load(user["_id"], force=True)[usage.USER_USAGE_FIELD]["since"]
     usage.accrue(
-        db,
         lifetime_row(instance_id="i-2"),
         {"userId": user["_id"], "memoryGb": 60, "billable": True},
     )
@@ -380,51 +383,48 @@ def test_since_is_written_once_and_never_moves(db, priced, user):
 
 
 @pytest.mark.plugin("sivacor")
-def test_an_unclaimed_instance_is_house_burn_not_an_error(db, priced):
+def test_an_unclaimed_instance_is_house_burn_not_an_error(clean, priced):
     """09-U7. Real SU belonging to nobody -- and its size is the interesting
     number, because it is the fleet controller's efficiency in SU."""
-    usage.accrue(db, lifetime_row(hours=1.0, size=60), None)
-    house = db[usage.TOTALS_COLLECTION].find_one({"_id": usage.TOTALS_ID})
+    usage.accrue(lifetime_row(hours=1.0, size=60), None)
+    house = UsageTotals().collection.find_one({"_id": usage.TOTALS_ID})
     assert house["suHours"] == pytest.approx(16.0)
     assert house["byReason"]["unclaimed"] == pytest.approx(16.0)
 
 
 @pytest.mark.plugin("sivacor")
-def test_our_defect_is_charged_to_the_house_under_its_own_reason(db, priced, user):
+def test_our_defect_is_charged_to_the_house_under_its_own_reason(clean, priced, user):
     """A growing `unexpected` is a bug report, which is why byReason exists."""
     usage.accrue(
-        db,
         lifetime_row(hours=1.0, size=60),
         {"userId": user["_id"], "memoryGb": 60, "billable": False, "code": "unexpected"},
     )
-    house = db[usage.TOTALS_COLLECTION].find_one({"_id": usage.TOTALS_ID})
+    house = UsageTotals().collection.find_one({"_id": usage.TOTALS_ID})
     assert house["byReason"]["unexpected"] == pytest.approx(16.0)
     assert usage.USER_USAGE_FIELD not in User().load(user["_id"], force=True)
 
 
 @pytest.mark.plugin("sivacor")
-def test_an_unstamped_failure_is_charged_to_the_house(db, priced, user):
+def test_an_unstamped_failure_is_charged_to_the_house(clean, priced, user):
     usage.accrue(
-        db,
         lifetime_row(hours=1.0, size=60),
         {"userId": user["_id"], "memoryGb": 60, "billable": False},
     )
-    house = db[usage.TOTALS_COLLECTION].find_one({"_id": usage.TOTALS_ID})
+    house = UsageTotals().collection.find_one({"_id": usage.TOTALS_ID})
     assert house["byReason"]["unstamped"] == pytest.approx(16.0)
 
 
 @pytest.mark.plugin("sivacor")
-def test_the_user_pays_up_to_the_cap_and_the_house_pays_the_rest(db, server, user):
+def test_the_user_pays_up_to_the_cap_and_the_house_pays_the_rest(clean, server, user):
     """The outage case, end to end: 09-U15 splitting one lifetime two ways."""
     Setting().set(PluginSettings.WORKER_SIZES, LADDER)
     Setting().set(PluginSettings.MAX_RUNTIME, 2.0)  # cap is 2.5 h
     usage.accrue(
-        db,
         lifetime_row(hours=10.0, size=60),
         {"userId": user["_id"], "memoryGb": 60, "billable": True},
     )
     counters = User().load(user["_id"], force=True)[usage.USER_USAGE_FIELD]
-    house = db[usage.TOTALS_COLLECTION].find_one({"_id": usage.TOTALS_ID})
+    house = UsageTotals().collection.find_one({"_id": usage.TOTALS_ID})
     assert counters["instanceHours"] == pytest.approx(2.5)
     assert counters["suHours"] == pytest.approx(40.0)
     assert house["byReason"]["over_cap"] == pytest.approx(7.5 * 16)
@@ -434,11 +434,10 @@ def test_the_user_pays_up_to_the_cap_and_the_house_pays_the_rest(db, server, use
 
 @pytest.mark.plugin("sivacor")
 def test_a_rung_that_left_the_catalogue_charges_nothing_rather_than_guessing(
-    db, priced, user
+    clean, priced, user
 ):
     """Guessing a rate is how a number nobody can repair gets written."""
     usage.accrue(
-        db,
         lifetime_row(hours=1.0, size=999),
         {"userId": user["_id"], "memoryGb": 999, "billable": True},
     )
@@ -449,12 +448,12 @@ def test_a_rung_that_left_the_catalogue_charges_nothing_rather_than_guessing(
 
 
 @pytest.mark.plugin("sivacor")
-def test_a_backwards_lifetime_is_skipped_not_credited(db, priced, user):
+def test_a_backwards_lifetime_is_skipped_not_credited(clean, priced, user):
     """Charging a negative would *credit* the user, which is worse than
     skipping: it is the one error that can make usage go down."""
     row = lifetime_row(hours=1.0)
     row["createdAt"], row["deletedAt"] = row["deletedAt"], row["createdAt"]
-    usage.accrue(db, row, {"userId": user["_id"], "memoryGb": 60, "billable": True})
+    usage.accrue(row, {"userId": user["_id"], "memoryGb": 60, "billable": True})
     assert usage.USER_USAGE_FIELD not in User().load(user["_id"], force=True)
 
 
@@ -462,20 +461,20 @@ def test_a_backwards_lifetime_is_skipped_not_credited(db, priced, user):
 
 
 @pytest.mark.plugin("sivacor")
-def test_the_drain_pairs_a_lifetime_with_its_attribution(db, priced, user):
-    usage.record_attribution(db, "i-1", user["_id"], 60, None, billable=True)
-    db[usage.LIFETIME_COLLECTION].insert_one(lifetime_row(hours=1.0, size=60))
-    assert usage.drain(db) == 1
+def test_the_drain_pairs_a_lifetime_with_its_attribution(clean, priced, user):
+    usage.record_attribution("i-1", user["_id"], 60, None, billable=True)
+    InstanceLifetime().collection.insert_one(lifetime_row(hours=1.0, size=60))
+    assert usage.drain() == 1
     counters = User().load(user["_id"], force=True)[usage.USER_USAGE_FIELD]
     assert counters["suHours"] == pytest.approx(16.0)
     # Both rows consumed, so a second drain is a no-op rather than a double charge.
-    assert usage.drain(db) == 0
-    assert db[usage.LIFETIME_COLLECTION].count_documents({}) == 0
-    assert db[usage.ATTRIBUTION_COLLECTION].count_documents({}) == 0
+    assert usage.drain() == 0
+    assert InstanceLifetime().collection.count_documents({}) == 0
+    assert UsageAttribution().collection.count_documents({}) == 0
 
 
 @pytest.mark.plugin("sivacor")
-def test_the_drain_claims_the_lifetime_before_the_attribution(db, priced, user, monkeypatch):
+def test_the_drain_claims_the_lifetime_before_the_attribution(clean, priced, user, monkeypatch):
     """09-U19, and the reason the order is written down rather than incidental.
 
     A crash between the two deletes must lose the lifetime -- an under-count,
@@ -484,38 +483,38 @@ def test_the_drain_claims_the_lifetime_before_the_attribution(db, priced, user, 
     pass: the total stays plausible and the wrong party pays, which is the
     failure nobody notices.
     """
-    usage.record_attribution(db, "i-1", user["_id"], 60, None, billable=True)
-    db[usage.LIFETIME_COLLECTION].insert_one(lifetime_row(hours=1.0, size=60))
+    usage.record_attribution("i-1", user["_id"], 60, None, billable=True)
+    InstanceLifetime().collection.insert_one(lifetime_row(hours=1.0, size=60))
 
-    # Patched on the class, not an instance: ``db[name]`` builds a new
-    # ``Collection`` every call, so an instance patch would never be seen.
+    # Patched on the class, not an instance: ``Model().collection`` resolves
+    # fresh on every call, so an instance patch would never be seen.
     real = Collection.find_one_and_delete
 
     def crash_on_the_second_delete(self, *args, **kwargs):
-        if self.name == usage.ATTRIBUTION_COLLECTION:
+        if self.name == UsageAttribution().name:
             raise RuntimeError("killed between the two deletes")
         return real(self, *args, **kwargs)
 
     monkeypatch.setattr(Collection, "find_one_and_delete", crash_on_the_second_delete)
     with pytest.raises(RuntimeError):
-        usage.drain(db)
+        usage.drain()
     monkeypatch.undo()
 
     # The lifetime is gone -- claimed -- so nothing will re-charge it.
-    assert db[usage.LIFETIME_COLLECTION].count_documents({}) == 0
+    assert InstanceLifetime().collection.count_documents({}) == 0
     # The attribution survives and expires by TTL. Nobody was charged.
-    assert db[usage.ATTRIBUTION_COLLECTION].count_documents({}) == 1
+    assert UsageAttribution().collection.count_documents({}) == 1
     assert usage.USER_USAGE_FIELD not in User().load(user["_id"], force=True)
 
 
 @pytest.mark.plugin("sivacor")
-def test_one_bad_row_does_not_stop_the_drain(db, priced, user, monkeypatch):
+def test_one_bad_row_does_not_stop_the_drain(clean, priced, user, monkeypatch):
     """A lost accrual is lost, not retried -- but it must not take the rest of
     the batch with it."""
-    usage.record_attribution(db, "i-1", user["_id"], 60, None, billable=True)
-    usage.record_attribution(db, "i-2", user["_id"], 60, None, billable=True)
-    db[usage.LIFETIME_COLLECTION].insert_one(lifetime_row("i-1", hours=1.0))
-    db[usage.LIFETIME_COLLECTION].insert_one(lifetime_row("i-2", hours=1.0))
+    usage.record_attribution("i-1", user["_id"], 60, None, billable=True)
+    usage.record_attribution("i-2", user["_id"], 60, None, billable=True)
+    InstanceLifetime().collection.insert_one(lifetime_row("i-1", hours=1.0))
+    InstanceLifetime().collection.insert_one(lifetime_row("i-2", hours=1.0))
 
     calls = {"n": 0}
     real_accrue = usage.accrue
@@ -527,24 +526,23 @@ def test_one_bad_row_does_not_stop_the_drain(db, priced, user, monkeypatch):
         return real_accrue(*args, **kwargs)
 
     monkeypatch.setattr(usage, "accrue", flaky)
-    assert usage.drain(db) == 1
-    assert db[usage.LIFETIME_COLLECTION].count_documents({}) == 0
+    assert usage.drain() == 1
+    assert InstanceLifetime().collection.count_documents({}) == 0
 
 
 @pytest.mark.plugin("sivacor")
-def test_draining_nothing_is_not_an_error(db, priced):
-    assert usage.drain(db) == 0
+def test_draining_nothing_is_not_an_error(clean, priced):
+    assert usage.drain() == 0
 
 
 # --- storage shape ---------------------------------------------------------
 
 
 @pytest.mark.plugin("sivacor")
-def test_the_counters_survive_a_user_save(db, priced, user):
+def test_the_counters_survive_a_user_save(clean, priced, user):
     """Open item 4: `sivacorUsage` is a plain subdocument on a model Girder
     itself owns, so an unrelated user update must not drop it."""
     usage.accrue(
-        db,
         lifetime_row(hours=1.0, size=60),
         {"userId": user["_id"], "memoryGb": 60, "billable": True},
     )
@@ -555,12 +553,11 @@ def test_the_counters_survive_a_user_save(db, priced, user):
 
 
 @pytest.mark.plugin("sivacor")
-def test_the_counters_are_not_exposed_to_other_users(server, db, priced, user, admin):
+def test_the_counters_are_not_exposed_to_other_users(server, clean, priced, user, admin):
     """The whole store is per-user spend. Girder exposes user fields by
     allow-list and this is deliberately not on it -- adding it would publish
     every researcher's usage to every other researcher."""
     usage.accrue(
-        db,
         lifetime_row(hours=1.0, size=60),
         {"userId": user["_id"], "memoryGb": 60, "billable": True},
     )
@@ -569,12 +566,12 @@ def test_the_counters_are_not_exposed_to_other_users(server, db, priced, user, a
 
 
 @pytest.mark.plugin("sivacor")
-def test_the_house_bucket_carries_no_identifier(db, priced, user):
+def test_the_house_bucket_carries_no_identifier(clean, priced, user):
     """Permanent *because* it is not personal data -- the same basis as
     sivacor_execution_record. A user or job id here would give it an erasure
     obligation it has no machinery for."""
-    usage.accrue(db, lifetime_row(hours=1.0, size=60), None)
-    house = db[usage.TOTALS_COLLECTION].find_one({"_id": usage.TOTALS_ID})
+    usage.accrue(lifetime_row(hours=1.0, size=60), None)
+    house = UsageTotals().collection.find_one({"_id": usage.TOTALS_ID})
     flat = str(house)
     assert str(user["_id"]) not in flat
     assert "i-1" not in flat
@@ -590,20 +587,21 @@ def test_the_house_bucket_carries_no_identifier(db, priced, user):
 
 
 @pytest.mark.plugin("sivacor")
-def test_the_transient_rows_expire(db):
-    """Without the TTL index the "transient" rows are permanent, and the
-    privacy argument for keeping a user id in the attribution row is not true.
-    Expiry has to be a property of the collection, not a sweep somebody
-    remembers to run."""
-    usage.ensure_indices(db)
-    for name in (usage.ATTRIBUTION_COLLECTION, usage.LIFETIME_COLLECTION):
+def test_the_transient_rows_expire(clean):
+    """Declared by the models, so they exist wherever the model is used rather
+    than wherever somebody remembered to call a setup function.
+
+    Without the TTL index the "transient" rows are permanent, and the privacy
+    argument for keeping a user id in the attribution row is not true.
+    """
+    for model in (UsageAttribution(), InstanceLifetime()):
         ttls = [
             idx
-            for idx in db[name].list_indexes()
+            for idx in model.collection.list_indexes()
             if idx.get("expireAfterSeconds") is not None
         ]
         assert len(ttls) == 1
-        assert ttls[0]["expireAfterSeconds"] == usage.TRANSIENT_TTL_SECONDS
+        assert ttls[0]["expireAfterSeconds"] == TRANSIENT_TTL_SECONDS
 
 
 # --- W1: the attribution hook (09-A2) --------------------------------------
@@ -634,15 +632,15 @@ def submission_job(user, queue="sivacor.i-abc", memory_gb=60, disk_gb=None):
     return Job().updateJob(job, status=JobStatus.RUNNING)
 
 
-def attribution(db, instance_id="i-abc"):
-    return db[usage.ATTRIBUTION_COLLECTION].find_one({"instanceId": instance_id})
+def attribution(instance_id="i-abc"):
+    return UsageAttribution().collection.find_one({"instanceId": instance_id})
 
 
 @pytest.mark.plugin("sivacor")
-def test_a_finished_submission_is_attributed_to_its_submitter(db, user, submission_collection):
+def test_a_finished_submission_is_attributed_to_its_submitter(clean, user, submission_collection):
     job = submission_job(user, disk_gb=100)
     Job().updateJob(job, status=JobStatus.SUCCESS)
-    row = attribution(db)
+    row = attribution()
     assert row["userId"] == user["_id"]
     assert row["memoryGb"] == 60
     assert row["volumeGb"] == 100
@@ -650,50 +648,50 @@ def test_a_finished_submission_is_attributed_to_its_submitter(db, user, submissi
 
 
 @pytest.mark.plugin("sivacor")
-def test_a_failure_is_attributed_but_not_yet_billable(db, user, submission_collection):
+def test_a_failure_is_attributed_but_not_yet_billable(clean, user, submission_collection):
     """The fail-safe: the row exists so the user *can* be charged, and is not
     charged until something classifies the outcome (09-U13)."""
     job = submission_job(user)
     Job().updateJob(job, status=JobStatus.ERROR)
-    row = attribution(db)
+    row = attribution()
     assert row["userId"] == user["_id"]
     assert row["billable"] is False
 
 
 @pytest.mark.plugin("sivacor")
-def test_a_cancel_is_billable_from_the_status_alone(db, user, submission_collection):
+def test_a_cancel_is_billable_from_the_status_alone(clean, user, submission_collection):
     """No failure code is involved and nothing has to be reported by the
     worker: the SU were spent on the researcher's behalf before they stopped
     the run, and making a cancel free makes it a way to get free compute."""
     job = submission_job(user)
     Job().updateJob(job, status=JobStatus.CANCELED)
-    assert attribution(db)["billable"] is True
+    assert attribution()["billable"] is True
 
 
 @pytest.mark.plugin("sivacor")
-def test_a_running_submission_is_not_attributed_yet(db, user, submission_collection):
+def test_a_running_submission_is_not_attributed_yet(clean, user, submission_collection):
     """The hook fires on every job update, including every log line. Only a
     terminal status means the instance is finished with."""
     job = submission_job(user)
     Job().updateJob(job, log="still going\n")
-    assert attribution(db) is None
+    assert attribution() is None
 
 
 @pytest.mark.plugin("sivacor")
 def test_a_submission_that_never_got_an_instance_is_not_attributed(
-    db, user, submission_collection
+    clean, user, submission_collection
 ):
     """No private queue means nothing booted -- refused at submit_job, reaped as
     REAPED_NO_WORKER, or a deployment on the shared-queue path. No SU to
     attribute and no row to write."""
     job = submission_job(user, queue=None)
     Job().updateJob(job, status=JobStatus.SUCCESS)
-    assert db[usage.ATTRIBUTION_COLLECTION].count_documents({}) == 0
+    assert UsageAttribution().collection.count_documents({}) == 0
 
 
 @pytest.mark.plugin("sivacor")
 def test_a_later_job_update_cannot_un_charge_a_stamped_failure(
-    db, user, submission_collection
+    clean, user, submission_collection
 ):
     """The reason `billable` is written with $max and not $set.
 
@@ -705,16 +703,16 @@ def test_a_later_job_update_cannot_un_charge_a_stamped_failure(
     """
     job = submission_job(user)
     Job().updateJob(job, status=JobStatus.ERROR)
-    usage.stamp_outcome(db, "i-abc", FailureCode.STATA_ERROR)
-    assert attribution(db)["billable"] is True
+    usage.stamp_outcome("i-abc", FailureCode.STATA_ERROR)
+    assert attribution()["billable"] is True
 
     Job().updateJob(job, log="a line that arrives after the failure\n")
-    assert attribution(db)["billable"] is True
+    assert attribution()["billable"] is True
 
 
 @pytest.mark.plugin("sivacor")
 def test_attribution_failure_never_breaks_the_folder_status(
-    db, user, submission_collection, monkeypatch
+    clean, user, submission_collection, monkeypatch
 ):
     """The folder write is the 2026-09-04 delete guard. An accounting failure
     must not be able to leave a submission transitional and undeletable --
@@ -738,14 +736,125 @@ def test_attribution_failure_never_breaks_the_folder_status(
 
 
 @pytest.mark.plugin("sivacor")
-def test_the_indexes_exist_after_a_plugin_load(db):
-    """Wired at load, not left to whoever writes the first row. Without the TTL
-    index the transient rows are permanent and the privacy argument for holding
-    a user id in one of them is not true."""
-    for name in (usage.ATTRIBUTION_COLLECTION, usage.LIFETIME_COLLECTION):
-        ttls = [
-            idx
-            for idx in db[name].list_indexes()
-            if idx.get("expireAfterSeconds") is not None
-        ]
-        assert len(ttls) == 1, f"{name} has no TTL index after plugin load"
+def test_the_endpoint_makes_a_user_fault_billable(server, clean, user, admin, submission_collection):
+    job = submission_job(user)
+    Job().updateJob(job, status=JobStatus.ERROR)
+    assert attribution()["billable"] is False
+
+    resp = server.request(
+        path=f"/sivacor/outcome/{job['_id']}",
+        method="PUT",
+        user=admin,
+        params={"code": "stata_error"},
+    )
+    assertStatusOk(resp)
+    assert resp.json == {"stamped": True, "billable": True}
+    row = attribution()
+    assert row["billable"] is True
+    assert row["code"] == "stata_error"
+
+
+@pytest.mark.plugin("sivacor")
+def test_the_endpoint_leaves_our_own_fault_unbillable(
+    server, clean, user, admin, submission_collection
+):
+    job = submission_job(user)
+    Job().updateJob(job, status=JobStatus.ERROR)
+    resp = server.request(
+        path=f"/sivacor/outcome/{job['_id']}",
+        method="PUT",
+        user=admin,
+        params={"code": "image_pull_failed"},
+    )
+    assertStatusOk(resp)
+    assert resp.json["billable"] is False
+    assert attribution()["billable"] is False
+
+
+@pytest.mark.plugin("sivacor")
+def test_an_unknown_code_is_refused_rather_than_stored(
+    server, clean, user, admin, submission_collection
+):
+    """`code` becomes a Mongo field name in the house bucket's byReason, so it
+    is validated against the enum rather than accepted as free text. A code from
+    a worker newer than the server is rejected loudly and the run falls to the
+    house -- the direction 09-U13 wants to fail in."""
+    job = submission_job(user)
+    Job().updateJob(job, status=JobStatus.ERROR)
+    resp = server.request(
+        path=f"/sivacor/outcome/{job['_id']}",
+        method="PUT",
+        user=admin,
+        params={"code": "../../etc/passwd"},
+    )
+    assertStatus(resp, 400)
+    assert attribution()["billable"] is False
+
+
+@pytest.mark.plugin("sivacor")
+def test_stamping_a_submission_that_never_booted_is_not_an_error(
+    server, clean, user, admin, submission_collection
+):
+    job = submission_job(user, queue=None)
+    Job().updateJob(job, status=JobStatus.ERROR)
+    resp = server.request(
+        path=f"/sivacor/outcome/{job['_id']}",
+        method="PUT",
+        user=admin,
+        params={"code": "reaped_no_worker"},
+    )
+    assertStatusOk(resp)
+    assert resp.json == {"stamped": False}
+
+
+@pytest.mark.plugin("sivacor")
+def test_the_outcome_endpoint_is_not_public(server, clean, user, submission_collection):
+    """It names a job, and therefore a person. Only the worker (which acts as
+    an admin) and the reaper have any business here."""
+    job = submission_job(user)
+    Job().updateJob(job, status=JobStatus.ERROR)
+    resp = server.request(
+        path=f"/sivacor/outcome/{job['_id']}",
+        method="PUT",
+        params={"code": "stata_error"},
+    )
+    assertStatus(resp, 401)
+    resp = server.request(
+        path=f"/sivacor/outcome/{job['_id']}",
+        method="PUT",
+        user=user,
+        params={"code": "stata_error"},
+    )
+    assertStatus(resp, 403)
+
+
+@pytest.mark.plugin("sivacor")
+def test_a_stamped_failure_is_charged_to_the_user_end_to_end(clean, priced, user, submission_collection):
+    """W1 + W2 + the accrual, without the reap: the pair of rows a real failed
+    submission leaves, drained."""
+    job = submission_job(user)
+    Job().updateJob(job, status=JobStatus.ERROR)
+    usage.stamp_outcome("i-abc", FailureCode.STATA_ERROR)
+    InstanceLifetime().collection.insert_one(
+        lifetime_row(instance_id="i-abc", hours=1.0, size=60)
+    )
+    assert usage.drain() == 1
+    counters = User().load(user["_id"], force=True)[usage.USER_USAGE_FIELD]
+    assert counters["suHours"] == pytest.approx(16.0)
+
+
+@pytest.mark.plugin("sivacor")
+def test_an_unstamped_failure_falls_to_the_house_end_to_end(
+    clean, priced, user, submission_collection
+):
+    """What the deployment looks like before 09-A2b is wired: conservative, and
+    visible as byReason.unstamped rather than as a missing number."""
+    job = submission_job(user)
+    Job().updateJob(job, status=JobStatus.ERROR)
+    InstanceLifetime().collection.insert_one(
+        lifetime_row(instance_id="i-abc", hours=1.0, size=60)
+    )
+    assert usage.drain() == 1
+    assert usage.USER_USAGE_FIELD not in User().load(user["_id"], force=True)
+    house = UsageTotals().collection.find_one({"_id": usage.TOTALS_ID})
+    assert house["byReason"]["unstamped"] == pytest.approx(16.0)
