@@ -33,15 +33,12 @@ from .statuses import CANCELING, DELETABLE, FAILED
 from .telemetry import sanitize_record
 from .utils import encrypt_job_secrets
 from .worker_plugin.routing import DISPATCH_QUEUE
-from .worker_plugin.lib import PHASE_ANALYSIS, PHASE_RESOLVE
 from .worker_plugin.run_submission import (
     create_workspace,
     execute_workflow,
     finalize_job,
-    needs_resolve_phase,
     prepare_submission,
     prune_workspace,
-    resolve_dependencies,
     run_tro,
     sign_tro,
     upload_workspace,
@@ -628,7 +625,8 @@ def build_submission_chain(job, file, stages, secrets):
     # truncated from the first keyword-bearing step onward rather than empty,
     # and every step after it runs with no job manager and so has nowhere to log
     # the warning. An empty kwargs dict is dropped by requests, which is why the
-    # chain worked until `stage_index`/`phase` arrived with Julia support.
+    # chain worked until `stage_index` and a since-removed `phase` arrived with
+    # Julia support.
     workflow = step(
         prepare_submission.s(
             str(job["userId"]),
@@ -642,46 +640,29 @@ def build_submission_chain(job, file, stages, secrets):
     )
     workflow |= step(create_workspace.s(), "Create Workspace")
     workflow |= step(run_tro.s("add_arrangement", 0, None), "Record initial arrangement")
-    # A running count of arrangements recorded so far, NOT the stage index. The
-    # two were the same number until a stage could produce more than one
-    # performance: a stage needing its dependencies resolved contributes two --
-    # the resolve and the run -- each with its own before/after arrangement.
-    # Deriving these from `enumerate` again would misnumber every arrangement
-    # after the first such stage, and the declaration would still validate.
-    arrangement = 0
+    # One stage, one performance, one before/after pair -- so the stage index is
+    # also the arrangement number, and nothing here decides to insert a step the
+    # researcher did not ask for. A stage that has to install dependencies is a
+    # stage they wrote; see `development_notes/10_julia_support_plan.md`.
     for i, stage in enumerate(stages):
-        if needs_resolve_phase(stage):
-            workflow |= step(
-                resolve_dependencies.s(stage, secrets), "Resolve declared dependencies"
-            )
-            workflow |= step(
-                run_tro.s("add_arrangement", arrangement + 1, None, i, PHASE_RESOLVE),
-                "Record arrangement after dependency resolution",
-            )
-            workflow |= step(
-                run_tro.s("add_performance", arrangement, None, i, PHASE_RESOLVE),
-                "Record dependency resolution TRP",
-            )
-            arrangement += 1
         workflow |= step(
             execute_workflow.s(stage, secrets), "Execute SIVACOR Workflow"
         )
         workflow |= step(
-            run_tro.s("add_arrangement", arrangement + 1, None, i, PHASE_ANALYSIS),
+            run_tro.s("add_arrangement", i + 1, None, i),
             "Record final arrangement",
         )
         workflow |= step(
-            run_tro.s("add_performance", arrangement, None, i, PHASE_ANALYSIS),
+            run_tro.s("add_performance", i, None, i),
             "Record user workflow TRP",
         )
-        arrangement += 1
     workflow |= step(prune_workspace.s(), "Prune Workspace")
     workflow |= step(
-        run_tro.s("add_arrangement", arrangement + 1, "is_pruned"),
+        run_tro.s("add_arrangement", len(stages) + 1, "is_pruned"),
         "Record final pruned arrangement",
     )
     workflow |= step(
-        run_tro.s("prune_performance", arrangement, "is_pruned"),
+        run_tro.s("prune_performance", len(stages), "is_pruned"),
         "Record workspace prune TRP",
     )
     # Signing runs on the manager, not on the worker holding the workspace --

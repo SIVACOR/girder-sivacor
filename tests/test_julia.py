@@ -1,12 +1,14 @@
 """Julia submissions, end to end.
 
-The one thing here that no other test can reach: a Julia stage runs as **two**
-containers, and the signed declaration has to say which of them was isolated.
-Everything else in this file exists to make that assertion trustworthy.
+The one thing here that no other test can reach: whether a researcher can set
+up a Julia environment **themselves**, in a stage of their own, and have the
+next stage use it while staying network-isolated. SIVACOR used to do that
+setup for them in an injected container; the depot lives in the workspace, so
+an ordinary stage can do it instead, and that is the property under test.
 
 These build their packages inline rather than shipping a fixture archive,
-because what is under test *is the contents* -- whether a ``Project.toml`` is
-present, and what it declares. A zip would hide exactly the variable.
+because what is under test *is the contents* -- which scripts are present and
+what they declare. A zip would hide exactly the variable.
 """
 
 import json
@@ -61,29 +63,36 @@ def julia_is_allow_listed():
     ):
         yield
 
-#: A real, tiny, pure-Julia dependency. Small enough that the resolve phase is
-#: seconds rather than minutes, and registered, so resolution genuinely succeeds
-#: rather than succeeding vacuously against an empty environment.
+
+#: A real, tiny, pure-Julia dependency. Small enough that installing it is
+#: seconds rather than minutes, and registered, so a setup stage genuinely
+#: resolves something rather than succeeding vacuously against an empty
+#: environment.
 JSON_UUID = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
 
+#: What a researcher writes when their package declares dependencies. There is
+#: nothing SIVACOR-specific about it, which is the point of the reversal: it is
+#: a Julia script, run by a Julia stage, and the platform has no opinion about
+#: what is in it.
+SETUP_SCRIPT = "using Pkg\nPkg.instantiate()\n"
 
-def julia_package(
-    uploads_folder, user, main_file="main.jl", project=None, script=None,
-    manifest=None,
-):
+USES_JSON = 'using JSON\nprintln(JSON.json(Dict("ok" => true)))\n'
+
+
+def julia_package(uploads_folder, user, scripts, project=None, manifest=None):
     """Build and upload a Julia replication package.
 
-    ``project=None`` ships no ``Project.toml`` at all, which is the case
-    PROJECT_FILE_MISSING exists for.
+    ``scripts`` maps filename to contents, so a package can carry a setup script
+    beside its main file. ``project=None`` ships no ``Project.toml`` at all,
+    which is an ordinary package now rather than a refusal.
     """
-    if script is None:
-        script = 'using JSON\nprintln(JSON.json(Dict("ok" => true)))\n'
     with (
         tempfile.NamedTemporaryFile(suffix=".tar.gz") as archive,
         tempfile.TemporaryDirectory() as directory,
     ):
-        with open(os.path.join(directory, main_file), "w") as handle:
-            handle.write(script)
+        for name, contents in scripts.items():
+            with open(os.path.join(directory, name), "w") as handle:
+                handle.write(contents)
         if project is not None:
             with open(os.path.join(directory, "Project.toml"), "w") as handle:
                 handle.write(project)
@@ -95,6 +104,15 @@ def julia_package(
         return upload_test_file(uploads_folder, user, archive.name)
 
 
+def stage(main_file, isolated=False):
+    return {
+        "image_name": IMAGE,
+        "image_tag": TAG,
+        "main_file": main_file,
+        "network_isolation": isolated,
+    }
+
+
 def read(fobj):
     with File().open(fobj) as handle:
         return handle.read().decode("utf-8", errors="ignore")
@@ -104,30 +122,44 @@ def listify(value):
     return value if isinstance(value, list) else ([] if value is None else [value])
 
 
+def paths(arrangement):
+    return {
+        location["trov:path"]
+        for location in listify(arrangement.get("trov:hasArtifactLocation"))
+    }
+
+
+def isolated(performance):
+    key = next(k for k in performance if "ttribute" in k)
+    types = {a.get("@type") for a in listify(performance.get(key))}
+    return "trov:InternetIsolation" in types
+
+
 @pytest.mark.plugin("sivacor")
-def test_a_julia_run_isolates_the_analysis_but_not_the_resolve(
+def test_a_setup_stage_installs_what_the_isolated_analysis_then_uses(
     server, db, user, eagerWorkerTasks, fsAssetstore, patched_gpg,
     uploads_folder, submission_collection,
 ):
-    """The claim the two-phase design exists to keep honest.
+    """The whole design, in one submission.
 
-    ``Pkg.instantiate()`` needs the network and ``InternetIsolation`` is a claim
-    about one performance, so the phases cannot share a container without one of
-    them lying. Asserted on the declaration itself rather than on the container
-    arguments, because the declaration is what is signed and what a reader
-    later trusts.
+    Two stages the researcher wrote: one that installs, unisolated, and one that
+    runs their analysis with the network off. The depot is a sibling of
+    ``project/`` inside the workspace, so what the first stage downloaded is
+    still there for the second -- which is what makes a setup stage a real
+    answer rather than a suggestion.
+
+    The isolation claims are asserted on the declaration, because that is what
+    is signed and what a reader later trusts, and against the container
+    arguments beside them, because the two could otherwise drift apart without
+    either looking wrong on its own.
     """
     fobj = julia_package(
-        uploads_folder, user, project=f'[deps]\nJSON = "{JSON_UUID}"\n'
+        uploads_folder,
+        user,
+        {"setup.jl": SETUP_SCRIPT, "main.jl": USES_JSON},
+        project=f'[deps]\nJSON = "{JSON_UUID}"\n',
     )
-    stages = [
-        {
-            "image_name": IMAGE,
-            "image_tag": TAG,
-            "main_file": "main.jl",
-            "network_isolation": True,
-        }
-    ]
+    stages = [stage("setup.jl"), stage("main.jl", isolated=True)]
     resp = submit_sivacor_job(server, user, fobj, stages)
     assertStatusOk(resp)
     job = Job().load(resp.json["_id"], force=True)
@@ -135,187 +167,109 @@ def test_a_julia_run_isolates_the_analysis_but_not_the_resolve(
 
     resp = get_submission_folder(server, user, job["_id"], submission_collection)
     assertStatusOk(resp)
-    metadata = resp.json[0]["meta"]
+    folder = resp.json[0]
+    metadata = folder["meta"]
     assert_submission_metadata(
         metadata, user, job["_id"], stages, "completed",
         ["tro_file_id", "stdout_file_id", "stderr_file_id", "tsr_file_id",
          "replpack_file_id"],
     )
 
+    # The analysis ran with no network and still loaded JSON, so the setup
+    # stage's depot survived into it.
+    assert '{"ok":true}' in read(File().load(metadata["stdout_file_id"], force=True))
+
     tro = json.loads(read(File().load(metadata["tro_file_id"], force=True)))
     root = tro["@graph"][0]
     performances = listify(root.get("trov:hasPerformance"))
 
-    # Two performances for ONE stage. Every other stack produces one.
+    # Two stages, two performances -- and both are workflow executions. Neither
+    # is a phase of the other.
     assert len(performances) == 2
-    resolve, analysis = performances
-    assert "dependency resolution" in resolve["rdfs:comment"]
-    assert "workflow execution" in analysis["rdfs:comment"]
+    setup, analysis = performances
+    assert "workflow execution (setup.jl)" in setup["rdfs:comment"]
+    assert "workflow execution (main.jl)" in analysis["rdfs:comment"]
 
-    def isolated(performance):
-        key = next(k for k in performance if "ttribute" in k)
-        types = {a.get("@type") for a in listify(performance.get(key))}
-        return "trov:InternetIsolation" in types
-
-    assert not isolated(resolve), "the resolve phase had the network; it must not claim otherwise"
+    assert not isolated(setup), "the setup stage had the network; it must not claim otherwise"
     assert isolated(analysis), "the analysis was isolated and the TRO must say so"
-
-    # ...and the claim has to match what the container actually got, or the two
-    # halves could drift apart without either looking wrong on its own.
-    assert json.loads(resolve["sivacor:DockerRunArgs"])["network_disabled"] is False
+    assert json.loads(setup["sivacor:DockerRunArgs"])["network_disabled"] is False
     assert json.loads(analysis["sivacor:DockerRunArgs"])["network_disabled"] is True
 
+    # The manifest Pkg wrote appears in the setup stage's own snapshot, so it
+    # reads as that stage's output rather than the analysis's.
+    arrangements = listify(root.get("trov:hasArrangement"))
+    assert "Manifest.toml" not in paths(arrangements[0])
+    assert "Manifest.toml" in paths(arrangements[1])
+    assert "After executing workflow step 1" in arrangements[1]["rdfs:comment"]
 
-@pytest.mark.plugin("sivacor")
-def test_the_resolve_phase_is_what_produces_the_manifest(
-    server, db, user, eagerWorkerTasks, fsAssetstore, patched_gpg,
-    uploads_folder, submission_collection,
-):
-    """Manifest.toml must appear in the resolve's arrangement, not the run's.
-
-    A package that ships only ``Project.toml`` has its manifest written by
-    ``Pkg.instantiate()``. If the resolve had no arrangement of its own, that
-    file would first appear in the after-analysis snapshot, reading as though
-    the researcher's code produced it.
-    """
-    fobj = julia_package(
-        uploads_folder, user, project=f'[deps]\nJSON = "{JSON_UUID}"\n'
-    )
-    stages = [{"image_name": IMAGE, "image_tag": TAG, "main_file": "main.jl"}]
-    resp = submit_sivacor_job(server, user, fobj, stages)
-    assertStatusOk(resp)
-    job = Job().load(resp.json["_id"], force=True)
-    assert job["status"] == JobStatus.SUCCESS
-
-    resp = get_submission_folder(server, user, job["_id"], submission_collection)
-    metadata = resp.json[0]["meta"]
-    tro = json.loads(read(File().load(metadata["tro_file_id"], force=True)))
-    arrangements = listify(tro["@graph"][0].get("trov:hasArrangement"))
-
-    def paths(arrangement):
-        return {
-            location["trov:path"]
-            for location in listify(arrangement.get("trov:hasArtifactLocation"))
-        }
-
-    before, after_resolve = paths(arrangements[0]), paths(arrangements[1])
-    assert "Manifest.toml" not in before
-    assert "Manifest.toml" in after_resolve
-    # And the snapshot says what made it, in words a reader will see.
-    assert "resolving dependencies" in arrangements[1]["rdfs:comment"]
-
-    # Both phases keep their own metrics; one filename would lose the resolve's.
+    # One metrics file per stage, named by stage alone.
     names = {
         item["name"]
         for item in server.request(
-            path="/item", params={"folderId": resp.json[0]["_id"], "limit": 100},
-            user=user,
+            path="/item", params={"folderId": folder["_id"], "limit": 100}, user=user,
         ).json
     }
-    assert "performance_data_stage_1.json" in names
-    assert "performance_data_stage_1_resolve.json" in names
-
-    # 10-D2: a generated manifest is a weaker guarantee than a supplied one, and
-    # the researcher has to be told which they got, in the place they are
-    # already reading.
-    fetched = server.request(path=f"/job/{job['_id']}", method="GET", user=user).json
-    log = "".join(fetched["log"])
-    assert "No Manifest.toml was supplied" in log
-    assert "does not pin them in advance" in log
+    assert {"performance_data_stage_1.json", "performance_data_stage_2.json"} <= names
+    assert not any(name.endswith("_resolve.json") for name in names)
 
 
 @pytest.mark.plugin("sivacor")
-def test_a_supplied_manifest_is_reported_as_such(
+def test_a_lone_julia_stage_runs_exactly_once(
     server, db, user, eagerWorkerTasks, fsAssetstore, patched_gpg,
     uploads_folder, submission_collection,
 ):
-    """The other half of 10-D2 -- and a resolve with nothing to do still runs.
+    """Nothing is inserted, and nothing is required.
 
-    An empty environment on purpose: it exercises the "supplied" branch without
-    a download, and it checks the claim that the resolve phase is unconditional.
-    Making it conditional on having something to fetch would make the TRO's
-    shape depend on cache contents.
+    A package with no ``Project.toml`` and no setup script is a legitimate Julia
+    submission -- the standard library is a great deal of Julia -- and it used
+    to be refused outright because SIVACOR insisted on having an environment to
+    resolve.
     """
     fobj = julia_package(
-        uploads_folder,
-        user,
-        project="[deps]\n",
-        manifest='julia_version = "1.11.9"\nmanifest_format = "2.0"\n\n[deps]\n',
-        script='println("no dependencies here")\n',
+        uploads_folder, user, {"main.jl": 'println("no dependencies here")\n'}
     )
-    stages = [{"image_name": IMAGE, "image_tag": TAG, "main_file": "main.jl"}]
+    stages = [stage("main.jl", isolated=True)]
     resp = submit_sivacor_job(server, user, fobj, stages)
     assertStatusOk(resp)
     job = Job().load(resp.json["_id"], force=True)
     assert job["status"] == JobStatus.SUCCESS
 
-    fetched = server.request(path=f"/job/{job['_id']}", method="GET", user=user).json
-    log = "".join(fetched["log"])
-    assert "Manifest.toml was supplied" in log
-    assert "No Manifest.toml was supplied" not in log
-
-    # The resolve still ran, and still has a performance of its own.
     resp = get_submission_folder(server, user, job["_id"], submission_collection)
     metadata = resp.json[0]["meta"]
     tro = json.loads(read(File().load(metadata["tro_file_id"], force=True)))
-    performances = listify(tro["@graph"][0].get("trov:hasPerformance"))
-    assert len(performances) == 2
+    assert len(listify(tro["@graph"][0].get("trov:hasPerformance"))) == 1
 
+    stdout = read(File().load(metadata["stdout_file_id"], force=True))
+    assert "no dependencies here" in stdout
+    # The log is stamped once, as one stage's output.
+    assert stdout.count("===== Stage 1 Output =====") == 1
+    assert "Dependency Resolution" not in stdout
 
-@pytest.mark.plugin("sivacor")
-def test_a_package_with_no_project_file_is_refused_before_anything_is_pulled(
-    server, db, user, eagerWorkerTasks, fsAssetstore, patched_gpg,
-    uploads_folder, submission_collection,
-):
-    """SIVACOR resolves what the researcher declares, so there must be a declaration.
-
-    Cheap by design: this fails in ``_infer_run_command``, before an image is
-    pulled or a container created.
-    """
-    fobj = julia_package(uploads_folder, user, project=None)
-    stages = [{"image_name": IMAGE, "image_tag": TAG, "main_file": "main.jl"}]
-    resp = submit_sivacor_job(server, user, fobj, stages, exception=True)
-    assertStatusOk(resp)
-
-    job = Job().load(resp.json["_id"], force=True)
-    assert job["status"] == JobStatus.ERROR
-
-    # Through REST, not Job().load(): the loaded document carries no `log`.
-    fetched = server.request(path=f"/job/{job['_id']}", method="GET", user=user).json
-    message = "".join(fetched["log"])
-    # The researcher has to be told what to add, not merely that something is
-    # missing -- this message is the whole remedy for this failure.
-    assert "Project.toml" in message
-    assert "Manifest.toml" in message
-
+    # And the permanent record counts one stage, which is what was submitted.
     records = list(ExecutionRecord().find({}))
     assert len(records) == 1
-    assert records[0]["error"]["code"] == FailureCode.PROJECT_FILE_MISSING.value
-    # It failed in the resolve phase, which is the step that first needs to know
-    # which environment it is assembling.
-    assert records[0]["error"]["step"] == "resolve_dependencies"
-    # A path out of the researcher's package is never kept.
-    assert records[0]["error"]["detail"] is None
+    assert records[0]["n_stages"] == 1
 
 
 @pytest.mark.plugin("sivacor")
-def test_an_unsatisfiable_environment_fails_in_the_resolve_not_the_analysis(
+def test_a_missing_dependency_fails_in_the_stage_that_needed_it(
     server, db, user, eagerWorkerTasks, fsAssetstore, patched_gpg,
     uploads_folder, submission_collection,
 ):
-    """The distinction the phase exists to draw.
+    """The cost of the reversal, stated plainly.
 
-    Folded into NONZERO_EXIT, "your declared environment could not be
-    assembled" would be indistinguishable from "your code raised" -- and the
-    researcher would go looking in the wrong file.
+    A researcher who declares dependencies and writes no setup stage gets a
+    Julia error from their own script rather than a platform message about
+    dependency resolution. That is an ordinary non-zero exit, classified like
+    any other, and the remedy lives in the docs rather than in a failure code.
     """
     fobj = julia_package(
         uploads_folder,
         user,
-        project='[deps]\nSivacorNoSuchPackage = "d7a1b2c3-0000-4000-8000-000000000001"\n',
-        script='println("never reached")\n',
+        {"main.jl": USES_JSON},
+        project=f'[deps]\nJSON = "{JSON_UUID}"\n',
     )
-    stages = [{"image_name": IMAGE, "image_tag": TAG, "main_file": "main.jl"}]
+    stages = [stage("main.jl", isolated=True)]
     resp = submit_sivacor_job(server, user, fobj, stages, exception=True)
     assertStatusOk(resp)
 
@@ -324,12 +278,13 @@ def test_an_unsatisfiable_environment_fails_in_the_resolve_not_the_analysis(
 
     records = list(ExecutionRecord().find({}))
     assert len(records) == 1
-    assert records[0]["error"]["code"] == FailureCode.DEPENDENCY_RESOLUTION_FAILED.value
-    assert records[0]["error"]["step"] == "resolve_dependencies"
-    # The exit code is safe to keep forever; the package name is not.
+    assert records[0]["error"]["code"] == FailureCode.NONZERO_EXIT.value
+    assert records[0]["error"]["step"] == "execute_workflow"
+    # The exit code is safe to keep forever; nothing about the package is.
     assert isinstance(records[0]["error"]["detail"], int)
-    assert "SivacorNoSuchPackage" not in json.dumps(records[0], default=str)
+    assert "JSON" not in json.dumps(records[0], default=str)
 
-    # And the message points at stderr, because that is where Pkg writes.
-    fetched = server.request(path=f"/job/{job['_id']}", method="GET", user=user).json
-    assert "stderr" in "".join(fetched["log"])
+    # Julia's own diagnosis reaches the researcher.
+    resp = get_submission_folder(server, user, job["_id"], submission_collection)
+    stderr = read(File().load(resp.json[0]["meta"]["stderr_file_id"], force=True))
+    assert "JSON" in stderr

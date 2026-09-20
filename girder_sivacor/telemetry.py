@@ -182,10 +182,9 @@ def _stata_detail(value):
 _DETAIL_VALIDATORS = {
     FailureCode.STATA_ERROR: _stata_detail,
     FailureCode.NONZERO_EXIT: lambda v: _safe_int(v),
-    # Same shape as NONZERO_EXIT: the exit code of the resolve container.
-    # PROJECT_FILE_MISSING deliberately has no entry -- its only possible detail
-    # would be a path out of the researcher's package, and a code absent from
-    # this table stores detail=None, which is the answer we want.
+    # Retired with the code (see errors.py), and kept for the same reason: a
+    # validator this table has no entry for stores detail=None, which would
+    # silently rewrite what a replayed historical payload means.
     FailureCode.DEPENDENCY_RESOLUTION_FAILED: lambda v: _safe_int(v),
     # The memory cap the run exceeded. A machine fact -- it is derived from the
     # worker's flavor, identically for every submission that lands on one -- so
@@ -227,10 +226,13 @@ def _catalogue_size(value, allowed):
     return value if value in allowed else None
 
 
-#: The phases one stage can run through. A closed set of two machine-chosen
+#: The phases one stage could run through. A closed set of two machine-chosen
 #: words, not researcher content -- the same class as ``network_isolation``.
-#: A row with no phase is from before the resolve phase existed and is an
-#: analysis by definition.
+#: A row with no phase is an analysis by definition, which covers both ends of
+#: the feature's life: records written before SIVACOR resolved Julia
+#: environments, and records written now that it does not. ``resolve`` stays in
+#: the set for the rows in between, and because a worker still running the old
+#: code may be mid-submission during a rollout.
 _PHASES = frozenset({"analysis", "resolve"})
 
 
@@ -333,10 +335,10 @@ def sanitize_record(payload, date, allowed_sizes=()):
         "date": date,
         "status": status,
         "stack_version": _matching(payload.get("stack_version"), _TAG),
-        # Analysis phases only. A Julia submission records two rows per stage --
-        # the dependency resolve and the run -- and counting both would report a
-        # one-stage submission as two, silently changing what every historical
-        # n_stages means relative to a new one.
+        # Analysis phases only. Julia submissions briefly recorded two rows per
+        # stage -- a dependency resolve and the run -- and counting both would
+        # report those as twice the size of the identical thing run in R,
+        # silently changing what n_stages means from one record to the next.
         "n_stages": sum(1 for s in stages if s["phase"] == "analysis"),
         "total_duration_seconds": _safe_number(payload.get("total_duration_seconds")),
         "package_size_bucket": bucket,
