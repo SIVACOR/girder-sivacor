@@ -616,6 +616,19 @@ def build_submission_chain(job, file, stages, secrets):
             girder_client_token=worker_token,
         )
 
+    # Every step below passes its arguments POSITIONALLY, and must keep doing
+    # so. The same girder_before_task_publish that needs the scope above builds
+    # its POST /job query string with `'args': json.dumps(task_args)` but a bare
+    # `'kwargs': task_kwargs` (girder_worker/context/nongirder_context.py), and
+    # requests serializes a dict query param by iterating it -- i.e. by its
+    # keys. One keyword argument anywhere in the chain therefore produces
+    # `?...&kwargs=stage_index&kwargs=phase` and a 400 "Parameter kwargs
+    # must not be specified multiple times", with the same consequences as the
+    # 403 above and one worse detail: it strikes mid-chain, so the job tree is
+    # truncated from the first keyword-bearing step onward rather than empty,
+    # and every step after it runs with no job manager and so has nowhere to log
+    # the warning. An empty kwargs dict is dropped by requests, which is why the
+    # chain worked until `stage_index`/`phase` arrived with Julia support.
     workflow = step(
         prepare_submission.s(
             str(job["userId"]),
@@ -642,23 +655,11 @@ def build_submission_chain(job, file, stages, secrets):
                 resolve_dependencies.s(stage, secrets), "Resolve declared dependencies"
             )
             workflow |= step(
-                run_tro.s(
-                    "add_arrangement",
-                    arrangement + 1,
-                    None,
-                    stage_index=i,
-                    phase=PHASE_RESOLVE,
-                ),
+                run_tro.s("add_arrangement", arrangement + 1, None, i, PHASE_RESOLVE),
                 "Record arrangement after dependency resolution",
             )
             workflow |= step(
-                run_tro.s(
-                    "add_performance",
-                    arrangement,
-                    None,
-                    stage_index=i,
-                    phase=PHASE_RESOLVE,
-                ),
+                run_tro.s("add_performance", arrangement, None, i, PHASE_RESOLVE),
                 "Record dependency resolution TRP",
             )
             arrangement += 1
@@ -666,19 +667,11 @@ def build_submission_chain(job, file, stages, secrets):
             execute_workflow.s(stage, secrets), "Execute SIVACOR Workflow"
         )
         workflow |= step(
-            run_tro.s(
-                "add_arrangement",
-                arrangement + 1,
-                None,
-                stage_index=i,
-                phase=PHASE_ANALYSIS,
-            ),
+            run_tro.s("add_arrangement", arrangement + 1, None, i, PHASE_ANALYSIS),
             "Record final arrangement",
         )
         workflow |= step(
-            run_tro.s(
-                "add_performance", arrangement, None, stage_index=i, phase=PHASE_ANALYSIS
-            ),
+            run_tro.s("add_performance", arrangement, None, i, PHASE_ANALYSIS),
             "Record user workflow TRP",
         )
         arrangement += 1
