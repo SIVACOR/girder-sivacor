@@ -132,7 +132,7 @@ out of scope for erasure requests. While a submission exists its job log has the
 full story.
 
 The rationale is written up for review in
-`../aea-sivacor/LEGITIMATE_INTERESTS_ASSESSMENT.md`.
+`../development_notes/compliance/LEGITIMATE_INTERESTS_ASSESSMENT.md`.
 
 ## `test_girder_upload_race.py` — 2 xfails that are supposed to fail
 
