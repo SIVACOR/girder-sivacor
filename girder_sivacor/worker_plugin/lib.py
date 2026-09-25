@@ -1601,11 +1601,82 @@ def pull_space_shortfall(cli, submission, image_reference) -> str | None:
     )
 
 
-#: How often to put a progress line in the job log while an image is pulling.
+#: How often to put a progress line in the job log while a long step runs.
 #: Deliberately much coarser than the heartbeat: each one is an updateJob, which
 #: fires ``jobs.job.update.after`` server-side, whereas the heartbeat writes
 #: straight to the collection.
-PULL_LOG_INTERVAL = 120
+PROGRESS_LOG_INTERVAL = 120
+
+
+class ProgressBeat:
+    """Rate-limited liveness ticker for a long, quiet pipeline step.
+
+    **Why every long step needs one.** The server's liveness signal is
+    ``max(meta.heartbeat, job.updated, job.created)`` measured against
+    ``sivacor.heartbeat_timeout`` (30 min on production). Only
+    :func:`recorded_run` ticks ``meta.heartbeat``, so every step *outside* a
+    container run is silent for its whole duration, and a step that outlasts the
+    threshold is reaped as a lost worker.
+
+    **Ticks are driven by progress, never by a clock of their own.** This is a
+    deliberate constraint, not an implementation detail: :meth:`tick` is called
+    from inside the work, e.g. a file written, a chunk uploaded, so a step that
+    stops making progress stops beating and is still reaped on schedule. A
+    background thread beating on process liveness would cover the same steps
+    with one line, and would also mean a worker wedged mid-step never gets
+    reaped at all, burning to ``sivacor.max_runtime`` (168 h) instead of failing
+    in 30 minutes.
+
+    Call :meth:`tick` as often as is convenient -- it is a monotonic clock read
+    until an interval has elapsed, so a per-chunk or per-file call site is fine.
+
+    :param log_message: optional zero-argument callable returning the progress
+        line for the job log. Called only when a line is actually due, so it may
+        be as expensive as formatting a count. ``None`` means heartbeat only.
+    """
+
+    def __init__(
+        self,
+        api,
+        job_id,
+        log_message=None,
+        interval=HEARTBEAT_INTERVAL,
+        log_interval=PROGRESS_LOG_INTERVAL,
+    ):
+        self.api = api
+        self.job_id = job_id
+        self.log_message = log_message
+        self.interval = interval
+        self.log_interval = log_interval
+        self._last_beat = self._last_log = time.monotonic()
+
+    def tick(self):
+        """Beat if the interval has elapsed. Never raises."""
+        now = time.monotonic()
+        if now - self._last_beat >= self.interval:
+            self._last_beat = now
+            try:
+                self.api.heartbeat(self.job_id)
+            except Exception:
+                # Best effort on purpose: a submission that is running fine must
+                # not be killed because one ping lost a race with a proxy
+                # restart. Missing several in a row is what the reaper acts on.
+                logging.warning("Heartbeat during a long step failed", exc_info=True)
+        if self.log_message is not None and now - self._last_log >= self.log_interval:
+            self._last_log = now
+            try:
+                self.api.update_job(self.job_id, log=self.log_message() + "\n")
+            except Exception:
+                logging.warning("Progress report during a long step failed", exc_info=True)
+
+    def on_upload_progress(self, _info):
+        """Adapter for ``girder_client``'s ``progressCallback``.
+
+        It passes a ``{"current": ..., "total": ...}`` dict once per 64 MiB
+        chunk; the figures are already in the log line the caller supplies, so
+        they are discarded here rather than threaded through.
+        """
+        self.tick()
 
 
 def pull_image(cli, api, submission, image_reference):
@@ -1621,7 +1692,9 @@ def pull_image(cli, api, submission, image_reference):
     min) -- so a large enough pull races the reaper, and losing that race shows
     up to the researcher as their own submission failing.
 
-    Streaming the low-level API gives progress events to tick the heartbeat on.
+    Streaming the low-level API gives progress events to tick the heartbeat on;
+    :class:`ProgressBeat` is the shared rate-limiter, and the same one now
+    guards ``create_workspace`` and ``upload_workspace``.
 
     Two traps this deliberately handles:
 
@@ -1633,9 +1706,15 @@ def pull_image(cli, api, submission, image_reference):
       transient Girder blip would kill a pull that is going fine.
     """
     job_id = submission["job_id"]
-    last_beat = last_log = time.monotonic()
     error = None
     layers = set()
+    beat = ProgressBeat(
+        api,
+        job_id,
+        log_message=lambda: (
+            f"Still pulling {image_reference} ({len(layers)} layers seen)"
+        ),
+    )
 
     for event in cli.api.pull(image_reference, stream=True, decode=True):
         if not isinstance(event, dict):
@@ -1646,24 +1725,7 @@ def pull_image(cli, api, submission, image_reference):
         if event.get("id"):
             layers.add(event["id"])
 
-        now = time.monotonic()
-        if now - last_beat >= HEARTBEAT_INTERVAL:
-            last_beat = now
-            try:
-                api.heartbeat(job_id)
-            except Exception:
-                logging.warning("Heartbeat during image pull failed", exc_info=True)
-        if now - last_log >= PULL_LOG_INTERVAL:
-            last_log = now
-            try:
-                api.update_job(
-                    job_id,
-                    log=f"Still pulling {image_reference} ({len(layers)} layers seen)\n",
-                )
-            except Exception:
-                logging.warning(
-                    "Progress report during image pull failed", exc_info=True
-                )
+        beat.tick()
 
     if error:
         if _is_out_of_space(error):

@@ -323,9 +323,30 @@ class GirderApi:
     def file_chunks(self, file_id):
         return self.client.downloadFileAsIterator(file_id, chunkSize=CHUNK_SIZE)
 
-    def upload_file(self, folder_id, path, name=None, mime_type=None, item_type=None):
+    def upload_file(
+        self,
+        folder_id,
+        path,
+        name=None,
+        mime_type=None,
+        item_type=None,
+        progress=None,
+    ):
+        """Upload a local file, optionally reporting progress as it goes.
+
+        ``progress`` is ``girder_client``'s ``progressCallback``: it is handed a
+        ``{"current": ..., "total": ...}`` dict once per 64 MiB chunk. It is the
+        only seam this call has -- ``uploadFileToFolder`` otherwise blocks for
+        the whole transfer -- and a multi-gigabyte package makes that silence
+        long enough for the reaper to fail a healthy submission. See
+        :class:`~girder_sivacor.worker_plugin.lib.ProgressBeat`.
+        """
         file_obj = self.client.uploadFileToFolder(
-            folder_id, path, filename=name, mimeType=mime_type
+            folder_id,
+            path,
+            filename=name,
+            mimeType=mime_type,
+            progressCallback=progress,
         )
         if item_type:
             self.annotate_item_type(file_obj, item_type)

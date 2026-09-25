@@ -29,6 +29,7 @@ from ..statuses import CANCELING, FAILED
 from ..telemetry import size_bucket
 from .girder_api import GirderApi, dump_to_zip
 from .lib import (
+    ProgressBeat,
     _redis_client_sync,
     get_project_dir,
     is_julia,
@@ -563,14 +564,44 @@ def create_workspace(task, api, submission):
 
     fobj = api.file(submission["file_id"])
     temp_filename = os.path.join(workspace_dir, fobj["name"])
+
+    # Downloading and unpacking a multi-gigabyte package is silent to the
+    # server for its whole duration. ProgressBeat makes it visible, so
+    # the autoscaler does not think the instance is stalled and kill it.
+    downloaded = 0
+    extracted_members = 0
+    beat = ProgressBeat(
+        api,
+        submission["job_id"],
+        log_message=lambda: (
+            f"Still preparing the workspace ({downloaded / 1024**3:.1f} GiB "
+            f"downloaded, {extracted_members} files unpacked)"
+        ),
+    )
+
     try:
-        api.download_file(fobj["_id"], temp_filename)
+        # Chunked rather than api.download_file(): girder_client's downloadFile
+        # takes no progress callback, and the iterator it does expose is the
+        # only seam this has. Same CHUNK_SIZE as every other read.
+        with open(temp_filename, "wb") as dest:
+            for chunk in api.file_chunks(fobj["_id"]):
+                dest.write(chunk)
+                downloaded += len(chunk)
+                beat.tick()
         # File is either a zip or tar archive; extract accordingly
         extracted = False
         try:
             if zipfile.is_zipfile(temp_filename):
                 with zipfile.ZipFile(temp_filename, "r") as zip_ref:
-                    zip_ref.extractall(project_dir)
+                    # Per member rather than extractall() for the same reason as
+                    # the download: it is the only place a tick can go.
+                    # ZipFile.extract() sanitizes member paths exactly as
+                    # extractall() does -- both route through _extract_member --
+                    # so this is not a weakening of the zip-slip guard.
+                    for member in zip_ref.infolist():
+                        zip_ref.extract(member, project_dir)
+                        extracted_members += 1
+                        beat.tick()
                 extracted = True
                 print("Extracted as a zip file.")
         except zipfile.BadZipFile:
@@ -815,7 +846,9 @@ def execute_workflow(task, api, submission, stage, env_vars):
     # recorded_run appended this stage's metrics; only it knows the wall-clock
     # span including the image pull.
     if telemetry_stages := submission.get("telemetry_stages"):
-        telemetry_stages[-1]["duration_seconds"] = (end_time - start_time).total_seconds()
+        telemetry_stages[-1]["duration_seconds"] = (
+            end_time - start_time
+        ).total_seconds()
 
     if submission.get("runs") is None:
         submission["runs"] = []
@@ -920,6 +953,18 @@ def upload_workspace(task, api, submission):
     )
     project_dir = get_project_dir(submission)
 
+    # The whole step is one silent stretch to the server: one log line above,
+    # then a walk of the entire workspace and a multi-gigabyte upload.
+    # Hence the ProgressBeat to keep the job alive.
+    zipped = 0
+    beat = ProgressBeat(
+        api,
+        submission["job_id"],
+        log_message=lambda: (
+            f"Still packaging the replication package ({zipped} files archived)"
+        ),
+    )
+
     zip_path = os.path.join(submission["workspace_dir"], zip_basename)
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
         for root, dirs, files in os.walk(project_dir):
@@ -934,24 +979,30 @@ def upload_workspace(task, api, submission):
                     zip_symlink(zipf, file_path, arcname=arcname)
                 else:
                     zipf.write(file_path, arcname)
+                zipped += 1
+                beat.tick()
 
         # Store TRO files in a separate 'tro/' directory within the zip
         for key in ("tro_file_id", "sig_file_id", "tsr_file_id"):
             if fobj := api.file(folder_meta.get(key)):
-                dump_to_zip(
-                    api.file_chunks(fobj["_id"]), zipf, "tro/" + fobj["name"]
-                )
+                dump_to_zip(api.file_chunks(fobj["_id"]), zipf, "tro/" + fobj["name"])
+                beat.tick()
 
         # Store stdout and stderr logs
         for key in ("stderr_file_id", "stdout_file_id"):
             if fobj := api.file(folder_meta.get(key)):
                 dump_to_zip(api.file_chunks(fobj["_id"]), zipf, fobj["name"])
+                beat.tick()
 
+    # The upload is the longer half and has no loop of its own: girder_client's
+    # progressCallback, once per 64 MiB chunk, is the only place to utilize
+    # ProgressBeat.
     fobj = api.upload_file(
         folder_id,
         zip_path,
         mime_type="application/zip",
         item_type="replicated_package",
+        progress=beat.on_upload_progress,
     )
     os.remove(zip_path)
     api.set_folder_metadata(folder_id, {"replpack_file_id": str(fobj["_id"])})
