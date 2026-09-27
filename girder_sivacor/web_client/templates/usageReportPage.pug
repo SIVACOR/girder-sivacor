@@ -1,0 +1,110 @@
+mixin tile(label, value, modifier)
+  .g-sivacor-tile(class=modifier)
+    .g-sivacor-tile-value= value
+    .g-sivacor-tile-label= label
+
+.g-sivacor-usage(class=loading ? 'g-sivacor-loading' : '')
+  h3
+    | Resource usage
+    button.g-sivacor-refresh.btn.btn-sm.btn-default Refresh
+  p.g-sivacor-lede
+    | Cumulative SU-hours charged to each account, measured from how long its
+    |  worker instances actually existed. Unlike the quota page, these counters
+    |  outlive the submissions behind them: they start at an account's first
+    |  accrued run and are never rewritten, which is what makes them answerable
+    |  for a quota or an invoice.
+
+  if error
+    .alert.alert-danger= error
+  else if !report
+    p.g-sivacor-empty Loading…
+  else
+    .g-sivacor-tiles
+      +tile('SU-hours total', formatHours(report.total_su_hours))
+      +tile('Charged to accounts', formatHours(chargedSuHours))
+      +tile(houseLabel, formatHours(report.house.su_hours), report.house.su_hours ? 'g-sivacor-bad' : '')
+      +tile('Accounts', report.users.length)
+      +tile('Awaiting drain', report.pending.lifetimes)
+
+    if !report.users.length
+      p.g-sivacor-empty No account has accrued usage yet.
+    else
+      table.g-sivacor-table.g-sivacor-usage-users
+        thead
+          tr
+            th Account
+            th.g-sivacor-number SU-hours
+            th.g-sivacor-number Instance-hours
+            th.g-sivacor-number Volume GB-hours
+            th.g-sivacor-number Submissions
+            th Worker sizes
+            th Accounting since
+            th Last run
+        tbody
+          each row in report.users
+            tr
+              td= row.login
+              td.g-sivacor-number= formatHours(row.su_hours)
+              td.g-sivacor-number= formatHours(row.instance_hours)
+              td.g-sivacor-number= formatHours(row.volume_gb_hours)
+              td.g-sivacor-number= row.submissions
+              td
+                if Object.keys(row.by_size || {}).length
+                  each count, size in row.by_size
+                    span.g-sivacor-size-tally #{size} GB ×#{count}
+                else
+                  | —
+              td= formatTimestamp(row.since)
+              td= formatTimestamp(row.last_at)
+
+    .g-sivacor-panels
+      .g-sivacor-panel
+        h4 House &mdash; spend charged to nobody
+        p.g-sivacor-panel-note
+          | Fleet burn with no submission behind it, and runs we declined to
+          |  charge because they were our own defects. Real SU against the same
+          |  allocation, so it is listed beside the accounts rather than hidden:
+          |  the per-user total is never the whole bill.
+        if !Object.keys(report.house.by_reason || {}).length
+          p.g-sivacor-empty Nothing has been charged to the house.
+        else
+          table.g-sivacor-table
+            thead
+              tr
+                th Reason
+                th.g-sivacor-number SU-hours
+            tbody
+              each hours, reason in report.house.by_reason
+                tr
+                  td: code= reason
+                  td.g-sivacor-number= formatHours(hours)
+              tr
+                td
+                  strong Instances
+                td.g-sivacor-number= report.house.instances
+
+      .g-sivacor-panel
+        h4 Waiting to be counted
+        p.g-sivacor-panel-note
+          | Reaped instances whose usage has not been accrued yet. A few between
+          |  drains is ordinary; a number that only ever grows means the periodic
+          |  accrual task is not running, which is the one failure of this
+          |  accounting that is otherwise completely silent.
+        table.g-sivacor-table
+          thead
+            tr
+              th
+              th.g-sivacor-number Rows
+          tbody
+            tr
+              td Instance lifetimes
+              td.g-sivacor-number= report.pending.lifetimes
+            tr
+              td Attributions
+              td.g-sivacor-number= report.pending.attributions
+
+    p.g-sivacor-footnote
+      | These figures will read lower than the ACCESS dashboard's, which also
+      |  lags 12-24 hours. Volume GB-hours here are #[em cumulative] and are not
+      |  the same number as the windowed ones on the
+      |  #[a(href="#sivacor/volumes") scratch volume quota page].

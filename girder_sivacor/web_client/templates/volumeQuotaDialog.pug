@@ -1,0 +1,43 @@
+.modal-dialog
+  .modal-content
+    form#g-sivacor-quota-form.modal-form(role="form")
+      .modal-header
+        button.close(data-dismiss="modal", aria-hidden="true", type="button") &times;
+        h4.modal-title Scratch volume allowance for #{login}
+      .modal-body
+        //- Rendered only once the allowance has been read, so `quota` is set
+        //- unless the read failed -- but branching on the thing the body needs
+        //- means a future caller that renders early gets an empty dialog rather
+        //- than a TypeError halfway through the markup.
+        if quota
+          .form-group
+            label.control-label(for="g-sivacor-quota-gb") Allowance (GB)
+            input#g-sivacor-quota-gb.input-sm.form-control(
+              type="number", min="0", step=quota.granularity_gb, value=quota.max_gb)
+          ul.g-sivacor-quota-notes
+            if !quota.enabled
+              li
+                | Scratch volumes are switched off on this deployment
+                |  (#[code sivacor.volumes_enabled]), so an allowance set here has
+                |  no effect until they are switched on.
+            li
+              | A submission's request is rounded up to a multiple of
+              |  #{quota.granularity_gb} GB #[em before] it is checked against this
+              |  allowance, so an allowance that is not a multiple of it is
+              |  effectively the multiple below.
+            li
+              | This deployment refuses any single request over
+              |  #[strong #{quota.deployment_gb} GB]
+              |  (#[code sivacor.volume_total_gb]), whatever this says.
+            li
+              | 0 revokes approval. A submission already running keeps the volume
+              |  it has.
+        else if loadError
+          .alert.alert-danger= loadError
+        .g-validation-failed-message
+      .modal-footer
+        a.btn.btn-sm.btn-default(data-dismiss="modal") Cancel
+        button.g-sivacor-revoke.btn.btn-sm.btn-link(type="button", disabled=!quota) Revoke
+        button.g-sivacor-quota-save.btn.btn-sm.btn-primary(type="submit", disabled=!quota)
+          i.icon-ok
+          |  Save

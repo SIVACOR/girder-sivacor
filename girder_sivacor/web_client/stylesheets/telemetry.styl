@@ -24,7 +24,10 @@
   // spinner makes the whole table disappear on every filter change, which is
   // far more disorienting than a moment of stale numbers.
   &.g-sivacor-loading
-    .g-sivacor-tiles, .g-sivacor-panels, .g-sivacor-records, .g-sivacor-paging
+    .g-sivacor-tiles
+    .g-sivacor-panels
+    .g-sivacor-records
+    .g-sivacor-paging
       opacity 0.45
       transition opacity 120ms ease-in
 
@@ -78,7 +81,8 @@
   border-collapse collapse
   font-size 13px
 
-  th, td
+  th
+  td
     text-align left
     padding 5px 8px
     border-bottom 1px solid #eee
@@ -92,6 +96,15 @@
 
   code
     font-size 12px
+
+  // Shared with the quota and usage pages. Figures are compared down a column,
+  // so they align right and share one set of digit widths -- a proportional
+  // font makes 1234.5 look shorter than 999.9. Written as `th`/`td` rather than
+  // a bare class because the rule above is more specific than one would be.
+  th.g-sivacor-number
+  td.g-sivacor-number
+    text-align right
+    font-variant-numeric tabular-nums
 
 .g-sivacor-records
   margin-bottom 12px

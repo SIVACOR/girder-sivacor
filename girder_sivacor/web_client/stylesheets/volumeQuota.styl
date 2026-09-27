@@ -1,0 +1,107 @@
+// Styles for the admin scratch-volume quota page. Girder's own client is
+// Bootstrap 3, so buttons and form controls reuse its classes; only the layout
+// specific to this page is defined here. The tiles, tables and empty-state
+// classes are shared with the telemetry page and live in telemetry.styl.
+
+.g-sivacor-volumes
+  padding 10px 0
+
+  h3
+    margin-top 0
+
+    .g-sivacor-refresh
+      margin-left 10px
+      vertical-align middle
+
+  .g-sivacor-lede
+    color #666
+    max-width 60em
+    margin-bottom 14px
+
+  .alert
+    max-width 60em
+    padding 8px 12px
+
+  // A pending request dims the page rather than replacing it: swapping in a
+  // spinner makes the whole table disappear on every save, which is far more
+  // disorienting than a moment of stale numbers.
+  &.g-sivacor-loading
+    .g-sivacor-tiles
+    .g-sivacor-quotas
+    .g-sivacor-grant
+      opacity 0.45
+      transition opacity 120ms ease-in
+
+.g-sivacor-config
+  color #666
+  font-size 13px
+  margin-bottom 18px
+
+.g-sivacor-grant
+  max-width 60em
+  margin-bottom 24px
+  padding 12px 14px
+  border 1px solid #ddd
+  border-radius 4px
+  background #fafafa
+
+  h4
+    font-size 14px
+    font-weight 600
+    margin 0 0 8px
+
+  .form-control
+    margin-right 6px
+    width 22em
+    max-width 100%
+
+.g-sivacor-search-results
+  list-style none
+  margin 12px 0 0
+  padding 0
+
+  li
+    display flex
+    align-items center
+    gap 10px
+    padding 4px 0
+    border-bottom 1px solid #eee
+    font-size 13px
+
+    span:first-child
+      flex 1 1 auto
+
+.g-sivacor-search-current
+  color #777
+  font-size 12px
+
+.g-sivacor-quotas
+  margin-bottom 10px
+
+  td.g-sivacor-actions
+    white-space nowrap
+    text-align right
+
+  // A revoked account stays listed while its runs are still inside the
+  // retention window, so it has to read as history rather than as an approval.
+  tr.g-sivacor-row-revoked td
+    color #999
+
+.g-sivacor-warn-text
+  color #8a6d3b
+  cursor help
+
+.g-sivacor-footnote
+  color #777
+  font-size 12px
+  max-width 60em
+  margin-bottom 20px
+
+.g-sivacor-quota-notes
+  color #666
+  font-size 12px
+  margin 10px 0 0
+  padding-left 18px
+
+  li
+    margin-bottom 4px
