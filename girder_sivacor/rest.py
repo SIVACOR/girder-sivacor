@@ -385,6 +385,12 @@ def volume_usage():
 
     return {
         "enabled": volumes_enabled(),
+        # Reported because it is the quietest way for this feature to be off:
+        # every configuration below is right, the researcher is approved, and
+        # resolve_volume_gb still refuses every request, because the fleet only
+        # reads a submission's requested size when it places that submission
+        # itself. An operator looking at approvals has no other way to see it.
+        "targeted_assignment": targeted_assignment(),
         "deployment_gb": volume_total_gb(),
         "granularity_gb": VOLUME_GRANULARITY_GB,
         # The window these figures cover, so a small total is not mistaken for a
@@ -818,6 +824,7 @@ class SIVACOR(Resource):
         self.route("GET", ("worker_sizes",), self.get_worker_sizes)
         self.route("GET", ("volume_quota",), self.get_volume_quota)
         self.route("GET", ("volume_usage",), self.get_volume_usage)
+        self.route("GET", ("user", ":id", "volume_quota"), self.get_user_volume_quota)
         self.route("PUT", ("user", ":id", "volume_quota"), self.set_volume_quota)
         self.route("GET", ("upload_integrity",), self.get_upload_integrity)
         self.route("GET", ("workflow_schema",), self.get_workflow_schema)
@@ -1809,6 +1816,32 @@ class SIVACOR(Resource):
     )
     def get_volume_usage(self):
         return volume_usage()
+
+    @access.admin
+    @autoDescribeRoute(
+        Description("Get one user's scratch-volume allowance, in GB.")
+        .modelParam("id", "The user to read.", model=User, level=AccessType.ADMIN)
+        .notes(
+            "The read side of the PUT below, so a client that is looking at one "
+            "account does not have to pull the whole /sivacor/volume_usage "
+            "report to learn its ceiling -- and, more importantly, cannot "
+            "conclude from that report's silence that the ceiling is zero. An "
+            "account with no allowance and no volume submissions is absent from "
+            "it, which is indistinguishable there from a stale listing.\n\n"
+            "'max_gb' is 0 for an account nobody has approved, which is every "
+            "account until an administrator says otherwise -- so 0 is an "
+            "ordinary answer, not an error."
+        )
+    )
+    def get_user_volume_quota(self, user):
+        return {
+            "userId": str(user["_id"]),
+            "login": user.get("login"),
+            "max_gb": user_volume_quota(user),
+            "granularity_gb": VOLUME_GRANULARITY_GB,
+            "enabled": volumes_enabled(),
+            "deployment_gb": volume_total_gb(),
+        }
 
     @access.admin
     @autoDescribeRoute(

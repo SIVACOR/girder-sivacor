@@ -1,0 +1,50 @@
+// Styles for the admin resource-usage page. Girder's own client is Bootstrap 3,
+// so buttons and form controls reuse its classes; only the layout specific to
+// this page is defined here. The tiles, tables and empty-state classes are
+// shared with the telemetry page and live in telemetry.styl.
+
+.g-sivacor-usage
+  padding 10px 0
+
+  h3
+    margin-top 0
+
+    .g-sivacor-refresh
+      margin-left 10px
+      vertical-align middle
+
+  .g-sivacor-lede
+    color #666
+    max-width 60em
+    margin-bottom 18px
+
+  .alert
+    max-width 60em
+    padding 8px 12px
+
+  // A pending request dims the page rather than replacing it: swapping in a
+  // spinner makes the whole table disappear on every refresh, which is far more
+  // disorienting than a moment of stale numbers.
+  &.g-sivacor-loading
+    .g-sivacor-tiles
+    .g-sivacor-usage-users
+    .g-sivacor-panels
+      opacity 0.45
+      transition opacity 120ms ease-in
+
+.g-sivacor-usage-users
+  margin-bottom 24px
+
+.g-sivacor-size-tally
+  display inline-block
+  margin-right 6px
+  padding 1px 6px
+  border-radius 10px
+  font-size 11px
+  background #eee
+  color #555
+
+.g-sivacor-panel-note
+  color #777
+  font-size 12px
+  margin-bottom 8px

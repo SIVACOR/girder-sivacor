@@ -1,0 +1,8 @@
+//- Site admins only. The menu item is rendered for anyone with write access to
+//- the user, but both endpoints behind it are @access.admin, so showing it to a
+//- non-admin would only offer them a 403.
+if currentUser && currentUser.get('admin')
+  li(role="presentation")
+    a.g-sivacor-volume-quota(role="menuitem")
+      i.icon-database
+      |  Scratch volume allowance

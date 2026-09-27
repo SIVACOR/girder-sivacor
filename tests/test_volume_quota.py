@@ -288,6 +288,68 @@ def test_only_an_administrator_may_grant_an_allowance(server, user, admin):
 
 
 @pytest.mark.plugin("sivacor")
+def test_only_an_administrator_may_read_one_accounts_allowance(server, user, admin):
+    """Admin-only, like /sivacor/volume_usage and unlike /sivacor/volume_quota.
+
+    The public endpoint answers about the *caller*; this one answers about
+    somebody else, and who has been approved for a share of a shared quota is
+    not an ordinary user's business. A user asking about themselves already has
+    the public endpoint.
+    """
+    path = f"/sivacor/user/{user['_id']}/volume_quota"
+    assertStatus(server.request(path=path, method="GET"), 401)
+    assertStatus(server.request(path=path, method="GET", user=user), 403)
+    assertStatusOk(server.request(path=path, method="GET", user=admin))
+
+
+@pytest.mark.plugin("sivacor")
+def test_reading_an_unapproved_account_is_not_an_error(server, user, admin):
+    """Zero is the answer for every account until an operator says otherwise.
+
+    The admin UI opens this dialog on accounts that have never been approved --
+    that is the whole point of granting -- so "never approved" has to be an
+    ordinary answer rather than a 404 the client has to interpret.
+    """
+    _enable(total_gb=800)
+    path = f"/sivacor/user/{user['_id']}/volume_quota"
+    response = server.request(path=path, method="GET", user=admin)
+    assertStatusOk(response)
+    assert response.json == {
+        "userId": str(user["_id"]),
+        "login": user["login"],
+        "max_gb": 0,
+        "granularity_gb": VOLUME_GRANULARITY_GB,
+        "enabled": True,
+        "deployment_gb": 800,
+    }
+
+
+@pytest.mark.plugin("sivacor")
+def test_reading_an_allowance_returns_what_was_set(server, user, admin):
+    path = f"/sivacor/user/{user['_id']}/volume_quota"
+    server.request(path=path, method="PUT", params={"maxGb": 120}, user=admin)
+    response = server.request(path=path, method="GET", user=admin)
+    assertStatusOk(response)
+    assert response.json["max_gb"] == 120
+
+
+@pytest.mark.plugin("sivacor")
+def test_reading_an_allowance_fails_closed_on_a_corrupt_field(server, user, admin):
+    """Same direction as :func:`user_volume_quota`, and for the same reason.
+
+    An operator reading a ceiling of 0 here goes and grants one; an operator
+    shown ``"200"`` because Mongo held a string believes the account is already
+    approved for 200 GB when every submission it makes will be refused.
+    """
+    User().update({"_id": user["_id"]}, {"$set": {USER_VOLUME_QUOTA_FIELD: "200"}})
+    response = server.request(
+        path=f"/sivacor/user/{user['_id']}/volume_quota", method="GET", user=admin
+    )
+    assertStatusOk(response)
+    assert response.json["max_gb"] == 0
+
+
+@pytest.mark.plugin("sivacor")
 def test_an_allowance_can_be_revoked_with_zero(server, user, admin):
     path = f"/sivacor/user/{user['_id']}/volume_quota"
     server.request(path=path, method="PUT", params={"maxGb": 100}, user=admin)

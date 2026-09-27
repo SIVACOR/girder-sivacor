@@ -1,0 +1,134 @@
+mixin gb(value)
+  if value
+    | #{value} GB
+  else
+    | —
+
+mixin tile(label, value, modifier)
+  .g-sivacor-tile(class=modifier)
+    .g-sivacor-tile-value= value
+    .g-sivacor-tile-label= label
+
+.g-sivacor-volumes(class=loading ? 'g-sivacor-loading' : '')
+  h3
+    | Scratch volume quotas
+    button.g-sivacor-refresh.btn.btn-sm.btn-default Refresh
+  p.g-sivacor-lede
+    | A scratch volume is an extra block device attached to the worker for one
+    |  submission, for replication packages too large for the worker's own disk.
+    |  It is off for every account until an administrator grants an allowance
+    |  here, because the gigabytes come out of the same OpenStack quota this
+    |  deployment's assetstore draws on.
+
+  if error
+    .alert.alert-danger= error
+  else if !usage
+    p.g-sivacor-empty Loading…
+  else
+    if !usage.enabled
+      .alert.alert-warning
+        strong Scratch volumes are switched off on this deployment.
+        |  Allowances below are recorded, but no submission can use one until
+        |  #[code sivacor.volumes_enabled] is set.
+    //- The quiet one: every other setting can be right and every request still
+    //- refused, because the fleet only reads a submission's requested size when
+    //- it is placing that submission itself.
+    if usage.enabled && !usage.targeted_assignment
+      .alert.alert-warning
+        strong Targeted assignment is off.
+        |  Every request for extra disk is refused, however large the allowance,
+        |  until #[code sivacor.targeted_assignment] is armed.
+    if usage.enabled && !usage.deployment_gb
+      .alert.alert-warning
+        strong This deployment's per-request limit is 0 GB.
+        |  Every request is refused whatever the allowances below say; set
+        |  #[code sivacor.volume_total_gb].
+
+    p.g-sivacor-config
+      | Largest single request this deployment accepts:
+      |  #[strong #{usage.deployment_gb} GB] · rounded up to
+      |  #[strong #{usage.granularity_gb} GB] steps · figures below cover the last
+      |  #[strong #{usage.retention_days}] days
+
+    .g-sivacor-tiles
+      +tile('Approved accounts', usage.totals.approved_users)
+      +tile('Granted GB', usage.totals.granted_gb)
+      +tile('In flight GB', usage.totals.live_gb, usage.totals.live_gb ? 'g-sivacor-ok' : '')
+      +tile('GB-hours in window', usage.totals.gb_hours)
+      +tile('Volume submissions', usage.totals.submissions)
+
+    .g-sivacor-panel.g-sivacor-grant
+      h4 Grant an allowance
+      form.g-sivacor-user-search-form.form-inline
+        input.g-sivacor-user-search.input-sm.form-control(
+          type="text", placeholder="Search accounts by login or name", value=searchTerm)
+        button.btn.btn-sm.btn-primary(type="submit") Search
+        if searchResults
+          button.g-sivacor-search-clear.btn.btn-sm.btn-link Clear
+      if searchResults && !searchResults.length
+        p.g-sivacor-empty No account matches “#{searchTerm}”.
+      else if searchResults
+        ul.g-sivacor-search-results
+          each account in searchResults
+            li
+              span= userLabel(account)
+              span.g-sivacor-search-current
+                if grantedTo[account._id]
+                  | #{grantedTo[account._id]} GB
+                else
+                  | no allowance
+              button.g-sivacor-edit-quota.btn.btn-sm.btn-default(
+                data-user-id=account._id, data-login=account.login)
+                = grantedTo[account._id] ? 'Change' : 'Grant'
+
+    if !usage.users.length
+      p.g-sivacor-empty
+        | No account has a scratch volume allowance, and none has used one in the
+        |  last #{usage.retention_days} days.
+    else
+      table.g-sivacor-table.g-sivacor-quotas
+        thead
+          tr
+            th Account
+            th Allowance
+            th In flight
+            th Largest
+            th.g-sivacor-number Submissions
+            th.g-sivacor-number GB-hours
+            th Last submission
+            th
+        tbody
+          each row in usage.users
+            tr(class=row.ceiling_gb ? '' : 'g-sivacor-row-revoked')
+              td= row.login
+              td
+                if row.ceiling_gb
+                  | #{row.ceiling_gb} GB
+                  //- Granting above the per-request limit is allowed on purpose
+                  //- -- an operator may fund it later -- but until then the top
+                  //- of the allowance cannot be spent, and nothing else says so.
+                  if row.ceiling_gb > usage.deployment_gb
+                    |&nbsp;
+                    span.g-sivacor-warn-text(title=overLimitHint) ⚠
+                else
+                  span.g-sivacor-empty revoked
+              td: +gb(row.live_gb)
+              td: +gb(row.largest_gb)
+              td.g-sivacor-number= row.submissions
+              td.g-sivacor-number= row.gb_hours
+              td= formatTimestamp(row.last_at)
+              td.g-sivacor-actions
+                button.g-sivacor-edit-quota.btn.btn-sm.btn-default(
+                  data-user-id=row.user_id, data-login=row.login)
+                  = row.ceiling_gb ? 'Change' : 'Grant'
+                if row.ceiling_gb
+                  button.g-sivacor-revoke-quota.btn.btn-sm.btn-link(
+                    data-user-id=row.user_id, data-login=row.login) Revoke
+      p.g-sivacor-footnote
+        | An account appears here if it has an allowance, or if it ran a
+        |  submission with extra disk inside the retention window — so a revoked
+        |  account stays visible while its runs do. GB-hours bracket the
+        |  #[em submission], not the volume: a volume is created moments before
+        |  its instance and destroyed at the reap, up to ~20 minutes after the run
+        |  ends. Good enough to answer who is spending the storage grant; not a
+        |  billing record.

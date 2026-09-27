@@ -163,12 +163,28 @@ def test_the_endpoint_is_admin_only(server, user, admin):
     assertStatusOk(resp)
     assert set(resp.json) == {
         "enabled",
+        "targeted_assignment",
         "deployment_gb",
         "granularity_gb",
         "retention_days",
         "users",
         "totals",
     }
+
+
+@pytest.mark.plugin("sivacor")
+def test_the_report_says_whether_the_fleet_can_honour_any_of_this(server):
+    """The quietest way for the feature to be off, so the report has to name it.
+
+    With ``sivacor.targeted_assignment`` unarmed, every configuration below can
+    be right -- the feature enabled, the deployment funded, the account approved
+    -- and ``resolve_volume_gb`` still refuses every request, because the fleet
+    only reads a submission's requested size when it places that submission
+    itself. An operator auditing approvals has nowhere else to see it.
+    """
+    assert volume_usage()["targeted_assignment"] is False
+    Setting().set(PluginSettings.TARGETED_ASSIGNMENT, True)
+    assert volume_usage()["targeted_assignment"] is True
 
 
 @pytest.mark.plugin("sivacor")
