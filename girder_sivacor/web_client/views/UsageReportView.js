@@ -67,7 +67,7 @@ const UsageReportView = View.extend({
             // read against, one instance reaped for a missing heartbeat was
             // 98.6% of every SU spent -- which the two numbers side by side
             // state and a reader scanning tiles still has to divide to see.
-            houseLabel: report && report.total_su_hours
+            houseLabel: report && report.total_su_hours && report.house.su_hours
                 ? `House (${((report.house.su_hours / report.total_su_hours) * 100)
                     .toFixed(1)}% of all SU)`
                 : 'House',
