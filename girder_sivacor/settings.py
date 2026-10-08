@@ -275,25 +275,30 @@ SettingDefault.defaults.update(
         PluginSettings.TRO_PROFILE: {
             # Identifies the TRS, so it must be an absolute IRI (or a compact
             # IRI whose prefix is not trov) and must be the same in every
-            # declaration mentioning this TRS. Load-bearing rather than
-            # belt-and-braces: tro-utils 0.5.0 derives a missing @id from
-            # trov:url only, which this profile no longer carries, so without
-            # the line below the TRS would be recorded as
-            # https://w3id.org/trace/tro-utils#unidentified-trs.
+            # declaration mentioning this TRS. tro-utils >=0.5.1 would derive
+            # the same string from schema:url below, but stating it keeps the
+            # identifier ours rather than a side effect of that fallback.
             "@id": "https://sivacor.org/",
             "rdfs:comment": "SIVACOR TRO profile",
+            # A capability belongs to the TRS rather than to one declaration,
+            # so it is identified by its own term -- which is what
+            # trov:warrantedBy points at from every performance attribute
+            # claiming it. The former "trs/capability/{i}" was relative and
+            # resolved against whichever document happened to contain it,
+            # which is what an external validator flags.
+            #
+            # tro-utils >=0.5.1 would derive each @id from its @type if we
+            # omitted it; spelled out so this setting shows an admin exactly
+            # what lands in the declaration.
             "trov:hasCapability": [
-                {"@id": "trs/capability/1", "@type": Caps.ENV_ISOLATION.value},
+                {"@id": Caps.ENV_ISOLATION.value, "@type": Caps.ENV_ISOLATION.value},
+                {"@id": Caps.NET_ISOLATION.value, "@type": Caps.NET_ISOLATION.value},
                 {
-                    "@id": "trs/capability/2",
-                    "@type": Caps.NET_ISOLATION.value,
-                },
-                {
-                    "@id": "trs/capability/3",
+                    "@id": Caps.NON_INTERACTIVE.value,
                     "@type": Caps.NON_INTERACTIVE.value,
                 },
                 {
-                    "@id": "trs/capability/4",
+                    "@id": Caps.MACHINE_ENFORCEMENT.value,
                     "@type": Caps.MACHINE_ENFORCEMENT.value,
                 },
             ],

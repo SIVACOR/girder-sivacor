@@ -23,6 +23,7 @@ from girder.models.setting import Setting
 from girder.settings import SettingDefault
 from girder_sivacor.settings import PluginSettings
 from girder_sivacor.worker_plugin.run_submission import _run_instant
+from girder_sivacor import is_conforming_capability_id
 from tro_utils.models.trs import (
     UNIDENTIFIED_TRS_ID,
     TrustedResearchSystem,
@@ -31,7 +32,7 @@ from tro_utils.models.trs import (
 
 #: Identifiers an admin might plausibly type that cannot identify a TRS.
 BAD_IDS = [
-    "trs",  # the 0.4.x convention, and still what the capability ids use
+    "trs",  # the 0.4.x convention
     "trs/capability/1",
     "sivacor",
     "",
@@ -50,9 +51,9 @@ class TestDefaultProfile:
     def test_default_profile_states_an_id(self):
         """Stated outright, not derived.
 
-        The profile describes the TRS in schema.org terms, and tro-utils 0.5.0
-        derives a missing @id from trov:url only -- so without this line the
-        TRS would be recorded as unidentified rather than as SIVACOR.
+        tro-utils would reach the same string through schema:url, so this
+        guards the identifier being ours rather than a side effect of that
+        fallback's ordering.
         """
         assert _default_profile()["@id"] == "https://sivacor.org/"
 
@@ -103,6 +104,50 @@ class TestDefaultProfile:
         assert out.exists()
 
 
+class TestCapabilityIdentity:
+    """Capabilities are named by their own term, not a relative id.
+
+    trov:warrantedBy on every performance attribute points at the capability
+    that justifies it. A relative id like "trs/capability/1" resolves against
+    whichever document contains it, so an external validator rejects it --
+    and because the warrant copies the profile's @id, one bad entry repeats
+    through the whole declaration.
+    """
+
+    def test_profile_capabilities_use_their_own_term(self):
+        capabilities = _default_profile()["trov:hasCapability"]
+        assert capabilities, "the profile should declare capabilities"
+        for capability in capabilities:
+            assert capability["@id"] == capability["@type"]
+            assert is_conforming_capability_id(capability["@id"])
+
+    def test_warrants_conform(self):
+        """What the external check actually inspects."""
+        trs = TrustedResearchSystem.from_profile(_default_profile())
+        for capability in trs.to_jsonld()["trov:hasCapability"]:
+            assert is_conforming_capability_id(capability["@id"])
+
+    @pytest.mark.plugin("sivacor")
+    def test_validator_rejects_a_relative_capability_id(self, server):
+        profile = dict(_default_profile())
+        profile["trov:hasCapability"] = [
+            {"@id": "trs/capability/1", "@type": "trov:CanIsolateEnvironment"}
+        ]
+        with pytest.raises(ValidationException, match="compact or absolute"):
+            Setting().set(PluginSettings.TRO_PROFILE, profile)
+
+    @pytest.mark.plugin("sivacor")
+    def test_validator_rejects_a_capability_without_a_type(self, server):
+        profile = dict(_default_profile())
+        profile["trov:hasCapability"] = [{"@id": "trov:CanIsolateEnvironment"}]
+        with pytest.raises(ValidationException, match="@type"):
+            Setting().set(PluginSettings.TRO_PROFILE, profile)
+
+    @pytest.mark.plugin("sivacor")
+    def test_validator_accepts_the_shipped_capabilities(self, server):
+        assert Setting().set(PluginSettings.TRO_PROFILE, _default_profile())
+
+
 class TestProfileValidator:
     """A bad @id must be caught while editing the setting.
 
@@ -133,12 +178,29 @@ class TestProfileValidator:
 
     @pytest.mark.plugin("sivacor")
     def test_validator_allows_an_absent_id(self, server):
-        """Without an @id and without trov:url, the TRS is unidentified.
+        """The validator rejects a wrong identifier, not a missing one.
 
-        Allowed by the validator -- it rejects a wrong identifier, not a
-        missing one -- but it is why the shipped profile states its @id.
+        With no @id, tro-utils derives one from schema:url -- which for this
+        profile is the same IRI the @id states.
         """
         profile = {k: v for k, v in _default_profile().items() if k != "@id"}
+        Setting().set(PluginSettings.TRO_PROFILE, profile)
+        assert (
+            TrustedResearchSystem.from_profile(profile).trs_id == "https://sivacor.org/"
+        )
+
+    @pytest.mark.plugin("sivacor")
+    def test_profile_without_id_or_url_is_unidentified(self, server):
+        """Nothing to derive from, so the TRS is recorded as unidentified.
+
+        Still allowed -- a missing identifier is not a wrong one -- but it is
+        why the shipped profile carries both.
+        """
+        profile = {
+            k: v
+            for k, v in _default_profile().items()
+            if k not in ("@id", "schema:url")
+        }
         Setting().set(PluginSettings.TRO_PROFILE, profile)
         assert TrustedResearchSystem.from_profile(profile).trs_id == UNIDENTIFIED_TRS_ID
 
