@@ -273,6 +273,13 @@ SettingDefault.defaults.update(
         PluginSettings.TRO_GPG_FINGERPRINT: "fingerprint",
         PluginSettings.TRO_GPG_PASSPHRASE: "passphrase",
         PluginSettings.TRO_PROFILE: {
+            # Identifies the TRS, so it must be an absolute IRI (or a compact
+            # IRI whose prefix is not trov) and must be the same in every
+            # declaration mentioning this TRS. tro-utils would otherwise fall
+            # back to trov:url below, which happens to be the same string
+            # today -- stating it here keeps the identifier ours rather than a
+            # side effect of that fallback.
+            "@id": "https://sivacor.org/",
             "rdfs:comment": "SIVACOR TRO profile",
             "trov:hasCapability": [
                 {"@id": "trs/capability/1", "@type": Caps.ENV_ISOLATION.value},

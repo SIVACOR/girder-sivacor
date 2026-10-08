@@ -172,10 +172,9 @@ Unlike the files below, this directory *is* part of the repo.
 
 ## Scratch files — not part of the plugin
 
-Root `aaa.py` / `ddd.py` / `debug.py` / `ala.py` / `foobar/`, the `*.patch`
-files, `auth/orcid.bak`, and non-`.mako` files in `mail_templates/` are all
-scratch. (`models/volume.py`, previously listed here as dead code, was deleted
-on 2026-08-06.)
-
-`tro_utils.patch` patches the *installed* `tro-utils` so `sha256_for_file`
-tolerates symlinks and missing files.
+Root `aaa.py` / `ddd.py` / `debug.py` / `ala.py` / `foobar/`, `auth/orcid.bak`,
+and non-`.mako` files in `mail_templates/` are all scratch.
+(`models/volume.py`, previously listed here as dead code, was deleted on
+2026-08-06. `tro_utils.patch`, which made the installed `tro-utils` tolerate
+symlinks and missing files in `sha256_for_file`, is gone too -- tro-utils
+handles both itself, and the plugin now requires >=0.5.0.)
