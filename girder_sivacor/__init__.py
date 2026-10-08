@@ -94,9 +94,12 @@ def _validate_tro_profile(doc):
     complaint while editing the setting and a submission failing several
     stages in, after the workers have already done the work.
 
-    A profile stating no @id is allowed: tro-utils then derives one from
-    trov:url, falling back to a placeholder that says the TRS is
+    A profile stating no @id is allowed: tro-utils then derives one from the
+    TRS's URL, falling back to a placeholder that says the TRS is
     unidentified. Deriving it is fine, silently mis-identifying it is not.
+    Note that 0.5.0 reads only trov:url there, not the schema:url a profile
+    describing the organization in schema.org terms would carry -- so such a
+    profile wants an explicit @id.
     """
     value = doc.get("value")
     if not isinstance(value, dict):

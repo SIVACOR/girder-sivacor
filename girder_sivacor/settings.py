@@ -275,10 +275,11 @@ SettingDefault.defaults.update(
         PluginSettings.TRO_PROFILE: {
             # Identifies the TRS, so it must be an absolute IRI (or a compact
             # IRI whose prefix is not trov) and must be the same in every
-            # declaration mentioning this TRS. tro-utils would otherwise fall
-            # back to trov:url below, which happens to be the same string
-            # today -- stating it here keeps the identifier ours rather than a
-            # side effect of that fallback.
+            # declaration mentioning this TRS. Load-bearing rather than
+            # belt-and-braces: tro-utils 0.5.0 derives a missing @id from
+            # trov:url only, which this profile no longer carries, so without
+            # the line below the TRS would be recorded as
+            # https://w3id.org/trace/tro-utils#unidentified-trs.
             "@id": "https://sivacor.org/",
             "rdfs:comment": "SIVACOR TRO profile",
             "trov:hasCapability": [
@@ -296,11 +297,17 @@ SettingDefault.defaults.update(
                     "@type": Caps.MACHINE_ENFORCEMENT.value,
                 },
             ],
-            "trov:owner": "SIVACOR Team",
-            "trov:description": "SIVACOR AEA Infrastructure",
-            "trov:contact": "admin@sivacor.org",
-            "trov:url": "https://sivacor.org/",
-            "trov:name": "sivacor",
+            # The TRS is a schema:Organization, so schema.org properties
+            # describe it. trov:owner/description/contact/url/name, used here
+            # previously, are not terms the TROV vocabulary defines.
+            "schema:name": "sivacor",
+            "schema:description": "SIVACOR AEA Infrastructure",
+            "schema:url": "https://sivacor.org/",
+            "schema:email": "admin@sivacor.org",
+            "schema:owner": {
+                "@type": "schema:Organization",
+                "schema:name": "SIVACOR Team",
+            },
         },
     }
 )

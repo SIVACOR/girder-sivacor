@@ -23,7 +23,11 @@ from girder.models.setting import Setting
 from girder.settings import SettingDefault
 from girder_sivacor.settings import PluginSettings
 from girder_sivacor.worker_plugin.run_submission import _run_instant
-from tro_utils.models.trs import TrustedResearchSystem, is_conforming_trs_id
+from tro_utils.models.trs import (
+    UNIDENTIFIED_TRS_ID,
+    TrustedResearchSystem,
+    is_conforming_trs_id,
+)
 
 #: Identifiers an admin might plausibly type that cannot identify a TRS.
 BAD_IDS = [
@@ -44,11 +48,11 @@ class TestDefaultProfile:
     """The shipped profile must identify the TRS without relying on a fallback."""
 
     def test_default_profile_states_an_id(self):
-        """Stated outright, not inferred from trov:url.
+        """Stated outright, not derived.
 
-        tro-utils would derive the same string from trov:url today, so this is
-        about the identifier being ours rather than a side effect of a fallback
-        that could change.
+        The profile describes the TRS in schema.org terms, and tro-utils 0.5.0
+        derives a missing @id from trov:url only -- so without this line the
+        TRS would be recorded as unidentified rather than as SIVACOR.
         """
         assert _default_profile()["@id"] == "https://sivacor.org/"
 
@@ -58,6 +62,34 @@ class TestDefaultProfile:
     def test_default_profile_resolves_to_its_own_id(self):
         trs = TrustedResearchSystem.from_profile(_default_profile())
         assert trs.trs_id == "https://sivacor.org/"
+
+    def test_profile_describes_the_trs_in_schema_org_terms(self):
+        """The TRS is a schema:Organization, so schema: properties describe it.
+
+        trov:owner, trov:description, trov:contact, trov:url and trov:name --
+        all used here previously -- are not terms TROV defines for a TRS.
+        """
+        profile = _default_profile()
+        assert profile["schema:name"] == "sivacor"
+        assert profile["schema:url"] == "https://sivacor.org/"
+        assert profile["schema:email"] == "admin@sivacor.org"
+        assert profile["schema:owner"]["@type"] == "schema:Organization"
+        assert profile["schema:owner"]["schema:name"] == "SIVACOR Team"
+        assert "SIVACOR" in profile["schema:description"]
+        # trov: is still right for the vocabulary's own terms, and only those.
+        assert sorted(k for k in profile if k.startswith("trov:")) == [
+            "trov:hasCapability"
+        ]
+
+    def test_schema_properties_reach_the_declaration(self):
+        """Everything not typed by the model rides along verbatim."""
+        trs = TrustedResearchSystem.from_profile(_default_profile())
+        node = trs.to_jsonld()
+        assert node["schema:name"] == "sivacor"
+        assert node["schema:url"] == "https://sivacor.org/"
+        assert node["schema:email"] == "admin@sivacor.org"
+        assert node["schema:owner"]["schema:name"] == "SIVACOR Team"
+        assert "schema:Organization" in node["@type"]
 
     def test_default_profile_declaration_can_be_saved(self, tmp_path):
         """A non-conforming TRS @id makes tro-utils refuse to save at all."""
@@ -101,12 +133,14 @@ class TestProfileValidator:
 
     @pytest.mark.plugin("sivacor")
     def test_validator_allows_an_absent_id(self, server):
-        """tro-utils derives one from trov:url; deriving is fine."""
+        """Without an @id and without trov:url, the TRS is unidentified.
+
+        Allowed by the validator -- it rejects a wrong identifier, not a
+        missing one -- but it is why the shipped profile states its @id.
+        """
         profile = {k: v for k, v in _default_profile().items() if k != "@id"}
         Setting().set(PluginSettings.TRO_PROFILE, profile)
-        assert (
-            TrustedResearchSystem.from_profile(profile).trs_id == "https://sivacor.org/"
-        )
+        assert TrustedResearchSystem.from_profile(profile).trs_id == UNIDENTIFIED_TRS_ID
 
     @pytest.mark.plugin("sivacor")
     def test_validator_still_rejects_a_non_dict(self, server):

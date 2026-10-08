@@ -76,7 +76,7 @@ def _settings_stub(keys):
         # could not produce a saveable declaration is a misleading one.
         PluginSettings.TRO_PROFILE: {
             "@id": "https://test.sivacor.org/",
-            "trov:name": "test-profile",
+            "schema:name": "test-profile",
         },
         PluginSettings.TRO_GPG_FINGERPRINT: FINGERPRINT,
         PluginSettings.TRO_GPG_PASSPHRASE: PASSPHRASE,
