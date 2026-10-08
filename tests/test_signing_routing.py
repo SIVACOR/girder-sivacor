@@ -70,7 +70,14 @@ def _settings_stub(keys):
     that a passphrase which was never requested cannot reach ``TRO``.
     """
     available = {
-        PluginSettings.TRO_PROFILE: {"trov:name": "test-profile"},
+        # Carries an @id, as a real profile must: tro-utils >=0.5.0 needs one
+        # that identifies the TRS the same way in every declaration. TRO is
+        # mocked below, so nothing here would complain -- but a stub that
+        # could not produce a saveable declaration is a misleading one.
+        PluginSettings.TRO_PROFILE: {
+            "@id": "https://test.sivacor.org/",
+            "schema:name": "test-profile",
+        },
         PluginSettings.TRO_GPG_FINGERPRINT: FINGERPRINT,
         PluginSettings.TRO_GPG_PASSPHRASE: PASSPHRASE,
     }

@@ -19,6 +19,7 @@ from girder_jobs.constants import JobStatus
 from girder_jobs.models.job import Job as JobModel
 from girder_oauth.providers import addProvider
 from girder_oauth.settings import PluginSettings as OAuthSettings
+from tro_utils.models.trs import is_conforming_capability_id, is_conforming_trs_id
 
 from .auth.orcid import ORCID
 from .notifications import (
@@ -84,9 +85,46 @@ def _validate_string_settings(doc):
 
 @setting_utilities.validator(PluginSettings.TRO_PROFILE)
 def _validate_tro_profile(doc):
+    """Check the TRS profile at write time, @id included.
+
+    The @id is what identifies the TRS in every declaration that mentions it,
+    so tro-utils (>=0.5.0) requires an absolute IRI, or a compact IRI whose
+    prefix is not trov, and refuses to save a declaration carrying anything
+    else. Checking here is the difference between an admin seeing the
+    complaint while editing the setting and a submission failing several
+    stages in, after the workers have already done the work.
+
+    A profile stating no @id is allowed: tro-utils then derives one from the
+    TRS's schema:url, falling back to a placeholder that says the TRS is
+    unidentified. Deriving it is fine, silently mis-identifying it is not.
+    """
     value = doc.get("value")
     if not isinstance(value, dict):
         raise ValidationException("TRO profile must be a dictionary.")
+    if "@id" in value and not is_conforming_trs_id(value["@id"]):
+        raise ValidationException(
+            "TRO profile @id must identify the TRS the same way in every "
+            "declaration, so it has to be an absolute IRI "
+            "(e.g. 'https://sivacor.org/') or a compact IRI whose prefix is "
+            f"not 'trov' (e.g. 'ex:trs'); got {value['@id']!r}."
+        )
+    # Each capability is referenced by trov:warrantedBy from every performance
+    # attribute claiming it, so a relative id here ends up repeated through the
+    # whole declaration -- and is what an external validator rejects.
+    for capability in value.get("trov:hasCapability", []):
+        if not isinstance(capability, dict) or "@type" not in capability:
+            raise ValidationException(
+                "Each trov:hasCapability entry must be an object with a "
+                f"@type; got {capability!r}."
+            )
+        capability_id = capability.get("@id", capability["@type"])
+        if not is_conforming_capability_id(capability_id):
+            raise ValidationException(
+                "A capability @id must name the capability the same way in "
+                "every declaration, so it has to be a compact or absolute "
+                "IRI -- usually the capability's own term, e.g. "
+                f"'{capability['@type']}'; got {capability_id!r}."
+            )
     return value
 
 

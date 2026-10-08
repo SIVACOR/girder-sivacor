@@ -721,8 +721,8 @@ def _run_tro(task, api, submission, action, inumber, condition, stage_index=None
         runs = submission.get("runs", [])
         run = runs[-1] if runs else {}
         tro.add_performance(
-            datetime.datetime.fromisoformat(run["run_start_time"]),
-            datetime.datetime.fromisoformat(run["run_end_time"]),
+            _run_instant(run["run_start_time"]),
+            _run_instant(run["run_end_time"]),
             comment="SIVACOR Workspace pruning step",
             accessed_arrangement=(f"arrangement/{inumber}", "/workspace"),
             modified_arrangement=(f"arrangement/{inumber + 1}", "/workspace"),
@@ -738,8 +738,8 @@ def _run_tro(task, api, submission, action, inumber, condition, stage_index=None
 
         comment = f"SIVACOR workflow execution ({main_file}) step {index + 1}"
         tro.add_performance(
-            datetime.datetime.fromisoformat(run["run_start_time"]),
-            datetime.datetime.fromisoformat(run["run_end_time"]),
+            _run_instant(run["run_start_time"]),
+            _run_instant(run["run_end_time"]),
             comment=comment,
             accessed_arrangement=(f"arrangement/{inumber}", "/workspace"),
             modified_arrangement=(f"arrangement/{inumber + 1}", "/workspace"),
@@ -807,6 +807,28 @@ def sign_tro(task, api, submission):
     return _run_tro(task, api, submission, "sign", 0, None)
 
 
+def _run_instant(value):
+    """Parse a stored run timestamp as an unambiguous instant.
+
+    Runs recorded since timezone-aware timestamps landed carry an offset.
+    Submissions already in flight at that point do not, and tro-utils >=0.5.0
+    would read an offset-less value as local time -- i.e. as whatever zone the
+    host running this TRO step happens to be in, which is not necessarily the
+    host that recorded the run. Pinning the legacy case to UTC keeps the
+    declaration the same wherever the step runs.
+
+    Args:
+        value: An ISO 8601 timestamp from ``submission["runs"]``.
+
+    Returns:
+        A timezone-aware :class:`datetime.datetime`.
+    """
+    parsed = datetime.datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed
+
+
 def _performance_attributes(api, folder_id, stage_num):
     """Read back the performance data recorded_run uploaded for a stage."""
     item = api.find_child_item(folder_id, performance_data_name(stage_num))
@@ -826,7 +848,12 @@ def execute_workflow(task, api, submission, stage, env_vars):
     report(api, submission["job_id"], "Executing workflow on workspace.")
 
     # Placeholder for actual workflow execution logic
-    start_time = datetime.datetime.now()
+    # UTC, not naive local: this is serialised into submission["runs"] and read
+    # back by whichever host runs the TRO step, which is not necessarily this
+    # one. tro-utils >=0.5.0 reads an offset-less timestamp as local time, so a
+    # naive value recorded here would land in a signed declaration shifted by
+    # the difference between the two hosts' zones.
+    start_time = datetime.datetime.now(datetime.timezone.utc)
     ret = recorded_run(api, submission, stage, env_vars)
     if ret["StatusCode"] == -123:
         print("Termination requested, stopping execution.")
@@ -842,7 +869,7 @@ def execute_workflow(task, api, submission, stage, env_vars):
             f"Workflow execution failed with code {ret['StatusCode']}",
             detail=ret["StatusCode"],
         )
-    end_time = datetime.datetime.now()
+    end_time = datetime.datetime.now(datetime.timezone.utc)
     # recorded_run appended this stage's metrics; only it knows the wall-clock
     # span including the image pull.
     if telemetry_stages := submission.get("telemetry_stages"):
@@ -874,7 +901,8 @@ def execute_workflow(task, api, submission, stage, env_vars):
 @submission_task("Failed to prune workspace")
 def prune_workspace(task, api, submission):
     logger.info(f"Pruning workspace for submission {submission['folder_id']}")
-    start_time = datetime.datetime.now()
+    # UTC for the same reason as in execute_workflow above.
+    start_time = datetime.datetime.now(datetime.timezone.utc)
     project_dir = pathlib.Path(get_project_dir(submission))
     patterns = copy.deepcopy(DEFAULT_SIVACOR_IGNORE)
     # Check if user provided a custom .sivacorignore
@@ -916,7 +944,7 @@ def prune_workspace(task, api, submission):
                 removed_paths.append(relative_file_str)
                 file_p.unlink()
 
-    end_time = datetime.datetime.now()
+    end_time = datetime.datetime.now(datetime.timezone.utc)
     if removed_paths:
         logger.info(
             "Pruned the following paths from the workspace:\n - "

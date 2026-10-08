@@ -17,11 +17,22 @@ requirements = [
     "pylibacl",
     "py-cpuinfo",
     "randomname",
-    # >=0.4.6 is load-bearing, not cosmetic: from that release tro-utils only
-    # touches the GPG keyring when signing, which is what lets non-signing hosts
-    # run without key material. Against 0.4.5 a host with no keyring raises
-    # KeyError(<fingerprint>) from TRO's constructor, on the first TRO step.
-    "tro-utils>=0.4.6",
+    # >=0.5.1 is load-bearing, not cosmetic. Each release fixed something this
+    # plugin depends on:
+    #   0.4.6 made tro-utils touch the GPG keyring only when signing, which is
+    #   what lets non-signing hosts run without key material. Against 0.4.5 a
+    #   host with no keyring raises KeyError(<fingerprint>) from TRO's
+    #   constructor, on the first TRO step.
+    #   0.5.0 requires the TRS @id to be an absolute IRI (or a compact IRI
+    #   whose prefix is not trov) and honours the one our profile declares --
+    #   0.4.x dropped a profile's @id on the floor and wrote a bare "trs", so
+    #   every declaration this plugin produced identified its TRS by a
+    #   reference that only resolves inside that one document.
+    #   0.5.1 extends that rule to capabilities, so trov:warrantedBy names one
+    #   by a compact or absolute IRI; it also reads schema:url when deriving a
+    #   missing TRS @id, and describes the TRS with schema.org properties,
+    #   which is the vocabulary our profile now uses.
+    "tro-utils>=0.5.1",
 ]
 
 setup(
