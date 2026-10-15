@@ -295,10 +295,10 @@ class DockerStatsCollectorThread(Thread):
             f"T{suffix}B",
             f"P{suffix}B",
         )
-        i = int(math.floor(math.log(size_bytes, base)))
+        i = math.floor(math.log(size_bytes, base))
         p = math.pow(base, i)
         s = round(size_bytes / p, 2)
-        return "%s %s" % (s, size_name[i])
+        return f"{s} {size_name[i]}"
 
     @staticmethod
     def calculate_cpu_seconds(d):
@@ -1034,7 +1034,9 @@ def _infer_run_command(submission, stage):
 #: of that follows: filling it fails one run and wedges nothing, which is the
 #: outcome the floor exists to manufacture. See :func:`disk_floor_bytes`, and
 #: open item 3 of ``development_notes/05_cinder_volumes_plan.md``.
-DISK_FLOOR_BYTES = int(os.environ.get("SIVACOR_DISK_FLOOR_BYTES", 5 * 1024**3))
+DISK_FLOOR_BYTES = int(
+    os.environ.get("SIVACOR_DISK_FLOOR_BYTES", str(5 * 1024**3))
+)
 
 #: Container-visible path whose filesystem backs the docker image store.
 #:
@@ -1078,7 +1080,7 @@ WORKSPACE_FLOOR_SHARE = float(os.environ.get("SIVACOR_WORKSPACE_FLOOR_SHARE", "0
 #: 2 GiB is for celery, the docker daemon, and the OS. It is not generous; it is
 #: the smallest amount that has to survive for a failure to be *reportable*.
 MEMORY_HEADROOM_BYTES = int(
-    os.environ.get("SIVACOR_MEMORY_HEADROOM_BYTES", 2 * 1024**3)
+    os.environ.get("SIVACOR_MEMORY_HEADROOM_BYTES", str(2 * 1024**3))
 )
 
 #: Do not cap below this. A limit this small cannot run any analysis image, so
@@ -1529,8 +1531,10 @@ def image_on_disk_estimate(cli, image_reference) -> tuple[int, str] | None:
         return None
     return (
         int(compressed_gb * 1024**3 * IMAGE_ON_DISK_MULTIPLIER),
-        f"{compressed_gb:g} GiB compressed for {family} images, "
-        f"at {IMAGE_ON_DISK_MULTIPLIER:g}x on disk",
+        (
+            f"{compressed_gb:g} GiB compressed for {family} images, "
+            f"at {IMAGE_ON_DISK_MULTIPLIER:g}x on disk"
+        ),
     )
 
 

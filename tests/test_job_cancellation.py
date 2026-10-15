@@ -308,7 +308,10 @@ def test_execute_workflow_chain_preserved_on_success():
 
     # Simulate the logic from execute_workflow when StatusCode is 0
     ret = {"StatusCode": 0}
-    if ret["StatusCode"] == -123:
+    # Not collapsed into one `if`, deliberately: this mirrors execute_workflow's
+    # own shape line for line, and a test that paraphrases the code it stands in
+    # for stops being evidence about it.
+    if ret["StatusCode"] == -123:  # noqa: SIM102
         if mock_task.request.chain:
             mock_task.request.chain = None
 

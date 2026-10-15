@@ -95,7 +95,7 @@ def test_reap_leaves_live_submissions_alone(
     server, db, admin, user, submission_collection
 ):
     """A submission that has just reported must survive the sweep."""
-    job, folder = make_submission(user, submission_collection)
+    job, _folder = make_submission(user, submission_collection)
 
     resp = reap(server, admin)
     assertStatusOk(resp)

@@ -244,11 +244,9 @@ def set_submission_status(event: events.Event) -> None:
         submission_status = COMPLETED
         try:
             notify_user(job, submission_folder, success=True)
-        except Exception as e:
+        except Exception:
             logger.exception(
-                "Failed to send success notification for job %s: %s",
-                str(job["_id"]),
-                str(e),
+                "Failed to send success notification for job %s", str(job["_id"])
             )
     elif status in (JobStatus.ERROR, JobStatus.CANCELED):
         # A cancel is terminal for the *server* and not for the worker. Girder
@@ -271,11 +269,9 @@ def set_submission_status(event: events.Event) -> None:
         submission_status = FAILED if status == JobStatus.ERROR else CANCELING
         try:
             notify_user(job, submission_folder, success=False)
-        except Exception as e:
+        except Exception:
             logger.exception(
-                "Failed to send failure notification for job %s: %s",
-                str(job["_id"]),
-                str(e),
+                "Failed to send failure notification for job %s", str(job["_id"])
             )
     else:
         submission_status = PROCESSING

@@ -114,7 +114,8 @@ class TestDockerStatsCollectorThread:
             stats_thread.start()
             stats_thread.join(timeout=2)
 
-            rows = open(output_path + ".csv").read().splitlines()
+            with open(output_path + ".csv") as fp:
+                rows = fp.read().splitlines()
             header, data = rows[0].split(","), rows[1].split(",")
             assert header[-1] == "CPU Seconds"
             assert float(data[-1]) == pytest.approx(4.0), "4e9 ns of CPU time = 4 s"

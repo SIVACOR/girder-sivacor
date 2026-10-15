@@ -30,6 +30,7 @@ after it is gone. That is the trade. While the submission still exists its job
 log holds the full story, including the parts stripped here.
 """
 
+import math
 import re
 
 from .errors import FailureCode
@@ -120,7 +121,12 @@ def _safe_number(value, minimum=0):
     """Coerce to a non-negative number, or ``None``."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    if value != value or value in (float("inf"), float("-inf")):  # NaN / inf
+    # `isinstance(value, float)` first, deliberately: `math.isfinite` raises
+    # OverflowError on an int too large to convert to float, and this function
+    # is the boundary that sanitizes whatever a worker posted -- JSON carries
+    # arbitrarily large integers, and a sanitizer that can be made to raise is
+    # not one. Only a float can be NaN or infinite, so the guard costs nothing.
+    if isinstance(value, float) and not math.isfinite(value):  # NaN / inf
         return None
     return value if value >= minimum else None
 

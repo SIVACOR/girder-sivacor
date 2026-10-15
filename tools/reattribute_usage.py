@@ -275,7 +275,9 @@ def main(argv=None):
 
     at = None
     if args.at:
-        at = _as_utc(datetime.datetime.fromisoformat(args.at.replace("Z", "+00:00")))
+        # `fromisoformat` parses a trailing Z natively on 3.11+, and the
+        # project now declares a 3.12 floor.
+        at = _as_utc(datetime.datetime.fromisoformat(args.at))
 
     move = plan(db, args.login, args.reason, args.instance_hours, args.instances,
                 args.volume_gb, at)

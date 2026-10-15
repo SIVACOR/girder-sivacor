@@ -305,7 +305,7 @@ def test_record_outlives_a_user_deleted_submission(
 def test_record_outlives_the_retention_sweep(
     server, db, user, admin, submission_collection
 ):
-    job, folder = make_submission(user, submission_collection)
+    _job, folder = make_submission(user, submission_collection)
     assertStatusOk(post_record(server, admin, {"status": "completed"}))
 
     Setting().set(PluginSettings.RETENTION_DAYS, 0.0)

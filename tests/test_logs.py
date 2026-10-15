@@ -288,7 +288,7 @@ class TestDockerLogStreamerMethods:
 
         # Mock pubsub to raise an exception
         async def mock_listen():
-            raise Exception("Redis connection failed")
+            raise RuntimeError("Redis connection failed")
 
         mock_pubsub.listen.return_value = mock_listen()
         mock_pubsub.unsubscribe = AsyncMock()
@@ -372,6 +372,8 @@ if __name__ == "__main__":
     import sys
 
     result = subprocess.run(
-        [sys.executable, "-m", "pytest", __file__, "-v"], capture_output=False
+        [sys.executable, "-m", "pytest", __file__, "-v"],
+        capture_output=False,
+        check=False,
     )
     sys.exit(result.returncode)

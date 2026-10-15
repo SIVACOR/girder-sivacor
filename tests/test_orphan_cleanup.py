@@ -14,6 +14,7 @@ including getting the label filter wrong.
 import os
 import uuid
 
+import docker
 import pytest
 from pytest_girder.assertions import assertStatusOk
 
@@ -91,7 +92,7 @@ def test_sweep_kills_this_workers_orphans(docker_client, monkeypatch):
         reaped = reap_orphaned_containers()
 
         assert container.name in reaped
-        with pytest.raises(Exception):
+        with pytest.raises(docker.errors.NotFound):
             # Gone entirely, not merely stopped: a stopped container still holds
             # its writable layer and would confuse the next sweep.
             docker_client.containers.get(container.id)
@@ -227,7 +228,8 @@ def test_short_containers_are_still_sampled(docker_client, tmp_path, lifetime):
 
         assert collector.samples >= 1, f"no stats reading for a {lifetime}s container"
         assert os.path.isfile(path), "human-readable dockerstats file was not written"
-        rows = [ln for ln in open(path + ".csv").read().splitlines()[1:] if ln.strip()]
+        with open(path + ".csv") as fp:
+            rows = [ln for ln in fp.read().splitlines()[1:] if ln.strip()]
         assert len(rows) >= 1
     finally:
         container.remove(force=True)

@@ -2124,7 +2124,7 @@ class SIVACOR(Resource):
         creator_id = meta.get("creator_id")
         if not (creator_id and str(creator_id) == str(user["_id"])):
             raise AccessException(
-                "You do not have permission to delete '%s' submission." % folder["name"]
+                f"You do not have permission to delete '{folder['name']}' submission."
             )
         status = meta.get("status")
         if status == CANCELING:

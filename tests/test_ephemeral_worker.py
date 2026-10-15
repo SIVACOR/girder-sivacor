@@ -104,7 +104,7 @@ def test_private_queue_is_never_cancelled(monkeypatch, task):
 
     stop_accepting_submissions(app, task)
 
-    (queue,), kwargs = app.control.cancel_consumer.call_args
+    (queue,), _kwargs = app.control.cancel_consumer.call_args
     assert queue == DISPATCH_QUEUE
     assert not queue.startswith(f"{DISPATCH_QUEUE}.")
 
