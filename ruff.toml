@@ -1,0 +1,56 @@
+# Lint configuration. Read the note on `select` before adding one.
+#
+# Why this file exists: on 2026-10-15 `tox -e lint` reported 211 errors against
+# a tree nobody had touched. Nothing had regressed. `tox.ini` declared `deps =
+# ruff` with no version, and ruff 0.17.0 shipped a far wider default rule set
+# than 0.15 -- 407 rules against the classic 59. The project had never stated
+# which rules it wanted or which Python it targets, so both were whatever the
+# newest ruff happened to assume that week.
+#
+# Two things fix that, and both are needed: ruff is pinned in `tox.ini`, and the
+# floor is declared below. Neither alone is enough -- a pin with no declared
+# target still leaves `UP017` resting on a guess, and a target with no pin still
+# lets the next release change the rule set underneath it.
+
+# The real floor, stated at last. The Dockerfile runs `python:3.12-slim` and CI
+# tests 3.12 only; `setup.py` now says so too. This is what makes `UP017`
+# (`datetime.UTC`, 3.11+) a legitimate fix rather than a lucky one -- ruff was
+# previously inferring a floor nobody had written down.
+target-version = "py312"
+
+[lint]
+# **There is deliberately no `select`.** The adopted rule set is ruff's own
+# default for the pinned version, and the pin is what makes that a fixed thing
+# rather than a moving one.
+#
+# Spelling it out was considered and rejected: the default is not whole
+# families, it is a curated subset of 37 of them -- 2 of 18 `E` rules, 3 of 58
+# `S`, 2 of 35 `PTH`, 1 of 44 `D`. So `select = ["E", "F", "S", ...]` would be
+# much *wider* than what is enforced today, and the only faithful alternative is
+# a literal list of 407 codes, which nobody would read and nobody could
+# maintain. A list that cannot be read is not a statement of intent.
+#
+# If you want a rule that is off, add it to a `select` of its own; if you want
+# one off that is on, add it below with a reason.
+ignore = [
+    # --- the never-raise discipline, and it is load-bearing ----------------
+    #
+    # A heartbeat, a log flush, a cancel check and a usage write are all
+    # best-effort on purpose: a submission that is running fine must not be
+    # killed because one ping lost a race with a proxy restart. Three
+    # production incidents came from a remote call on the critical path that
+    # *did* raise -- 2026-09-06 (broker blip), 2026-09-18 (log flush 502),
+    # 2026-10-12 (image pull). The blind excepts are the fix for that class,
+    # not an instance of sloppiness, and every one of them logs.
+    #
+    # See `ProgressBeat.tick`, `CancelWatcher`, `usage.record_lifetime` and
+    # `usage.drain`, each of which argues for its own handler in a docstring.
+    "BLE001", # blind-except
+    "S110",   # try-except-pass
+]
+
+[lint.per-file-ignores]
+# The module is named for the language it tests, which is a capital R. Renaming
+# it to satisfy a naming rule would make the file harder to find and tell a
+# reader nothing.
+"tests/test_R.py" = ["N999"]
