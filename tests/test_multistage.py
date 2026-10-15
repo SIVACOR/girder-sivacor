@@ -51,6 +51,25 @@ def test_multistage_run(
     job = Job().load(job["_id"], force=True)
     assert job["status"] == JobStatus.SUCCESS
 
+    # #130: both images are fetched once, up front, before any stage runs --
+    # and the job log says how much room is left once they have landed. Asserted
+    # here rather than only against a mocked client, because this is the shape
+    # of the submission the front-loading was written for: several stages, more
+    # than one distinct image.
+    # `includeLog` is not the default: Job().load omits the field unless asked.
+    logged = Job().load(job["_id"], force=True, includeLog=True)
+    log = "".join(logged.get("log") or [])
+    assert "Fetching analysis image 1 of 2" in log
+    assert "Fetching analysis image 2 of 2" in log
+    assert "dataeditors/stata18_5-mp:2025-02-26" in log
+    assert "rocker/r-ver:4.3.1" in log
+    assert log.count("All analysis images are ready") == 1
+    assert "GiB free" in log
+    # The fetch finishes before the first stage begins.
+    assert log.index("All analysis images are ready") < log.index(
+        "Starting recorded run"
+    )
+
     # Get submission folder and verify metadata
     resp = get_submission_folder(server, user, job["_id"], submission_collection)
     assertStatusOk(resp)

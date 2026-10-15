@@ -1538,85 +1538,130 @@ def image_on_disk_estimate(cli, image_reference) -> tuple[int, str] | None:
     )
 
 
-def pull_space_shortfall(cli, submission, image_reference) -> str | None:
-    """Explain why ``image_reference`` cannot be pulled here, or ``None`` to proceed.
+#: How often to put a progress line in the job log while a long step runs.
+#: Deliberately much coarser than the heartbeat: each one is an updateJob, which
+#: fires ``jobs.job.update.after`` server-side, whereas the heartbeat writes
+#: straight to the collection.
+PROGRESS_LOG_INTERVAL = 120
 
-    **Why this exists as a separate check from** :func:`disk_shortfall`. That one
-    runs inside ``recorded_run``'s poll loop, which does not exist until a container
-    is running -- so a pull that exhausts the disk could never reach it, and
-    surfaced instead as ``IMAGE_PULL_FAILED`` naming the image. Four production
-    submissions failed that way on 2026-08-20/21, all of them ``>5GB`` packages
-    pulling a ~15 GB dynare image onto a 60 GB root disk already holding their
-    extracted workspace. The record said the image could not be fetched, which
-    reads as *our* registry problem and sent nobody to look at disk.
 
-    See ``development_notes/05_cinder_volumes_plan.md`` C0.1. The permanent
-    consequence of that misattribution: ``out_of_disk`` has never been recorded, so
-    any before/after comparison across this change has to read the *old* side as
-    ``image_pull_failed`` on large packages.
+def distinct_images(stages) -> list[str]:
+    """The ``image:tag`` references a submission needs, deduplicated, in order.
+
+    By reference and not by stage: a submission with eight stages and two
+    distinct images needs two pulls, and the whole point of front-loading is
+    that it stops asking the registry the same question eight times.
+
+    Order is first-appearance rather than sorted, so the job log reads in the
+    order the researcher wrote their workflow.
     """
-    estimate = image_on_disk_estimate(cli, image_reference)
-    if estimate is None:
-        return None
-    needed, how = estimate
+    seen = {}
+    for stage in stages or []:
+        reference = f"{stage['image_name']}:{stage['image_tag']}"
+        seen.setdefault(reference, None)
+    return list(seen)
+
+
+def image_set_shortfall(cli, submission, image_references) -> str | None:
+    """Explain why this submission's images cannot all be pulled here.
+
+    **Why this exists as a separate check from** :func:`disk_shortfall`. That
+    one runs inside ``recorded_run``'s poll loop, which does not exist until a
+    container is running -- so a pull that exhausts the disk could never reach
+    it, and surfaced instead as ``IMAGE_PULL_FAILED`` naming the image. Four
+    production submissions failed that way on 2026-08-20/21, all of them
+    ``>5GB`` packages pulling a ~15 GB dynare image onto a 60 GB root disk
+    already holding their extracted workspace. The record said the image could
+    not be fetched, which reads as *our* registry problem and sent nobody to
+    look at disk. See ``development_notes/05_cinder_volumes_plan.md`` C0.1. The
+    permanent consequence of that misattribution: ``out_of_disk`` had never been
+    recorded, so any before/after comparison across C0 has to read the *old*
+    side as ``image_pull_failed`` on large packages.
+
+    **The sum is what this adds over the per-image check it replaced.** Checking
+    one image at a time against free space *at that moment* passes a set that
+    never fitted: for a submission whose workspace shares the root filesystem --
+    most of them -- the workspace has grown by stage 6, so the free space a
+    later pull sees is smaller than what stage 1 saw. Four checks pass and the
+    fifth fails, for a reason that was knowable before the run started.
+
+    **An unknown family contributes nothing to the sum, which makes this a
+    lower bound.** :func:`image_on_disk_estimate` returns ``None`` for a family
+    it has no recorded size for, on purpose, and the two ways to be wrong are
+    not symmetric: guessing high refuses a pull that would have fitted, which
+    the researcher experiences as being wrongly told their package is too big
+    and has no way to disprove. Guessing low leaves the pull to fail as it does
+    today, which :func:`_is_out_of_space` labels correctly anyway. So an unknown
+    image makes this check quieter, never louder -- a submission with one still
+    runs, exactly as it does per-stage today.
+
+    Returns ``None`` to proceed, including when nothing could be established.
+    """
+    needed = 0
+    bases = []
+    for reference in image_references:
+        estimate = image_on_disk_estimate(cli, reference)
+        if estimate is None:
+            logger.info(
+                "No recorded size for %s, so it is left out of the pre-check sum",
+                reference,
+            )
+            continue
+        size, how = estimate
+        if not size:
+            continue  # already present locally; costs nothing to "pull"
+        needed += size
+        bases.append(f"{reference} ({how})")
     if not needed:
         return None
 
-    # **The image lands where the image store is, not where the workspace is**,
-    # and on a volume-backed submission those are different filesystems. Checking
-    # the workspace there would read the volume's free space -- large and nearly
-    # empty -- and clear a pull that has to fit on the root disk. That blindness
-    # would only show up for exactly the submissions this feature exists for, and
-    # first on a multi-stage one: each stage pulls its own image onto the same
-    # per-VM store. See open item 3 of 05_cinder_volumes_plan.md.
+    # **The images land where the image store is, not where the workspace is**,
+    # and on a volume-backed submission those are different filesystems.
+    # Checking the workspace there would read the volume's free space -- large
+    # and nearly empty -- and clear a set that has to fit on the root disk.
+    # That blindness would only show up for exactly the submissions the volume
+    # feature exists for. See open item 3 of 05_cinder_volumes_plan.md.
     workspace = submission.get("workspace_dir") or "/tmp"
     shared = not workspace_has_own_filesystem(workspace)
     measured = workspace if shared else IMAGE_STORE_PATH
     try:
         free = shutil.disk_usage(measured).free
     except OSError:
-        logger.warning(
-            "Could not determine free space for %s", measured, exc_info=True
-        )
+        logger.warning("Could not determine free space for %s", measured, exc_info=True)
         return None
 
-    # On a shared filesystem the floor is part of what the pull must leave
-    # behind: filling the disk to within a byte of it only moves the same failure
-    # to the first thing the analysis writes. On a volume-backed run the floor
-    # belongs to the *other* filesystem, where disk_shortfall guards it, so
-    # requiring it here would refuse pulls that fit.
     floor = disk_floor_bytes(submission) if shared else 0
-    required = needed + floor
-    if free >= required:
+    if free >= needed + floor:
         return None
+
+    # The message names the sum and then its parts. One image's figure alone
+    # would be the wrong number to act on -- it is the total that does not fit,
+    # and a researcher told only about the largest image would shrink the wrong
+    # thing.
+    detail = "; ".join(bases)
+    head = (
+        f"Not enough disk space for this submission's analysis images: "
+        f"{free / 1024**3:.1f} GiB free, but the {len(bases)} image(s) it uses "
+        f"need about {needed / 1024**3:.1f} GiB together"
+    )
     if shared:
         return (
-            f"Not enough disk space to pull {image_reference}: "
-            f"{free / 1024**3:.1f} GiB free on the workspace filesystem, but the image "
-            f"needs about {needed / 1024**3:.1f} GiB ({how}) plus a "
-            f"{floor / 1024**3:.1f} GiB working reserve. The replication "
-            "package, its outputs and the analysis image all share this worker's disk, "
-            "and together they do not fit. Reduce the size of the package -- or, if this "
-            "work genuinely needs more room than one worker has, contact "
-            "support@sivacor.org about extra scratch disk."
+            f"{head} plus a {floor / 1024**3:.1f} GiB working reserve, on the "
+            f"workspace filesystem. Sizes: {detail}. The replication package, "
+            "its outputs and the analysis images all share this worker's disk, "
+            "and together they do not fit. Reduce the size of the package -- "
+            "or, if this work genuinely needs more room than one worker has, "
+            "contact support@sivacor.org about extra scratch disk."
         )
     # The scratch volume is not the constraint here and the package is not the
-    # problem, so neither is mentioned: the software image alone does not fit the
+    # problem, so neither is mentioned: the software images alone do not fit the
     # worker's own disk, which is nothing the researcher can act on.
     return (
-        f"Not enough disk space to pull {image_reference}: "
-        f"{free / 1024**3:.1f} GiB free on the worker's own disk, but the image needs "
-        f"about {needed / 1024**3:.1f} GiB ({how}). Your extra scratch disk holds the "
-        "replication package and is not what is short -- the software image is "
-        "unpacked onto the worker itself. Please contact support@sivacor.org."
+        f"{head}, on the worker's own disk. Sizes: {detail}. Your extra scratch "
+        "disk holds the replication package and is not what is short -- the "
+        "software images are unpacked onto the worker itself. Please contact "
+        "support@sivacor.org."
     )
-
-
-#: How often to put a progress line in the job log while a long step runs.
-#: Deliberately much coarser than the heartbeat: each one is an updateJob, which
-#: fires ``jobs.job.update.after`` server-side, whereas the heartbeat writes
-#: straight to the collection.
-PROGRESS_LOG_INTERVAL = 120
 
 
 class ProgressBeat:
@@ -1762,7 +1807,7 @@ def _pull_failure(image_reference, error_text) -> SubmissionError:
     **Disk is tested first, and that order is the whole point.** A daemon error
     that is really ENOSPC must report ``OUT_OF_DISK``; calling it a registry
     problem is exactly the misattribution C0.1 was written to end (see
-    :func:`pull_space_shortfall`), and it would be a poor trade to close that
+    :func:`image_set_shortfall`), and it would be a poor trade to close that
     door and reopen it as a window.
 
     Both ways a pull can fail come through here -- an event carrying ``error``
@@ -1842,7 +1887,7 @@ def _attempt_pull(cli, beat, image_reference, layers):
     return None
 
 
-def pull_image(cli, api, submission, image_reference):
+def pull_image(cli, api, submission, image_reference, beat=None):
     """Pull an image while keeping the submission visibly alive.
 
     ``images.pull()`` blocks and emits nothing. Analysis images are pulled on
@@ -1898,25 +1943,29 @@ def pull_image(cli, api, submission, image_reference):
     failure took 7.9 s -- stays under 80 s of silence. The constraint survives
     intact, which is worth more than three extra attempts.
 
-    *Cancellation is not observed during a pull, and the retry widens that
-    window.* :class:`CancelWatcher` is consulted every ``CHECKIN_INTERVAL``
-    while a container runs, and a pull has no container -- so a cancel pressed
-    during one is not acted on until it finishes, both before this change and
-    after. The window grows by at most the retry budget. Left as a known gap
-    rather than fixed here: threading a watcher through the pull is the same
-    work whether or not there is a retry, it belongs with #130 where the pull
-    moves and grows, and doing it here would mean a second cancellation path
-    with its own races beside the one that already exists.
+    *Cancellation is not observed inside a single pull.*
+    :class:`CancelWatcher` is consulted every ``CHECKIN_INTERVAL`` while a
+    container runs, and a pull has no container, so a cancel pressed during one
+    is not acted on until that image finishes. :func:`prefetch_images` closes
+    most of the window by polling *between* images; what is left is one image's
+    pull, which is the irreducible part without teaching the docker client to
+    abort a transfer.
+
+    ``beat`` lets a caller supply its own :class:`ProgressBeat` so that a run of
+    pulls shares one. :func:`prefetch_images` does that: a sequence of fast
+    no-op pulls followed by a slow one must not lose its liveness between them,
+    and a fresh beat per image restarts the interval each time.
     """
     job_id = submission["job_id"]
     layers = set()
-    beat = ProgressBeat(
-        api,
-        job_id,
-        log_message=lambda: (
-            f"Still pulling {image_reference} ({len(layers)} layers seen)"
-        ),
-    )
+    if beat is None:
+        beat = ProgressBeat(
+            api,
+            job_id,
+            log_message=lambda: (
+                f"Still pulling {image_reference} ({len(layers)} layers seen)"
+            ),
+        )
 
     attempts = len(PULL_RETRY_BACKOFF) + 1
     for attempt in range(1, attempts + 1):
@@ -1973,6 +2022,132 @@ def pull_image(cli, api, submission, image_reference):
             delay,
         )
         time.sleep(delay)
+
+
+def assert_image_present(cli, image_reference):
+    """Fail legibly if an image fetched before the run has gone missing.
+
+    Every image is pulled once up front, so by the time a stage runs this is
+    expected to be free and silent. It is here for the case where it is not --
+    an operator pruning a busy worker, a daemon restart that loses the store --
+    because the alternative is an ``ImageNotFound`` raised out of
+    ``containers.create``, which points nowhere near the cause.
+
+    ``IMAGE_PULL_FAILED`` rather than a code of its own: the detail validator
+    already accepts an image reference, the researcher's situation is identical
+    (an image we were supposed to supply is not there), and a new permanent
+    enum member for a case nobody has yet observed is not worth the telemetry
+    churn. The message is what distinguishes it, and the message says the image
+    was fetched and then vanished.
+    """
+    try:
+        cli.images.get(image_reference)
+    except docker.errors.ImageNotFound as exc:
+        raise SubmissionError(
+            FailureCode.IMAGE_PULL_FAILED,
+            f"The analysis image {image_reference} was fetched successfully "
+            "before this run started but is no longer on the worker. This is a "
+            "problem with our infrastructure, not with your replication "
+            "package.",
+            detail=image_reference,
+        ) from exc
+
+
+def prefetch_images(cli, api, submission, checkin=None) -> bool:
+    """Fetch every image this submission needs, once, before any stage runs.
+
+    Returns ``False`` if the submission was cancelled part way through, in
+    which case the caller abandons the chain; ``True`` once every image is on
+    the worker.
+
+    **Why this is not done lazily per stage.** On 2026-10-12 a production
+    submission ran 50 h 39 m, completed 4 of 8 stages with every one exit 0,
+    and died 7.9 s into stage 5 when the worker's docker daemon could not
+    resolve ``registry-1.docker.io``. The image was already on that worker,
+    pulled for stages 1 and 3, so the best possible outcome of the manifest
+    ``HEAD`` that ended the run was *"up to date"*. There is no resume -- a TRO
+    certifies one supervised in-situ execution -- so a failure's cost is the
+    run's full elapsed time, which makes *where in the run a failure can occur*
+    a design parameter rather than an implementation detail.
+
+    Three things follow from doing it here:
+
+    * a registry or DNS failure lands at minute zero, where it costs seconds
+      rather than 199.9 CPU-hours;
+    * the disk pre-check becomes a sum computed once, against the free space
+      that actually exists before the workspace has grown -- see
+      :func:`image_set_shortfall`;
+    * each stage's recorded ``ImageRepoDigests`` is identical **by
+      construction**. ``rocker`` and ``dataeditors`` tags are mutable upstream,
+      unlike the immutable-tag discipline SIVACOR holds itself to for its own
+      images (10-D11), and re-pulling before each stage is the only thing that
+      can make two stages of one run record different digests for the same
+      declared image.
+
+    The pull stays inside the supervised run; it moves earlier, not outside, so
+    nothing about what the TRS warrants changes.
+
+    ``checkin`` is consulted **between** images, which is as much of the
+    cancellation gap as can be closed without teaching docker to abort a
+    transfer in flight. Front-loading makes that gap matter more than it did --
+    every image is fetched in one uninterrupted run rather than one per stage --
+    so a cancel pressed during a cold two-image fetch now waits for at most one
+    image instead of all of them.
+    """
+    job_id = submission["job_id"]
+    references = distinct_images(submission.get("stages"))
+    if not references:
+        return True
+
+    if shortfall := image_set_shortfall(cli, submission, references):
+        raise SubmissionError(FailureCode.OUT_OF_DISK, shortfall)
+
+    total = len(references)
+    # One beat for the whole run of pulls, not one per image: a fresh beat
+    # restarts its interval, so a sequence of fast no-op pulls followed by a
+    # slow one would reset the clock just before the only part that needs it.
+    progress = {"index": 0, "reference": None}
+    beat = ProgressBeat(
+        api,
+        job_id,
+        log_message=lambda: (
+            f"Still fetching analysis images "
+            f"({progress['index']} of {total}: {progress['reference']})"
+        ),
+    )
+
+    for index, reference in enumerate(references, start=1):
+        if checkin is not None and checkin.poll():
+            _note(api, job_id, "Cancelled while fetching analysis images.")
+            return False
+        progress["index"] = index
+        progress["reference"] = reference
+        _note(api, job_id, f"Fetching analysis image {index} of {total}: {reference}")
+        pull_image(cli, api, submission, reference, beat=beat)
+
+    _note(api, job_id, _free_space_note(submission))
+    return True
+
+
+def _free_space_note(submission) -> str:
+    """One line saying what is left after the images have landed.
+
+    Asked for on #130 by the AEA side, and it is the figure an operator wants
+    when a later stage runs out anyway: it says whether the images or the
+    researcher's own outputs were what filled the disk.
+    """
+    workspace = submission.get("workspace_dir") or "/tmp"
+    shared = not workspace_has_own_filesystem(workspace)
+    measured = workspace if shared else IMAGE_STORE_PATH
+    try:
+        free = shutil.disk_usage(measured).free
+    except OSError:
+        return "All analysis images are ready."
+    where = "the workspace filesystem" if shared else "the worker's own disk"
+    return (
+        f"All analysis images are ready. {free / 1024**3:.1f} GiB free on "
+        f"{where}."
+    )
 
 
 def recorded_run(api, submission, stage, env_vars):
@@ -2100,12 +2275,14 @@ def recorded_run(api, submission, stage, env_vars):
             )
         )
 
-    # Before the pull, not during it: a pull that exhausts the disk cannot reach
-    # disk_shortfall() below, because that only runs once a container exists. C0.1.
-    if shortfall := pull_space_shortfall(cli, submission, image_reference):
-        raise SubmissionError(FailureCode.OUT_OF_DISK, shortfall)
-
-    pull_image(cli, api, submission, image_reference)
+    # No pull here any more. Every image this submission needs was fetched once
+    # by prefetch_images before stage 1, and the disk was checked against the
+    # *sum* of them at the same time -- see that function for why the lazy
+    # per-stage pull this replaced put a registry round trip on the critical
+    # path 50 hours into a run. All that is left is the cheap local assertion,
+    # so an image that vanished between the fetch and now says so plainly
+    # instead of surfacing as an ImageNotFound out of containers.create.
+    assert_image_present(cli, image_reference)
 
     entrypoint, command, sub_dir, home_dir = _infer_run_command(submission, stage)
     project_dir = get_project_dir(submission)

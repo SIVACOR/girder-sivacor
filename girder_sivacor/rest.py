@@ -37,6 +37,7 @@ from .worker_plugin.routing import DISPATCH_QUEUE, instance_id_of
 from .worker_plugin.run_submission import (
     create_workspace,
     execute_workflow,
+    fetch_images,
     finalize_job,
     prepare_submission,
     prune_workspace,
@@ -657,6 +658,12 @@ def build_submission_chain(job, file, stages, secrets):
         f"Moving {file['name']} to submission collection",
     )
     workflow |= step(create_workspace.s(), "Create Workspace")
+    # Every distinct image, once, before any stage runs -- and before the
+    # initial arrangement, because hashing the whole workspace is real work and
+    # there is no reason to do it for a submission whose images cannot be
+    # fetched. Pulling touches no workspace file, so the TRO is unaffected by
+    # the order. See lib.prefetch_images for why this is not lazy per stage.
+    workflow |= step(fetch_images.s(), "Fetch Analysis Images")
     workflow |= step(run_tro.s("add_arrangement", 0, None), "Record initial arrangement")
     # One stage, one performance, one before/after pair -- so the stage index is
     # also the arrangement number, and nothing here decides to insert a step the

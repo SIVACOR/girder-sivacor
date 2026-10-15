@@ -25,11 +25,14 @@ from girder_sivacor.worker_plugin.lib import (
     HEARTBEAT_INTERVAL,
     PULL_RETRY_BACKOFF,
     _is_out_of_space,
+    assert_image_present,
     disk_floor_bytes,
     disk_shortfall,
+    distinct_images,
     image_on_disk_estimate,
+    image_set_shortfall,
+    prefetch_images,
     pull_image,
-    pull_space_shortfall,
     workspace_has_own_filesystem,
 )
 
@@ -731,7 +734,7 @@ def test_the_pull_is_refused_up_front_when_the_image_cannot_fit():
     with mock.patch(
         "girder_sivacor.worker_plugin.lib.shutil.disk_usage", return_value=usage
     ):
-        msg = pull_space_shortfall(cli, {"workspace_dir": "/tmp/w"}, DYNARE)
+        msg = image_set_shortfall(cli, {"workspace_dir": "/tmp/w"}, [DYNARE])
 
     assert msg is not None
     assert DYNARE in msg
@@ -756,7 +759,7 @@ def test_a_pull_that_fits_is_not_pre_empted():
     with mock.patch(
         "girder_sivacor.worker_plugin.lib.shutil.disk_usage", return_value=usage
     ):
-        assert pull_space_shortfall(cli, {"workspace_dir": "/tmp/w"}, DYNARE) is None
+        assert image_set_shortfall(cli, {"workspace_dir": "/tmp/w"}, [DYNARE]) is None
 
 
 def test_an_image_already_on_the_worker_needs_no_room():
@@ -770,7 +773,7 @@ def test_an_image_already_on_the_worker_needs_no_room():
     with mock.patch(
         "girder_sivacor.worker_plugin.lib.shutil.disk_usage", return_value=usage
     ):
-        assert pull_space_shortfall(cli, {"workspace_dir": "/tmp/w"}, DYNARE) is None
+        assert image_set_shortfall(cli, {"workspace_dir": "/tmp/w"}, [DYNARE]) is None
     assert image_on_disk_estimate(cli, DYNARE) == (0, "already present locally")
 
 
@@ -788,7 +791,7 @@ def test_an_unknown_image_family_is_never_pre_judged():
     with mock.patch(
         "girder_sivacor.worker_plugin.lib.shutil.disk_usage", return_value=usage
     ):
-        assert pull_space_shortfall(cli, {"workspace_dir": "/tmp/w"}, "who/what:1") is None
+        assert image_set_shortfall(cli, {"workspace_dir": "/tmp/w"}, ["who/what:1"]) is None
 
 
 def test_the_dynare_estimate_matches_the_measured_footprint():
@@ -828,7 +831,7 @@ def test_the_preflight_check_never_fails_a_run_by_itself():
         "girder_sivacor.worker_plugin.lib.shutil.disk_usage",
         side_effect=OSError("stale NFS handle"),
     ):
-        assert pull_space_shortfall(cli, {"workspace_dir": "/tmp/w"}, DYNARE) is None
+        assert image_set_shortfall(cli, {"workspace_dir": "/tmp/w"}, [DYNARE]) is None
 
     # ...including when the local-image probe itself is what breaks.
     broken = mock.MagicMock()
@@ -924,7 +927,7 @@ def test_the_preflight_check_measures_where_the_image_actually_lands():
         volume_free=80 * 1024**3, root_free=4 * 1024**3, volume_total=100 * 1024**3
     )
     with own_fs, usage:
-        msg = pull_space_shortfall(cli, {"workspace_dir": "/home/ubuntu/volumes/tmp"}, DYNARE)
+        msg = image_set_shortfall(cli, {"workspace_dir": "/home/ubuntu/volumes/tmp"}, [DYNARE])
 
     assert msg is not None, "the pull cannot fit the disk it is actually going to"
     assert "worker's own disk" in msg
@@ -951,7 +954,7 @@ def test_a_pull_is_not_charged_the_workspace_floor_on_another_filesystem():
     own_fs, usage = _split_filesystems(volume_free=1 * 1024**3, root_free=30 * 1024**3)
     with own_fs, usage:
         assert (
-            pull_space_shortfall(cli, {"workspace_dir": "/home/ubuntu/volumes/tmp"}, DYNARE)
+            image_set_shortfall(cli, {"workspace_dir": "/home/ubuntu/volumes/tmp"}, [DYNARE])
             is None
         )
 
@@ -1051,3 +1054,275 @@ def test_the_family_entry_is_the_largest_image_in_that_family():
     assert stata_needed >= 2.68 * 1024**3, stata_needed / 1024**3
     dynare_needed, _ = image_on_disk_estimate(_cold_client(), DYNARE)
     assert dynare_needed >= 21.0 * 1024**3, dynare_needed / 1024**3
+
+
+# --- front-loading the pull (#130) -----------------------------------------
+#
+# Every distinct image once, before stage 1, instead of lazily before each
+# stage. There is no resume, so a failure's cost is the run's full elapsed
+# time -- which makes *where in the run a failure can occur* a design
+# parameter. On 2026-10-12 it was hour fifty; it is now minute zero.
+
+
+def _stage(image, tag, main_file="a.do"):
+    return {"image_name": image, "image_tag": tag, "main_file": main_file}
+
+
+def test_eight_stages_on_two_images_resolve_to_two_pulls():
+    """The shape of the submission that died: 8 stages, 2 distinct images."""
+    stages = [
+        _stage("rocker/geospatial", "4.4.2"),
+        _stage("dataeditors/stata19_5-mp", "2026-04-15"),
+    ] * 4
+
+    assert distinct_images(stages) == [
+        "rocker/geospatial:4.4.2",
+        "dataeditors/stata19_5-mp:2026-04-15",
+    ]
+
+
+def test_images_are_listed_in_the_order_the_workflow_names_them():
+    """First appearance, not sorted: the job log should read in the order the
+    researcher wrote their stages."""
+    stages = [_stage("z/z", "1"), _stage("a/a", "1"), _stage("z/z", "1")]
+
+    assert distinct_images(stages) == ["z/z:1", "a/a:1"]
+
+
+def test_a_submission_with_no_stages_needs_no_images():
+    assert distinct_images([]) == []
+    assert distinct_images(None) == []
+
+
+def test_every_image_is_fetched_once_before_any_stage_runs():
+    cli = mock.MagicMock()
+    cli.api.pull.side_effect = lambda *a, **k: iter(_pull_events(2))
+    submission = {
+        "job_id": "job-1",
+        "workspace_dir": "/tmp/w",
+        "stages": [_stage("rocker/r-ver", "4.6.1"), _stage("rocker/r-ver", "4.6.1")],
+    }
+
+    with mock.patch(
+        "girder_sivacor.worker_plugin.lib.shutil.disk_usage",
+        return_value=mock.MagicMock(free=60 * 1024**3),
+    ):
+        assert prefetch_images(cli, mock.MagicMock(), submission) is True
+
+    assert cli.api.pull.call_count == 1
+
+
+def test_the_disk_check_is_a_sum_rather_than_one_image_at_a_time():
+    """Two images that each fit, and together do not.
+
+    This is the case the per-stage check could never see: it compared one image
+    against the free space *at that moment*, so a set that never fitted passed
+    four checks and failed the fifth -- for a reason knowable before the run
+    started.
+    """
+    cli = _cold_client()
+    # ~21.6 GiB each at 6.3 GiB compressed x 3.5. One fits in 30 GiB; two do not.
+    usage = mock.MagicMock(free=30 * 1024**3)
+    with mock.patch(
+        "girder_sivacor.worker_plugin.lib.shutil.disk_usage", return_value=usage
+    ):
+        one = image_set_shortfall(cli, {"workspace_dir": "/tmp/w"}, [DYNARE])
+        both = image_set_shortfall(
+            cli, {"workspace_dir": "/tmp/w"}, [DYNARE, "dynare/dynare:5.5-R2023a"]
+        )
+
+    assert one is None
+    assert both is not None
+    assert "2 image(s)" in both
+
+
+def test_the_shortfall_message_names_the_total_and_its_parts():
+    """A researcher told only about the largest image would shrink the wrong
+    thing: it is the total that does not fit."""
+    cli = _cold_client()
+    with mock.patch(
+        "girder_sivacor.worker_plugin.lib.shutil.disk_usage",
+        return_value=mock.MagicMock(free=4 * 1024**3),
+    ):
+        msg = image_set_shortfall(
+            cli, {"workspace_dir": "/tmp/w"}, [DYNARE, "rocker/geospatial:4.4.2"]
+        )
+
+    assert "together" in msg
+    assert DYNARE in msg and "rocker/geospatial:4.4.2" in msg
+    # Still an estimate, and still says what it rests on.
+    assert "compressed" in msg and "about" in msg
+    # The remedy survived the move from the per-image check.
+    assert "support@sivacor.org" in msg
+
+
+def test_an_unknown_family_makes_the_sum_quieter_never_louder():
+    """It contributes nothing, so the check can only under-estimate.
+
+    Guessing high refuses a pull that would have fitted and tells a researcher
+    something untrue about their package that they cannot disprove. A
+    submission with one unknown-family image still runs, exactly as it did
+    per-stage.
+    """
+    cli = _cold_client()
+    with mock.patch(
+        "girder_sivacor.worker_plugin.lib.shutil.disk_usage",
+        return_value=mock.MagicMock(free=1024),
+    ):
+        assert image_set_shortfall(cli, {"workspace_dir": "/tmp/w"}, ["who/what:1"]) is None
+        # ...and a known one beside it is still judged on its own figure.
+        assert (
+            image_set_shortfall(cli, {"workspace_dir": "/tmp/w"}, ["who/what:1", DYNARE])
+            is not None
+        )
+
+
+def test_a_set_that_cannot_fit_is_refused_before_a_single_byte_is_pulled():
+    cli = _cold_client()
+    submission = {
+        "job_id": "job-1",
+        "workspace_dir": "/tmp/w",
+        "stages": [_stage("dynare/dynare", "6.1-R2024a")],
+    }
+
+    with mock.patch(
+        "girder_sivacor.worker_plugin.lib.shutil.disk_usage",
+        return_value=mock.MagicMock(free=4 * 1024**3),
+    ), pytest.raises(SubmissionError) as exc:
+        prefetch_images(cli, mock.MagicMock(), submission)
+
+    assert exc.value.code is FailureCode.OUT_OF_DISK
+    cli.api.pull.assert_not_called()
+
+
+def test_a_tag_that_does_not_exist_fails_before_stage_one():
+    """Strictly better for the researcher than finding out at hour fifty."""
+    cli = mock.MagicMock()
+    cli.images.get.side_effect = docker.errors.ImageNotFound("x")
+    cli.api.pull.side_effect = _pull_sequence(
+        _pull_events(1, error="manifest for rocker/r-ver:9.9.9 not found: manifest unknown")
+    )
+    submission = {
+        "job_id": "job-1",
+        "workspace_dir": "/tmp/w",
+        "stages": [_stage("rocker/r-ver", "9.9.9")],
+    }
+
+    with mock.patch(
+        "girder_sivacor.worker_plugin.lib.shutil.disk_usage",
+        return_value=mock.MagicMock(free=60 * 1024**3),
+    ), pytest.raises(SubmissionError) as exc:
+        prefetch_images(cli, mock.MagicMock(), submission)
+
+    assert exc.value.code is FailureCode.IMAGE_PULL_FAILED
+
+
+def test_a_cancel_between_images_stops_the_fetch():
+    """#130 polls the watcher between images -- the most of the cancellation
+    gap that can be closed without teaching docker to abort a transfer."""
+    cli = mock.MagicMock()
+    cli.api.pull.side_effect = lambda *a, **k: iter(_pull_events(1))
+    checkin = mock.MagicMock()
+    checkin.poll.side_effect = [False, True]  # cancelled before the second image
+    submission = {
+        "job_id": "job-1",
+        "workspace_dir": "/tmp/w",
+        "stages": [_stage("rocker/r-ver", "4.6.1"), _stage("dynare/dynare", "6.1-R2024a")],
+    }
+
+    with mock.patch(
+        "girder_sivacor.worker_plugin.lib.shutil.disk_usage",
+        return_value=mock.MagicMock(free=200 * 1024**3),
+    ):
+        assert prefetch_images(cli, mock.MagicMock(), submission, checkin) is False
+
+    assert cli.api.pull.call_count == 1
+
+
+def test_a_cancel_before_the_first_image_pulls_nothing():
+    cli = mock.MagicMock()
+    checkin = mock.MagicMock()
+    checkin.poll.return_value = True
+    submission = {
+        "job_id": "job-1",
+        "workspace_dir": "/tmp/w",
+        "stages": [_stage("rocker/r-ver", "4.6.1")],
+    }
+
+    with mock.patch(
+        "girder_sivacor.worker_plugin.lib.shutil.disk_usage",
+        return_value=mock.MagicMock(free=200 * 1024**3),
+    ):
+        assert prefetch_images(cli, mock.MagicMock(), submission, checkin) is False
+
+    cli.api.pull.assert_not_called()
+
+
+def test_one_beat_covers_the_whole_fetch_rather_than_one_per_image():
+    """A sequence of fast no-op pulls followed by a slow one must not lose its
+    liveness between them; a fresh beat per image restarts the interval."""
+    cli = mock.MagicMock()
+    cli.api.pull.side_effect = lambda *a, **k: iter(_pull_events(1))
+    submission = {
+        "job_id": "job-1",
+        "workspace_dir": "/tmp/w",
+        "stages": [_stage("rocker/r-ver", "4.6.1"), _stage("dynare/dynare", "6.1-R2024a")],
+    }
+
+    with mock.patch(
+        "girder_sivacor.worker_plugin.lib.shutil.disk_usage",
+        return_value=mock.MagicMock(free=200 * 1024**3),
+    ), mock.patch("girder_sivacor.worker_plugin.lib.ProgressBeat") as beat:
+        prefetch_images(cli, mock.MagicMock(), submission)
+
+    assert beat.call_count == 1
+
+
+def test_the_job_log_reports_the_space_left_once_the_images_have_landed():
+    """Asked for on #130: the figure that says whether the images or the
+    researcher's own outputs were what filled the disk."""
+    cli = mock.MagicMock()
+    cli.api.pull.side_effect = lambda *a, **k: iter(_pull_events(1))
+    api = mock.MagicMock()
+    submission = {
+        "job_id": "job-1",
+        "workspace_dir": "/tmp/w",
+        "stages": [_stage("rocker/r-ver", "4.6.1")],
+    }
+
+    with mock.patch(
+        "girder_sivacor.worker_plugin.lib.shutil.disk_usage",
+        return_value=mock.MagicMock(free=23.7 * 1024**3),
+    ):
+        prefetch_images(cli, api, submission)
+
+    written = [str(call.kwargs.get("log", "")) for call in api.update_job.call_args_list]
+    final = [line for line in written if "All analysis images are ready" in line]
+    assert len(final) == 1
+    assert "23.7 GiB free" in final[0]
+
+
+def test_an_image_that_vanished_mid_run_says_so_plainly():
+    """The per-stage assertion that replaced the per-stage pull. Without it the
+    symptom is an ImageNotFound out of containers.create, which points nowhere
+    near the cause."""
+    cli = mock.MagicMock()
+    cli.images.get.side_effect = docker.errors.ImageNotFound(IMAGE)
+
+    with pytest.raises(SubmissionError) as exc:
+        assert_image_present(cli, IMAGE)
+
+    assert exc.value.code is FailureCode.IMAGE_PULL_FAILED
+    assert exc.value.detail == IMAGE
+    assert "no longer on the worker" in str(exc.value)
+    assert "not with your replication package" in str(exc.value)
+
+
+def test_a_present_image_costs_one_local_call_and_says_nothing():
+    """The common case, run once per stage: free and silent."""
+    cli = mock.MagicMock()
+
+    assert_image_present(cli, IMAGE)
+
+    cli.images.get.assert_called_once_with(IMAGE)
+    cli.api.pull.assert_not_called()
