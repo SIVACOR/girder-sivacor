@@ -31,8 +31,8 @@ class ORCID(ProviderBase):
         clientId = Setting().get(PluginSettings.ORCID_CLIENT_ID)
 
         if clientId is None:
-            # noqa-ed rather than changed: girder_oauth's own providers raise a
-            # bare Exception here, and swapping in a RestException would change
+            # Suppressed rather than changed: girder_oauth's own providers raise
+            # a bare Exception here, and swapping in a RestException would change
             # what a misconfigured deployment returns from the OAuth flow. That
             # is an auth-behaviour decision, not a lint fix.
             raise Exception("No ORCID client ID setting is present.")  # noqa: TRY002
