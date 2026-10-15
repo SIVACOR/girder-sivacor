@@ -23,6 +23,7 @@ from girder_sivacor.worker_plugin.lib import (
     _IMAGE_FAMILY_COMPRESSED_GB,
     DISK_FLOOR_BYTES,
     HEARTBEAT_INTERVAL,
+    PULL_RETRY_BACKOFF,
     _is_out_of_space,
     disk_floor_bytes,
     disk_shortfall,
@@ -33,6 +34,38 @@ from girder_sivacor.worker_plugin.lib import (
 )
 
 IMAGE = "dataeditors/stata19_5-mp:2026-04-15"
+
+
+@pytest.fixture(autouse=True)
+def slept():
+    """Record the retry backoff instead of serving it.
+
+    Without this the failure tests really do sleep the budget: this file went
+    from 2.6 s to 3 min 21 s the moment the retry landed, because every
+    transient-failure test now waits 50 s for nothing. The recorded calls are
+    also what the budget assertions below read, so the fixture is a probe as
+    much as it is a speed-up.
+    """
+    with mock.patch("girder_sivacor.worker_plugin.lib.time.sleep") as patched:
+        yield patched
+
+
+def _pull_sequence(*outcomes):
+    """A `cli.api.pull` that behaves differently on successive attempts.
+
+    Each outcome is either a list of events to yield or an exception to raise.
+    Like the real one, an exception surfaces when the generator is iterated
+    rather than when it is called.
+    """
+    remaining = iter(outcomes)
+
+    def stream(*_args, **_kwargs):
+        outcome = next(remaining)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        yield from outcome
+
+    return stream
 
 
 def _pull_events(n, error=None):
@@ -294,6 +327,230 @@ def test_a_docker_py_bug_is_still_recorded_as_a_defect():
         pull_image(cli, mock.MagicMock(), {"job_id": "job-1"}, IMAGE)
 
     assert classify(exc.value) == (FailureCode.UNEXPECTED, "DockerException")
+
+
+# --- retry (#127) ----------------------------------------------------------
+#
+# There is no resume: a TRO certifies one supervised in-situ execution, so a
+# pull that dies at stage 5 throws away stages 1-4 with it. Prevention is the
+# only lever, which is why the default here is to retry and the exceptions are
+# named one by one rather than the other way round.
+
+
+def test_a_transient_failure_is_retried_and_the_run_survives():
+    """The 2026-10-12 case, had this existed: one failed DNS lookup 7.9 s into
+    stage 5 of a 50 h 39 m run, against an image already on the worker."""
+    cli = mock.MagicMock()
+    cli.api.pull.side_effect = _pull_sequence(
+        _api_error(500, "dial tcp: lookup registry-1.docker.io: server misbehaving"),
+        _pull_events(3),
+    )
+    api = mock.MagicMock()
+
+    pull_image(cli, api, {"job_id": "job-1"}, IMAGE)  # must not raise
+
+    assert cli.api.pull.call_count == 2
+
+
+def test_a_retried_pull_says_so_in_the_job_log():
+    """A pull that silently took three tries is a registry problem nobody will
+    ever investigate."""
+    cli = mock.MagicMock()
+    cli.api.pull.side_effect = _pull_sequence(
+        _api_error(500, "server misbehaving"),
+        _api_error(500, "server misbehaving"),
+        _pull_events(2),
+    )
+    api = mock.MagicMock()
+
+    pull_image(cli, api, {"job_id": "job-1"}, IMAGE)
+
+    written = " ".join(
+        str(call.kwargs.get("log", "")) for call in api.update_job.call_args_list
+    )
+    assert "retrying" in written
+    assert "attempt 3 of" in written  # the success line names which attempt won
+
+
+def test_the_backoff_grows_and_is_served_in_order(slept):
+    cli = mock.MagicMock()
+    cli.api.pull.side_effect = _pull_sequence(
+        *[_api_error(500, "server misbehaving")] * 3, _pull_events(1)
+    )
+
+    pull_image(cli, mock.MagicMock(), {"job_id": "job-1"}, IMAGE)
+
+    assert [call.args[0] for call in slept.call_args_list] == list(
+        PULL_RETRY_BACKOFF
+    )
+
+
+def test_a_pull_that_never_recovers_fails_after_a_bounded_number_of_attempts():
+    cli = mock.MagicMock()
+    cli.api.pull.side_effect = _pull_sequence(
+        *[_api_error(500, "server misbehaving")] * (len(PULL_RETRY_BACKOFF) + 1)
+    )
+
+    with pytest.raises(SubmissionError) as exc:
+        pull_image(cli, mock.MagicMock(), {"job_id": "job-1"}, IMAGE)
+
+    assert exc.value.code is FailureCode.IMAGE_PULL_FAILED
+    assert cli.api.pull.call_count == len(PULL_RETRY_BACKOFF) + 1
+
+
+def test_the_retry_budget_cannot_approach_the_reaper(slept):
+    """The liveness contract, pinned as arithmetic rather than as a comment.
+
+    The server reaps on `sivacor.heartbeat_timeout` (30 min on production) and
+    a backoff sleep is deliberately not a heartbeat -- ProgressBeat ticks on
+    progress, never on a clock. So the whole budget has to be small enough that
+    nobody needs to argue an exception to that rule. If someone raises
+    PULL_RETRY_BACKOFF far enough for this to fail, the choice between the two
+    has to be made again rather than drifted past.
+    """
+    heartbeat_timeout_seconds = 30 * 60
+
+    cli = mock.MagicMock()
+    cli.api.pull.side_effect = _pull_sequence(
+        *[_api_error(500, "server misbehaving")] * (len(PULL_RETRY_BACKOFF) + 1)
+    )
+    with pytest.raises(SubmissionError):
+        pull_image(cli, mock.MagicMock(), {"job_id": "job-1"}, IMAGE)
+
+    assert sum(call.args[0] for call in slept.call_args_list) == sum(
+        PULL_RETRY_BACKOFF
+    )
+    assert sum(PULL_RETRY_BACKOFF) < heartbeat_timeout_seconds * 0.1
+
+
+@pytest.mark.parametrize("status", [401, 403, 404])
+def test_a_configuration_fault_is_not_retried(status, slept):
+    """An unknown manifest or a package nobody logged in for cannot be fixed by
+    repetition, and three attempts only delay telling someone."""
+    cli = mock.MagicMock()
+    cli.api.pull.side_effect = _pull_sequence(_api_error(status, "manifest unknown"))
+
+    with pytest.raises(SubmissionError) as exc:
+        pull_image(cli, mock.MagicMock(), {"job_id": "job-1"}, IMAGE)
+
+    assert exc.value.code is FailureCode.IMAGE_PULL_FAILED
+    assert cli.api.pull.call_count == 1
+    slept.assert_not_called()
+
+
+def test_a_request_timeout_is_retried_even_though_it_is_a_4xx():
+    """408 is the server saying *try again*, which is the one 4xx that means
+    the opposite of the rest."""
+    cli = mock.MagicMock()
+    cli.api.pull.side_effect = _pull_sequence(
+        _api_error(408, "request timed out"), _pull_events(1)
+    )
+
+    pull_image(cli, mock.MagicMock(), {"job_id": "job-1"}, IMAGE)
+
+    assert cli.api.pull.call_count == 2
+
+
+def test_an_unknown_manifest_is_not_retried_when_it_arrives_as_an_event(slept):
+    """The streamed path has no status code to read, so the decision falls to
+    the registry's own words."""
+    cli = mock.MagicMock()
+    cli.api.pull.side_effect = _pull_sequence(
+        _pull_events(1, error="manifest for foo:9.9.9 not found: manifest unknown")
+    )
+
+    with pytest.raises(SubmissionError):
+        pull_image(cli, mock.MagicMock(), {"job_id": "job-1"}, IMAGE)
+
+    assert cli.api.pull.call_count == 1
+    slept.assert_not_called()
+
+
+def test_a_rate_limit_is_not_retried(slept):
+    """The judgment call worth revisiting if SIVACOR ever leaves Docker Hub.
+
+    A rate limit is transient in principle, but Hub's anonymous window is six
+    hours against a 50-second budget, so retrying cannot clear it -- it only
+    delays the report by the whole budget.
+    """
+    cli = mock.MagicMock()
+    cli.api.pull.side_effect = _pull_sequence(
+        _pull_events(1, error="toomanyrequests: rate limit exceeded")
+    )
+
+    with pytest.raises(SubmissionError):
+        pull_image(cli, mock.MagicMock(), {"job_id": "job-1"}, IMAGE)
+
+    assert cli.api.pull.call_count == 1
+    slept.assert_not_called()
+
+
+def test_an_out_of_disk_pull_is_not_retried(slept):
+    """Deterministic, and a second attempt burns the partial pull again."""
+    cli = mock.MagicMock()
+    cli.api.pull.side_effect = _pull_sequence(
+        _pull_events(1, error="failed to register layer: no space left on device")
+    )
+
+    with pytest.raises(SubmissionError) as exc:
+        pull_image(cli, mock.MagicMock(), {"job_id": "job-1"}, IMAGE)
+
+    assert exc.value.code is FailureCode.OUT_OF_DISK
+    assert cli.api.pull.call_count == 1
+    slept.assert_not_called()
+
+
+def test_the_daemons_traceback_still_survives_a_retried_failure():
+    """#126's chaining must not be lost to the loop: the frames are the only
+    record of which remote call failed, and #129 carries them through the chain
+    redaction."""
+    last = _api_error(500, "server misbehaving")
+    cli = mock.MagicMock()
+    cli.api.pull.side_effect = _pull_sequence(
+        *[_api_error(500, "server misbehaving")] * len(PULL_RETRY_BACKOFF), last
+    )
+
+    with pytest.raises(SubmissionError) as exc:
+        pull_image(cli, mock.MagicMock(), {"job_id": "job-1"}, IMAGE)
+
+    assert exc.value.__cause__ is last
+
+
+def test_the_progress_line_still_counts_layers_across_a_retry():
+    """The layer set is shared with the attempt rather than rebuilt by it. A
+    fresh set per attempt would leave the job log reporting "0 layers seen" for
+    the whole pull -- invisible except to someone reading it during an incident,
+    which is exactly when it is read."""
+    cli = mock.MagicMock()
+    cli.api.pull.side_effect = _pull_sequence(
+        _api_error(500, "server misbehaving"), _pull_events(4)
+    )
+    api = mock.MagicMock()
+
+    pull_image(cli, api, {"job_id": "job-1"}, IMAGE)
+
+    written = " ".join(
+        str(call.kwargs.get("log", "")) for call in api.update_job.call_args_list
+    )
+    assert "4 layers" in written
+
+
+def test_a_failed_job_log_write_does_not_kill_a_recovering_pull():
+    """`api.update_job` is a Girder PUT ending in raise_for_status(), so an
+    unguarded call is a remote call on the critical path -- the shape of the
+    2026-09-18 incident, where a 502 on a log flush killed a healthy run. It
+    would be a poor joke for the retry loop to die reporting that it had
+    recovered."""
+    cli = mock.MagicMock()
+    cli.api.pull.side_effect = _pull_sequence(
+        _api_error(500, "server misbehaving"), _pull_events(2)
+    )
+    api = mock.MagicMock()
+    api.update_job.side_effect = RuntimeError("502 Bad Gateway")
+
+    pull_image(cli, api, {"job_id": "job-1"}, IMAGE)  # must not raise
+
+    assert cli.api.pull.call_count == 2
 
 
 def test_heartbeat_failure_does_not_abort_a_healthy_pull():

@@ -1690,6 +1690,68 @@ class ProgressBeat:
         self.tick()
 
 
+#: Seconds to wait between image-pull attempts. One entry per *retry*, so a
+#: pull is attempted ``len() + 1`` times and the worst case adds 50 s of sleep.
+#:
+#: **Sized against the liveness contract, not against the registry.** The
+#: server reaps on ``max(meta.heartbeat, job.updated, job.created)`` versus
+#: ``sivacor.heartbeat_timeout`` (30 min on production), and a retry *sleep* is
+#: by definition not progress, so :class:`ProgressBeat` cannot tick through one
+#: without breaking its own rule. Two honest options existed and the cheap one
+#: was taken: keep the total short enough that no beat is needed. 50 s is 2.8 %
+#: of the threshold, which leaves the constraint intact rather than arguing an
+#: exception to it -- see :func:`pull_image` for the argument.
+#:
+#: A transient fault that outlives a minute is not transient. Raising this is
+#: not a free knob: it trades the reaper's guarantee for a longer wait on a
+#: failure that is, by then, probably not going to clear.
+PULL_RETRY_BACKOFF = (5, 15, 30)
+
+#: Failures that another attempt cannot fix, matched against the registry's or
+#: daemon's own text. Textual for the same reason
+#: :data:`_OUT_OF_SPACE_FRAGMENTS` is: docker reports these as free-form strings
+#: and there is no structured field to read.
+#:
+#: ``toomanyrequests`` is here, which is the one entry worth arguing about. A
+#: rate limit *is* transient in principle, but Docker Hub's anonymous window is
+#: six hours against a 50-second budget -- so retrying cannot clear it and only
+#: delays telling someone what is wrong. If SIVACOR ever pulls from a registry
+#: with a seconds-long limit, this is the line to revisit.
+_PERMANENT_PULL_FRAGMENTS = (
+    "manifest unknown",
+    "repository does not exist",
+    "pull access denied",
+    "unauthorized",
+    "authentication required",
+    "requested access to the resource is denied",
+    "toomanyrequests",
+)
+
+
+def _is_retryable_pull_failure(error_text, status_code) -> bool:
+    """Whether a failed pull is worth attempting again.
+
+    **The default is yes, and that asymmetry is the whole design.** Guessing
+    wrong in the retry direction costs a researcher under a minute. Guessing
+    wrong the other way costs them the entire run: SIVACOR does not checkpoint
+    and resume -- a TRO certifies one supervised in-situ execution, and a
+    resumed run is two with an unsupervised gap no ``trov:TRSCapability``
+    covers -- so a pull that dies at stage 5 throws away stages 1 to 4 as well.
+    On 2026-10-12 that was 50 h 39 m and 199.9 CPU-hours against one failed DNS
+    lookup. A minute versus fifty hours is not a close call, so this declines to
+    retry only what it can affirmatively name as permanent.
+
+    A 4xx is the daemon saying the request itself is wrong -- an unknown tag, a
+    private package nobody logged in for -- and no number of attempts makes it
+    right. 408 is the exception: a request timeout is the server saying *try
+    again*. Anything else, including every 5xx, is assumed worth another go.
+    """
+    if status_code is not None and 400 <= status_code < 500 and status_code != 408:
+        return False
+    lowered = str(error_text or "").lower()
+    return not any(fragment in lowered for fragment in _PERMANENT_PULL_FRAGMENTS)
+
+
 def _pull_failure(image_reference, error_text) -> SubmissionError:
     """Build the right :class:`SubmissionError` for a failed pull.
 
@@ -1736,6 +1798,50 @@ def _pull_failure(image_reference, error_text) -> SubmissionError:
     )
 
 
+def _note(api, job_id, message):
+    """Write one line to the job log. Never raises.
+
+    ``api.update_job`` is a Girder ``PUT`` ending in ``raise_for_status()``, so
+    an unguarded call is a remote call on the run's critical path -- which is
+    the shape of the 2026-09-18 incident, where a 502 on a log flush killed a
+    healthy run. Narration is never worth a submission, and it would be a poor
+    joke for the retry loop below to die reporting that it had recovered.
+    """
+    try:
+        api.update_job(job_id, log=message + "\n")
+    except Exception:
+        logger.warning("Could not write a pull line to the job log", exc_info=True)
+
+
+def _attempt_pull(cli, beat, image_reference, layers):
+    """Run one pull to completion. Returns ``None``, or a failure triple.
+
+    A failure is ``(text, status_code, exc)``: the text docker gave, the
+    daemon's HTTP status when it raised rather than streamed, and the original
+    exception so the caller can chain it. Returning rather than raising is what
+    keeps the status, and the status is what tells a 404 apart from a 500.
+
+    ``layers`` is **mutated in place**, not returned, because
+    :func:`pull_image`'s progress line closes over it: a fresh set per attempt
+    would leave the job log reporting "0 layers seen" for the whole pull. It is
+    cleared on entry, so a retry counts from zero rather than accumulating.
+    """
+    layers.clear()
+    try:
+        for event in cli.api.pull(image_reference, stream=True, decode=True):
+            if not isinstance(event, dict):
+                continue
+            if event.get("error"):
+                return event["error"], None, None
+            if event.get("id"):
+                layers.add(event["id"])
+
+            beat.tick()
+    except docker.errors.APIError as exc:
+        return str(exc), exc.status_code, exc
+    return None
+
+
 def pull_image(cli, api, submission, image_reference):
     """Pull an image while keeping the submission visibly alive.
 
@@ -1779,9 +1885,30 @@ def pull_image(cli, api, submission, image_reference):
     All three live *inside* this function on purpose. The pull is expected to
     move to the front of the run (#130), and a fix sitting around the call site
     in :func:`recorded_run` would not survive the move.
+
+    **Transient failures are retried** on :data:`PULL_RETRY_BACKOFF`, and two
+    decisions about that are worth stating rather than leaving to be inferred.
+
+    *The backoff does not tick the heartbeat.* :class:`ProgressBeat`'s rule is
+    that ticks are driven by progress and never by a clock, so that a step which
+    stops progressing stops beating and is still reaped on schedule. A sleep is
+    not progress. Rather than argue an exception for this one case, the retry
+    budget is kept small enough not to need one: 50 s of sleep against a 30-min
+    threshold, so even a sequence of instant failures -- the 2026-10-12 DNS
+    failure took 7.9 s -- stays under 80 s of silence. The constraint survives
+    intact, which is worth more than three extra attempts.
+
+    *Cancellation is not observed during a pull, and the retry widens that
+    window.* :class:`CancelWatcher` is consulted every ``CHECKIN_INTERVAL``
+    while a container runs, and a pull has no container -- so a cancel pressed
+    during one is not acted on until it finishes, both before this change and
+    after. The window grows by at most the retry budget. Left as a known gap
+    rather than fixed here: threading a watcher through the pull is the same
+    work whether or not there is a retry, it belongs with #130 where the pull
+    moves and grows, and doing it here would mean a second cancellation path
+    with its own races beside the one that already exists.
     """
     job_id = submission["job_id"]
-    error = None
     layers = set()
     beat = ProgressBeat(
         api,
@@ -1791,29 +1918,61 @@ def pull_image(cli, api, submission, image_reference):
         ),
     )
 
-    try:
-        for event in cli.api.pull(image_reference, stream=True, decode=True):
-            if not isinstance(event, dict):
-                continue
-            if event.get("error"):
-                error = event["error"]
-                break
-            if event.get("id"):
-                layers.add(event["id"])
+    attempts = len(PULL_RETRY_BACKOFF) + 1
+    for attempt in range(1, attempts + 1):
+        failure = _attempt_pull(cli, beat, image_reference, layers)
+        if failure is None:
+            msg = f"Pulled {image_reference} ({len(layers)} layers)"
+            if attempt > 1:
+                # Say so. A pull that silently took three tries is a registry
+                # problem nobody will ever investigate.
+                msg += f", on attempt {attempt} of {attempts}"
+            _note(api, job_id, msg)
+            logger.info(msg)
+            return
 
-            beat.tick()
-    except docker.errors.APIError as exc:
-        # `from exc` deliberately: the daemon's frames are the only record of
-        # which remote call failed, and a post-mortem reads them.
-        raise _pull_failure(image_reference, str(exc)) from exc
-
-    if error:
+        text, status_code, exc = failure
         # The event path and the exception path classify identically -- see
         # _pull_failure, which also explains why disk is tested before registry.
-        raise _pull_failure(image_reference, error)
-    msg = f"Pulled {image_reference} ({len(layers)} layers)"
-    api.update_job(job_id, log=msg + "\n")
-    logger.info(msg)
+        error = _pull_failure(image_reference, text)
+
+        # Three ways to stop. Out of disk is deterministic and a second attempt
+        # burns the partial pull again; a permanent failure cannot be fixed by
+        # repetition; and the budget is the budget.
+        last = attempt == attempts
+        if (
+            error.code is FailureCode.OUT_OF_DISK
+            or not _is_retryable_pull_failure(text, status_code)
+            or last
+        ):
+            if last and attempt > 1:
+                _note(
+                    api,
+                    job_id,
+                    f"Giving up on {image_reference} after {attempts} attempts.",
+                )
+            # `from exc` deliberately: the daemon's frames are the only record
+            # of which remote call failed, and a post-mortem reads them. The
+            # streamed-event path has no exception to chain.
+            if exc is not None:
+                raise error from exc
+            raise error
+
+        delay = PULL_RETRY_BACKOFF[attempt - 1]
+        _note(
+            api,
+            job_id,
+            f"Could not pull {image_reference} (attempt {attempt} of "
+            f"{attempts}); retrying in {delay}s. Docker reported: {text}",
+        )
+        logger.warning(
+            "Pull of %s failed on attempt %d/%d; retrying in %ds",
+            image_reference,
+            attempt,
+            attempts,
+            delay,
+        )
+        time.sleep(delay)
 
 
 def recorded_run(api, submission, stage, env_vars):
