@@ -29,6 +29,13 @@ The SIVACOR-side mitigation (``verify_upload_complete`` in ``rest.py`` and
 deployments upgrading across the floor, and it is the only thing that detects a
 short blob already on disk.
 
+**Only the half reproduced here is fixed upstream.** A rejected chunk that
+interleaves with a legitimate one still finalises a file at *exactly* its
+document's length with the wrong bytes inside it — measured against released
+5.0.19 on 2026-10-15. These tests do not cover that; the minimal reproduction is
+``wholetale-ng/girder/test/test_upload_chunk_interleave.py``. No length check
+can see it, and only a full re-hash of the blob can. Open item 0 of the plan.
+
 **No threads are needed to demonstrate it.** Concurrency is only how two
 requests come to hold the same ``received``; the defect was what the rollback
 then did. Holding a stale copy of the document reproduced it deterministically,

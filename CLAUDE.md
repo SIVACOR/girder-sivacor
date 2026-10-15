@@ -149,7 +149,16 @@ now, so the suite reports **no xfailed and no xpassed**. The SIVACOR-side
 mitigation in `rest.py` (`verify_upload_complete`, and
 `GET /sivacor/upload_integrity`) is **kept**: it covers deployments still running
 below the floor and is the only thing that detects a short blob already on disk.
-Background: `../development_notes/08_girder_upload_race_plan.md`.
+
+**Upstream fixed only the half these tests reproduce.** A rejected chunk that
+interleaves with a legitimate one still finalises a file at exactly its
+document's length with another chunk's bytes inside it — measured against
+released 5.0.19, invisible to any length check and catchable only by a full
+re-hash (`tools/assetstore_integrity.py --verify-hash`). Do not read these two
+passing tests as "that bug is gone". Two artifacts live in the girder checkout:
+`test/test_upload_chunk_interleave.py` shows it and
+`test/test_upload_chunk_invariant.py` is what a fix has to pass. Background and
+the open decision: `../development_notes/08_girder_upload_race_plan.md`.
 
 ## `tools/` — operator scripts, and not scratch
 
