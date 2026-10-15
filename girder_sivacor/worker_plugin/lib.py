@@ -1690,6 +1690,52 @@ class ProgressBeat:
         self.tick()
 
 
+def _pull_failure(image_reference, error_text) -> SubmissionError:
+    """Build the right :class:`SubmissionError` for a failed pull.
+
+    Returns rather than raises, so the caller can ``raise ... from exc`` and
+    keep the daemon's traceback attached -- the frames are what a post-mortem
+    reads, and they are the only record of *which* remote call failed.
+
+    **Disk is tested first, and that order is the whole point.** A daemon error
+    that is really ENOSPC must report ``OUT_OF_DISK``; calling it a registry
+    problem is exactly the misattribution C0.1 was written to end (see
+    :func:`pull_space_shortfall`), and it would be a poor trade to close that
+    door and reopen it as a window.
+
+    Both ways a pull can fail come through here -- an event carrying ``error``
+    and a raised ``APIError`` -- so there is one classification rather than two
+    that can drift apart.
+    """
+    if _is_out_of_space(error_text):
+        # No detail: OUT_OF_DISK has no entry in telemetry's _DETAIL_VALIDATORS,
+        # so one would be dropped server-side anyway. The free-space figure would
+        # be defensible there -- it is a machine fact of the same class as
+        # OUT_OF_MEMORY's cap -- but adding it is a deliberate telemetry change
+        # with a privacy argument attached, and not part of C0.
+        return SubmissionError(
+            FailureCode.OUT_OF_DISK,
+            f"Ran out of disk space while pulling {image_reference}. The "
+            "replication package, its outputs and the analysis image all "
+            "share this worker's disk, and together they did not fit. "
+            f"Docker reported: {error_text}",
+        )
+    # Infrastructure, not user error: a registry timeout, a rate limit or a
+    # worker that cannot resolve DNS must not read as "your replication package
+    # is broken" -- so the message says so outright rather than leaving the
+    # researcher to infer it from a stack of registry jargon.
+    #
+    # The daemon's and registry's own text is free-form and goes no further than
+    # the job log; the record keeps the image reference, which is allow-listed.
+    return SubmissionError(
+        FailureCode.IMAGE_PULL_FAILED,
+        f"Failed to pull the analysis image {image_reference}. This is a "
+        "problem with our infrastructure or with the image registry, not with "
+        f"your replication package. Docker reported: {error_text}",
+        detail=image_reference,
+    )
+
+
 def pull_image(cli, api, submission, image_reference):
     """Pull an image while keeping the submission visibly alive.
 
@@ -1707,14 +1753,32 @@ def pull_image(cli, api, submission, image_reference):
     :class:`ProgressBeat` is the shared rate-limiter, and the same one now
     guards ``create_workspace`` and ``upload_workspace``.
 
-    Two traps this deliberately handles:
+    Three traps this deliberately handles:
 
-    * ``cli.api.pull(stream=True)`` does **not** raise on failure the way
-      ``images.pull()`` does -- it yields an event carrying ``error``. Left
-      unchecked, a failed pull would look like success here and resurface as a
-      confusing ImageNotFound from ``containers.create`` further down.
+    * ``cli.api.pull(stream=True)`` does **not** raise on a *registry* failure
+      the way ``images.pull()`` does -- it yields an event carrying ``error``.
+      Left unchecked, a failed pull would look like success here and resurface
+      as a confusing ImageNotFound from ``containers.create`` further down.
+    * **It does raise on a *daemon* failure, and that is the other half.**
+      ``docker/api/image.py`` ends ``pull()`` with ``self._raise_for_status()``,
+      so any 4xx/5xx from the daemon becomes an ``APIError`` out of the
+      generator's **first iteration** -- before any event, before any
+      ``beat.tick()``, and before the branch above could ever see it. For as
+      long as that went uncaught the whole family was unreachable: the exception
+      escaped to ``submission_task``'s generic handler and ``errors.classify()``
+      recorded it as ``unexpected``/``APIError``, the code reserved for *our own
+      defects*, with only the class name kept. On 2026-10-12 that cost a run
+      50 h 39 m and 199.9 CPU-hours and told the researcher nothing true about
+      why; the one earlier instance could not even be compared against it. Only
+      ``APIError`` is caught, not ``DockerException`` -- "the daemon answered
+      with an error" is a pull failure, while a docker-py bug or a broken socket
+      is a platform defect and ``unexpected`` is the honest code for those.
     * a heartbeat is best-effort; a failed ping must not fail the run, or a
       transient Girder blip would kill a pull that is going fine.
+
+    All three live *inside* this function on purpose. The pull is expected to
+    move to the front of the run (#130), and a fix sitting around the call site
+    in :func:`recorded_run` would not survive the move.
     """
     job_id = submission["job_id"]
     error = None
@@ -1727,46 +1791,26 @@ def pull_image(cli, api, submission, image_reference):
         ),
     )
 
-    for event in cli.api.pull(image_reference, stream=True, decode=True):
-        if not isinstance(event, dict):
-            continue
-        if event.get("error"):
-            error = event["error"]
-            break
-        if event.get("id"):
-            layers.add(event["id"])
+    try:
+        for event in cli.api.pull(image_reference, stream=True, decode=True):
+            if not isinstance(event, dict):
+                continue
+            if event.get("error"):
+                error = event["error"]
+                break
+            if event.get("id"):
+                layers.add(event["id"])
 
-        beat.tick()
+            beat.tick()
+    except docker.errors.APIError as exc:
+        # `from exc` deliberately: the daemon's frames are the only record of
+        # which remote call failed, and a post-mortem reads them.
+        raise _pull_failure(image_reference, str(exc)) from exc
 
     if error:
-        if _is_out_of_space(error):
-            # A pull that filled the disk is a disk failure, not a registry one,
-            # and this branch is the reliable half of C0.1: it rests on what
-            # docker actually reported rather than on an estimate, so it catches
-            # the cases the pre-flight check declines to guess about.
-            #
-            # No detail: OUT_OF_DISK has no entry in telemetry's
-            # _DETAIL_VALIDATORS, so one would be dropped server-side anyway.
-            # The free-space figure would be defensible there -- it is a machine
-            # fact of the same class as OUT_OF_MEMORY's cap -- but adding it is a
-            # deliberate telemetry change with a privacy argument attached, and
-            # not part of C0.
-            raise SubmissionError(
-                FailureCode.OUT_OF_DISK,
-                f"Ran out of disk space while pulling {image_reference}. The "
-                "replication package, its outputs and the analysis image all "
-                "share this worker's disk, and together they did not fit. "
-                f"Docker reported: {error}",
-            )
-        # Infrastructure, not user error: a registry timeout or a rate limit must
-        # not read as "your replication package is broken".
-        # The registry's own text is free-form and goes no further than the job
-        # log; the record keeps the image reference, which is allow-listed.
-        raise SubmissionError(
-            FailureCode.IMAGE_PULL_FAILED,
-            f"Failed to pull image {image_reference}: {error}",
-            detail=image_reference,
-        )
+        # The event path and the exception path classify identically -- see
+        # _pull_failure, which also explains why disk is tested before registry.
+        raise _pull_failure(image_reference, error)
     msg = f"Pulled {image_reference} ({len(layers)} layers)"
     api.update_job(job_id, log=msg + "\n")
     logger.info(msg)
