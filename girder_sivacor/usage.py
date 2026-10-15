@@ -374,6 +374,11 @@ def accrue(lifetime, attribution) -> None:
         )
         rate = 0.0
 
+    # Every branch below spends `hours * volume_gb`, split the same way the
+    # hours are. A branch that forgets it does not under-report a little -- the
+    # gigabytes vanish entirely, which is what happened to a 480 GB volume on a
+    # 50.852 h platform-fault run (#128). `accrue_house` takes the figure
+    # without a default for that reason: a new branch cannot omit it silently.
     volume_gb = lifetime.get("volumeGb") or 0
 
     if over_cap_hours:
@@ -381,6 +386,7 @@ def accrue(lifetime, attribution) -> None:
             "over_cap",
             su_hours=over_cap_hours * rate,
             instance_hours=over_cap_hours,
+            volume_gb_hours=over_cap_hours * volume_gb,
             instances=0,
         )
 
@@ -389,6 +395,7 @@ def accrue(lifetime, attribution) -> None:
             "unclaimed",
             su_hours=billable_hours * rate,
             instance_hours=billable_hours,
+            volume_gb_hours=billable_hours * volume_gb,
         )
         return
 
@@ -397,6 +404,7 @@ def accrue(lifetime, attribution) -> None:
             attribution.get("code") or "unstamped",
             su_hours=billable_hours * rate,
             instance_hours=billable_hours,
+            volume_gb_hours=billable_hours * volume_gb,
         )
         return
 
@@ -449,7 +457,9 @@ def accrue_user(user_id, su_hours, instance_hours, volume_gb_hours, memory_gb) -
     )
 
 
-def accrue_house(reason, su_hours, instance_hours, instances=1) -> None:
+def accrue_house(
+    reason, su_hours, instance_hours, volume_gb_hours, instances=1
+) -> None:
     """Add spend that belongs to nobody, or to us, to the anonymous singleton.
 
     ``reason`` separates three different bills with three different owners: the
@@ -460,6 +470,21 @@ def accrue_house(reason, su_hours, instance_hours, instances=1) -> None:
     Not a real admin account, deliberately: that would mix platform waste with
     that admin's genuine submissions, and a future quota would lock out the one
     account that must never be locked out (09-U11).
+
+    **``volume_gb_hours`` has no default, unlike ``instances``.** For eighteen
+    months it had no parameter at all, so every scratch volume the house paid
+    for was dropped on the floor -- :func:`accrue` read ``volumeGb`` and spent it
+    on the user branch only. A default would have let the next branch make the
+    same mistake just as quietly; the signature is the guard, and
+    ``test_volume_gb_hours_are_conserved_whoever_pays`` is the proof.
+
+    Worth knowing why this matters more than the SU equivalent: the scarce
+    resource behind a scratch volume is not the SU allocation but the Cinder
+    quota (10 volumes / 2000 GB, most of it already spoken for), and a new
+    approval is argued against this report. It is also the *least* sensitive
+    place in the system to record a number -- the house is one anonymous
+    document with no ``userId``, so counting here creates no new store of
+    personal data.
     """
     now = _now()
     UsageTotals().collection.update_one(
@@ -468,7 +493,11 @@ def accrue_house(reason, su_hours, instance_hours, instances=1) -> None:
             "$inc": {
                 "suHours": su_hours,
                 "instanceHours": instance_hours,
+                "volumeGbHours": volume_gb_hours,
                 "instances": instances,
+                # SU-hours only, deliberately: one scalar is enough to stop the
+                # gigabytes vanishing, and a second per-reason breakdown is a
+                # nicety nobody has asked a question of yet.
                 f"byReason.{_reason_key(reason)}": su_hours,
             },
             "$set": {"lastAt": now},
@@ -563,12 +592,20 @@ def report() -> dict:
             "instances": house.get("instances", 0),
             "su_hours": house.get("suHours", 0.0),
             "instance_hours": house.get("instanceHours", 0.0),
+            "volume_gb_hours": house.get("volumeGbHours", 0.0),
             "by_reason": house.get("byReason", {}),
         },
         # Cheap to compute, and the number an operator actually wants when
         # reconciling: per-user plus house, before comparing with ACCESS.
         "total_su_hours": sum(row["su_hours"] for row in users)
         + house.get("suHours", 0.0),
+        # The same sum for the storage grant, and the reason it is here rather
+        # than left to the reader: /sivacor/volume_usage cannot answer it. That
+        # one derives from job documents, so a volume whose submission has been
+        # deleted is invisible to it -- which is precisely the run whose
+        # gigabytes the house is holding.
+        "total_volume_gb_hours": sum(row["volume_gb_hours"] for row in users)
+        + house.get("volumeGbHours", 0.0),
         "pending": {
             "lifetimes": InstanceLifetime().collection.count_documents({}),
             "attributions": UsageAttribution().collection.count_documents({}),
