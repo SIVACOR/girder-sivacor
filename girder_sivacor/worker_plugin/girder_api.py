@@ -146,7 +146,7 @@ class GirderApi:
             headers={"Content-Type": "application/json"},
         )
 
-    def record_outcome(self, job_id, code):
+    def record_outcome(self, job_id, code, detail=None, step=None):
         """Tell the server why this submission failed, for usage accounting.
 
         A separate call from :meth:`record_execution` on purpose. That endpoint
@@ -156,10 +156,16 @@ class GirderApi:
         then be wrong, and a refactor honouring it would break billability
         silently.
         """
-        return self.client.put(
-            f"sivacor/outcome/{job_id}",
-            parameters={"code": getattr(code, "value", code)},
-        )
+        parameters = {"code": getattr(code, "value", code)}
+        if step is not None:
+            parameters["step"] = step
+        if detail is not None:
+            # Optional on the wire, so a worker newer than its server does not
+            # 400 on a parameter the server has never heard of. A server newer
+            # than its worker simply gets no detail and collapses alerts on the
+            # code alone, which is coarser and still correct.
+            parameters["detail"] = str(detail)
+        return self.client.put(f"sivacor/outcome/{job_id}", parameters=parameters)
 
     # -- collections, groups and access -----------------------------------
 

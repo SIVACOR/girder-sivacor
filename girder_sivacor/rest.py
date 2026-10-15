@@ -26,12 +26,12 @@ from girder_jobs.constants import REST_CREATE_JOB_TOKEN_SCOPE, JobStatus
 from girder_jobs.models.job import Job
 from girder_plugin_worker.utils import getWorkerApiUrl
 
-from . import usage
+from . import alerts, usage
 from .errors import FailureCode
 from .models.execution_record import ExecutionRecord
 from .settings import PluginSettings
 from .statuses import CANCELING, DELETABLE, FAILED
-from .telemetry import sanitize_record
+from .telemetry import safe_step, sanitize_record
 from .utils import encrypt_job_secrets
 from .worker_plugin.routing import DISPATCH_QUEUE, instance_id_of
 from .worker_plugin.run_submission import (
@@ -821,6 +821,8 @@ class SIVACOR(Resource):
         self.route("POST", ("claim", ":id"), self.claim)
         self.route("POST", ("execution_record",), self.record_execution)
         self.route("PUT", ("outcome", ":id"), self.record_outcome)
+        self.route("POST", ("alerts", "digest"), self.send_alert_digest)
+        self.route("POST", ("alerts", "sweep"), self.sweep_unalerted)
         self.route("POST", ("usage", "drain"), self.drain_usage)
         self.route("GET", ("usage",), self.get_usage)
         self.route("GET", ("execution_record",), self.list_execution_records)
@@ -1190,8 +1192,14 @@ class SIVACOR(Resource):
             required=True,
         )
         .param("code", "A FailureCode value.", required=True)
+        .param(
+            "detail",
+            "The short, allow-listed scalar qualifying the code, if any.",
+            required=False,
+        )
+        .param("step", "The pipeline step that failed, if known.", required=False)
     )
-    def record_outcome(self, job, code):
+    def record_outcome(self, job, code, detail=None, step=None):
         # Validated against the enum rather than accepted as free text, because
         # `code` becomes a Mongo field name in the house bucket's byReason. A
         # code from a newer worker than this server is rejected loudly and the
@@ -1200,6 +1208,25 @@ class SIVACOR(Resource):
             code = FailureCode(code)
         except ValueError:
             raise ValidationException(f"Unknown failure code: {code!r}")
+        # The step is stamped rather than passed through, because the alert
+        # email is not the only reader: it is the one field that says *where*
+        # a failure happened, and a later digest or post-mortem wants it on the
+        # job. Validated through telemetry's identifier allow-list, which is the
+        # same boundary that lets a step name be kept forever.
+        if safe := safe_step(step):
+            Job().collection.update_one(
+                {"_id": job["_id"]}, {"$set": {"meta.sivacorFailedStep": safe}}
+            )
+            job.setdefault("meta", {})["sivacorFailedStep"] = safe
+
+        # Before the early return below, and before the stamp: the alert is
+        # about the failure, not about the instance, and a submission that never
+        # booted one is exactly the kind of failure an operator wants to hear
+        # about. This is also the moment the code first exists anywhere the
+        # server can see -- the terminal transition has already happened, by
+        # design, so notifications.set_submission_status could never have it.
+        alerts.consider(job, code, detail)
+
         instance_id = instance_id_of((job.get("meta") or {}).get("worker_queue") or "")
         if not instance_id:
             # Nothing booted, so there is no attribution row and no SU to argue
@@ -1223,6 +1250,46 @@ class SIVACOR(Resource):
     )
     def drain_usage(self):
         return {"accrued": usage.drain()}
+
+    @access.admin
+    @autoDescribeRoute(
+        Description("Send the daily failure digest to the administrators.").notes(
+            "Driven from the celery beat once a day. Reports two things in one "
+            "message: the failure codes whose policy is 'digest' -- out of "
+            "memory, out of disk, past the runtime ceiling, each the most "
+            "expensive outcome in its class and each the researcher's to pay "
+            "for -- and the repeats of any code that was already mailed once, "
+            "which is what makes collapsing a storm lossless rather than "
+            "merely quieter.\n\n"
+            "Counts only, with no job ids and no logins: it is built from the "
+            "alert counters, which hold no identifier. Sends nothing when "
+            "there is nothing to say, because a daily email that usually reads "
+            "'nothing happened' trains people to stop opening it.\n\n"
+            "Safe to call by hand and safe to call twice: the counters are "
+            "claimed with find_one_and_delete, so a second caller finds "
+            "nothing rather than reporting the same failures again."
+        )
+    )
+    def send_alert_digest(self):
+        return alerts.send_digest()
+
+    @access.admin
+    @autoDescribeRoute(
+        Description("Alert on failures that never recorded a reason.").notes(
+            "Driven from the celery beat every ten minutes. Every path that "
+            "fails a submission stamps a code immediately afterwards, so this "
+            "normally finds nothing -- it exists for when that second call does "
+            "not happen, because report_outcome swallows its own exceptions by "
+            "design. A run that failed with no recorded reason is the one state "
+            "that must not be the quiet one.\n\n"
+            "Bounded at both ends: it ignores anything failed in the last ten "
+            "minutes, so it cannot race the stamp it is checking for, and "
+            "anything older than a day, so a first run does not consider a "
+            "deployment's whole history at once."
+        )
+    )
+    def sweep_unalerted(self):
+        return alerts.sweep_undecided()
 
     @access.admin
     @autoDescribeRoute(
@@ -1611,6 +1678,10 @@ class SIVACOR(Resource):
         cls._fail_stranded(job, reason)
         cls._record_reaped(job, code, elapsed, detail)
         cls._stamp_outcome(job, code)
+        # The reaper's half of the alert, for the same reason it stamps its own
+        # outcome: it is inside Girder holding both the job and the code, so it
+        # does not need the round trip the worker does.
+        alerts.consider(job, code, detail)
         reaped.append(str(job["_id"]))
 
     @classmethod

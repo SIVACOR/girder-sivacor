@@ -106,7 +106,7 @@ def report_failure(api, job_id, failure, exc):
         logger.exception("Could not mark job %s as failed", job_id)
 
 
-def report_outcome(api, job_id, exc):
+def report_outcome(api, job_id, exc, step=None):
     """Tell the server which failure code this run ended with (09-A2b).
 
     Without it every failed submission falls to the house at accrual, because an
@@ -117,7 +117,7 @@ def report_outcome(api, job_id, exc):
     exception out of an error path.
     """
     try:
-        api.record_outcome(job_id, classify(exc)[0])
+        api.record_outcome(job_id, *classify(exc), step=step)
     except Exception:
         logger.warning(
             "Could not report the outcome of job %s; its instance's SU will "
@@ -298,7 +298,7 @@ def submission_task(failure):
                 # After report_failure, which is what transitions the job to
                 # ERROR and so fires the hook that creates the attribution row.
                 # Stamping first would write onto a row that does not exist yet.
-                report_outcome(api, job_id, failed_with)
+                report_outcome(api, job_id, failed_with, func.__name__)
                 # func.__name__ rather than the `failure` prose: the step name
                 # is kept forever, so it has to be a stable identifier we chose,
                 # not a sentence someone may reword later.
@@ -525,7 +525,7 @@ def prepare_submission(
         report_failure(api, job_id, "Failed to prepare submission", exc)
         # This step is not wrapped by submission_task, so it needs its own
         # stamp -- the head of the chain does its own job bookkeeping.
-        report_outcome(api, job_id, exc)
+        report_outcome(api, job_id, exc, "prepare_submission")
         record_execution(api, telemetry, "failed", "prepare_submission", exc)
         raise
 
@@ -1327,6 +1327,18 @@ def setup_periodic_tasks(sender, **kwargs):
         name="Accrue reaped instances' usage",
         options={"queue": LOCAL_QUEUE},
     )
+    sender.add_periodic_task(
+        24 * 60 * 60,
+        send_alert_digest.s(),
+        name="Send the daily failure digest",
+        options={"queue": LOCAL_QUEUE},
+    )
+    sender.add_periodic_task(
+        10 * 60,
+        sweep_unalerted_failures.s(),
+        name="Alert on failures that recorded no reason",
+        options={"queue": LOCAL_QUEUE},
+    )
 
 
 def _local_admin_token():
@@ -1414,6 +1426,41 @@ def drain_usage():
         )
         return
     api.client.post("sivacor/usage/drain")
+
+
+@app.task(queue=LOCAL_QUEUE)
+def sweep_unalerted_failures():
+    """Ask Girder to alert on any failure that recorded no reason.
+
+    Ten minutes, not a day: the digest is for failures nobody acts on within
+    the hour, and this is the opposite of that. A submission that failed with
+    no recorded reason means the classification path itself broke, which is
+    the one thing the alerting cannot afford to be slow about.
+    """
+    if not (api := _maintenance_api()):
+        return
+    api.client.post("sivacor/alerts/sweep")
+
+
+@app.task(queue=LOCAL_QUEUE)
+def send_alert_digest():
+    """Ask Girder to mail the administrators one summary of the day's failures.
+
+    An HTTP call for the same reason :func:`drain_usage` gives: it renders a
+    mail template and reads the admin list, both of which are unambiguously
+    wired in the Girder *server* and a question about imports in a worker.
+
+    Once a day is the cadence the digest is for. The failures it reports are
+    not ones anybody acts on within the hour -- that is precisely why they are
+    digested rather than mailed -- and a daily message is one somebody reads.
+    """
+    if not (api := _maintenance_api()):
+        logger.info(
+            "Skipping the failure digest: set GIRDER_API_URL on a worker (plus "
+            "GIRDER_API_KEY, unless it can reach MongoDB) to enable it."
+        )
+        return
+    api.client.post("sivacor/alerts/digest")
 
 
 @app.task(queue=LOCAL_QUEUE)
