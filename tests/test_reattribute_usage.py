@@ -17,12 +17,13 @@ from pathlib import Path
 
 import pytest
 from girder.models.user import User
+
 from girder_sivacor import usage
 from girder_sivacor.models.usage import UsageTotals
 
 TOOL = Path(__file__).resolve().parent.parent / "tools" / "reattribute_usage.py"
 
-UTC = datetime.timezone.utc
+UTC = datetime.UTC
 
 #: Read back through Girder's tz_aware client, so the expectations are aware
 #: too. The stored instant is the same either way -- BSON has no timezone.

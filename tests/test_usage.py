@@ -23,6 +23,8 @@ from girder.models.user import User
 from girder_jobs.constants import JobStatus
 from girder_jobs.models.job import Job
 from pymongo.collection import Collection
+from pytest_girder.assertions import assertStatus, assertStatusOk
+
 from girder_sivacor import usage
 from girder_sivacor.errors import FailureCode
 from girder_sivacor.models.usage import (
@@ -32,7 +34,6 @@ from girder_sivacor.models.usage import (
     UsageTotals,
 )
 from girder_sivacor.settings import PluginSettings
-from pytest_girder.assertions import assertStatus, assertStatusOk
 
 LADDER = [
     {"memory_gb": 30, "flavor": "m3.medium", "vcpus": 8, "gated": False},
@@ -41,7 +42,7 @@ LADDER = [
 
 
 def utc(*args):
-    return datetime.datetime(*args, tzinfo=datetime.timezone.utc)
+    return datetime.datetime(*args, tzinfo=datetime.UTC)
 
 
 def fake_instance(instance_id="i-1", created=None, size=60, volume_gb=None):
@@ -62,7 +63,6 @@ def clean(server):
     """
     for model in (UsageAttribution(), InstanceLifetime(), UsageTotals()):
         model.collection.delete_many({})
-    return None
 
 
 # --- the billability table -------------------------------------------------

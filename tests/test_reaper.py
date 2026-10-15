@@ -7,16 +7,17 @@ timestamps a lost worker would have left behind.
 """
 
 import datetime
+from unittest import mock
 
-import mock
 import pytest
 from girder.exceptions import ValidationException
 from girder.models.folder import Folder
 from girder.models.setting import Setting
 from girder_jobs.constants import JobStatus
 from girder_jobs.models.job import Job
-from girder_sivacor.settings import PluginSettings
 from pytest_girder.assertions import assertStatus, assertStatusOk
+
+from girder_sivacor.settings import PluginSettings
 
 
 def make_submission(user, submission_collection, status=JobStatus.RUNNING):
@@ -49,7 +50,7 @@ def backdate(job, minutes=None, hours=None, heartbeat=None):
     recent of the three, so a test has to move all of them to look stale.
     """
     delta = datetime.timedelta(minutes=minutes or 0, hours=hours or 0)
-    then = datetime.datetime.now(datetime.timezone.utc) - delta
+    then = datetime.datetime.now(datetime.UTC) - delta
     updates = {"created": then, "updated": then}
     if heartbeat is not None:
         updates["meta.heartbeat"] = heartbeat
@@ -94,7 +95,7 @@ def test_reap_leaves_live_submissions_alone(
     server, db, admin, user, submission_collection
 ):
     """A submission that has just reported must survive the sweep."""
-    job, folder = make_submission(user, submission_collection)
+    job, _folder = make_submission(user, submission_collection)
 
     resp = reap(server, admin)
     assertStatusOk(resp)
@@ -115,7 +116,7 @@ def test_reap_leaves_long_run_with_fresh_heartbeat_alone(
     backdate(
         job,
         hours=3,
-        heartbeat=datetime.datetime.now(datetime.timezone.utc),
+        heartbeat=datetime.datetime.now(datetime.UTC),
     )
 
     resp = reap(server, admin)
@@ -130,7 +131,7 @@ def test_reap_fails_stranded_submission(
 ):
     """No sign of life past the threshold: fail the job and tell the user."""
     job, folder = make_submission(user, submission_collection)
-    stale = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=2)
+    stale = datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=2)
     backdate(job, hours=2, heartbeat=stale)
 
     with mock.patch("smtplib.SMTP") as smtp_class:
@@ -158,7 +159,7 @@ def test_reap_enforces_absolute_max_runtime(
     backdate(
         job,
         hours=48,
-        heartbeat=datetime.datetime.now(datetime.timezone.utc),
+        heartbeat=datetime.datetime.now(datetime.UTC),
     )
 
     with mock.patch("smtplib.SMTP") as smtp_class:

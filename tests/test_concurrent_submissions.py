@@ -9,8 +9,9 @@ rejected with a 409; finished jobs (SUCCESS / ERROR / CANCELED) don't block.
 import pytest
 from girder_jobs.constants import JobStatus
 from girder_jobs.models.job import Job
-from girder_sivacor.rest import SIVACOR
 from pytest_girder.assertions import assertStatus
+
+from girder_sivacor.rest import SIVACOR
 
 from .conftest import submit_sivacor_job, upload_test_file
 

@@ -6,6 +6,30 @@ on:
   pull_request:
 
 jobs:
+  # Runs here because it did not, which is the whole reason a lint gate was
+  # allowed to go 211 errors into the red without anyone noticing: `tox -e lint`
+  # existed, was never wired into CI, and CircleCI's `lint` job is the npm
+  # web-client one. A gate nobody runs is not a gate.
+  #
+  # Its own job rather than a step in `test`: it needs no mongo, no redis and no
+  # docker socket, so it answers in seconds and says something useful about a PR
+  # long before the suite has finished booting its services.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set up Python
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.12'
+
+    - name: Install tox
+      run: pip install tox
+
+    - name: Lint
+      run: tox -e lint
+
   test:
     runs-on: ubuntu-latest
 

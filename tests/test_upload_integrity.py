@@ -21,14 +21,16 @@ and the suite runs at ``-n 4`` or wider, against a shared assetstore. Raising
 bytes than the blob holds) and touches only this test's database.
 """
 
-import mock
+from unittest import mock
+
 import pytest
 from girder.exceptions import ValidationException
 from girder.models.file import File
 from girder.models.user import User
 from girder_jobs.models.job import Job
-from girder_sivacor.rest import stored_blob_size, verify_upload_complete
 from pytest_girder.assertions import assertStatus, assertStatusOk
+
+from girder_sivacor.rest import stored_blob_size, verify_upload_complete
 
 from .conftest import submit_sivacor_job, upload_test_file
 

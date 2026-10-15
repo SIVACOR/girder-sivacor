@@ -1,5 +1,7 @@
-import pytest
 from pathlib import Path
+
+import pytest
+
 from girder_sivacor.errors import FailureCode, SubmissionError
 from girder_sivacor.worker_plugin.lib import _infer_run_command, get_project_dir
 
@@ -81,7 +83,7 @@ def test_infer_run_command_with_space_in_filename(submission_dir):
     submission = {"workspace_dir": str(submission_dir)}
     stage = {"image_name": "rocker/r-ver", "main_file": "my submission.R"}
 
-    entrypoint, command, sub_dir, home_dir = _infer_run_command(submission, stage)
+    _entrypoint, command, sub_dir, home_dir = _infer_run_command(submission, stage)
     assert command == '"my submission.R"'
     assert sub_dir == ""
     assert home_dir == "/workspace"
@@ -99,7 +101,7 @@ def test_infer_run_command_with_renv_lock(submission_dir):
     submission = {"workspace_dir": str(submission_dir)}
     stage = {"image_name": "rocker/r-ver", "main_file": "main.R"}
 
-    entrypoint, command, sub_dir, home_dir = _infer_run_command(submission, stage)
+    _entrypoint, command, sub_dir, home_dir = _infer_run_command(submission, stage)
     assert sub_dir == "."
     assert str(command) == "code/main.R"
     assert home_dir == "/workspace"
@@ -118,7 +120,7 @@ def test_infer_run_command_with_renv_lock_in_subdir(submission_dir):
     submission = {"workspace_dir": str(submission_dir)}
     stage = {"image_name": "rocker/r-ver", "main_file": "main.R"}
 
-    entrypoint, command, sub_dir, home_dir = _infer_run_command(submission, stage)
+    _entrypoint, command, sub_dir, home_dir = _infer_run_command(submission, stage)
     assert sub_dir == "analysis"
     assert str(command) == "code/main.R"
     assert home_dir == "/workspace"
@@ -134,7 +136,7 @@ def test_infer_run_command_with_matlab(submission_dir):
     submission = {"workspace_dir": str(submission_dir)}
     stage = {"image_name": "dynare/matlab", "main_file": "script.m"}
 
-    entrypoint, command, sub_dir, home_dir = _infer_run_command(submission, stage)
+    _entrypoint, command, sub_dir, home_dir = _infer_run_command(submission, stage)
     assert command == "script"
     assert sub_dir == ""
     assert home_dir == "/home/matlab"

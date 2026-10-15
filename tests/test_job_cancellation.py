@@ -8,13 +8,15 @@ This test module verifies:
 4. The StatusCode -123 handling in execute_workflow properly stops execution
 """
 
-import mock
+from unittest import mock
+
 import pytest
 from girder_jobs.constants import JobStatus
 from girder_jobs.models.job import Job
+from pytest_girder.assertions import assertStatusOk
+
 from girder_sivacor.worker_plugin.routing import QUEUE_PREFIX, pin_chain, worker_queue
 from girder_sivacor.worker_plugin.run_submission import submission_task
-from pytest_girder.assertions import assertStatusOk
 
 
 def _decorate(func, status=JobStatus.RUNNING, failure="Task failed"):
@@ -306,7 +308,10 @@ def test_execute_workflow_chain_preserved_on_success():
 
     # Simulate the logic from execute_workflow when StatusCode is 0
     ret = {"StatusCode": 0}
-    if ret["StatusCode"] == -123:
+    # Not collapsed into one `if`, deliberately: this mirrors execute_workflow's
+    # own shape line for line, and a test that paraphrases the code it stands in
+    # for stops being evidence about it.
+    if ret["StatusCode"] == -123:  # noqa: SIM102
         if mock_task.request.chain:
             mock_task.request.chain = None
 

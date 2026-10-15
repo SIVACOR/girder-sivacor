@@ -61,8 +61,8 @@ def test_the_julia_family_has_a_measured_entry():
     which looks exactly like working.
     """
     from girder_sivacor.worker_plugin.lib import (
-        IMAGE_ON_DISK_MULTIPLIER,
         _IMAGE_FAMILY_COMPRESSED_GB,
+        IMAGE_ON_DISK_MULTIPLIER,
     )
 
     family = image_family("ghcr.io/sivacor/julia1.13:1.13.0-20260916")

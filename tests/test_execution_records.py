@@ -17,12 +17,13 @@ from girder.models.folder import Folder
 from girder.models.setting import Setting
 from girder_jobs.constants import JobStatus
 from girder_jobs.models.job import Job
+from pytest_girder.assertions import assertStatus, assertStatusOk
+
 from girder_sivacor.errors import FailureCode, SubmissionError, classify
 from girder_sivacor.models.execution_record import ExecutionRecord
 from girder_sivacor.settings import PluginSettings
 from girder_sivacor.telemetry import sanitize_record, size_bucket
 from girder_sivacor.worker_plugin.lib import stata_error, stata_error_code
-from pytest_girder.assertions import assertStatus, assertStatusOk
 
 from .conftest import get_submission_folder, submit_sivacor_job, upload_test_file
 
@@ -304,11 +305,11 @@ def test_record_outlives_a_user_deleted_submission(
 def test_record_outlives_the_retention_sweep(
     server, db, user, admin, submission_collection
 ):
-    job, folder = make_submission(user, submission_collection)
+    _job, folder = make_submission(user, submission_collection)
     assertStatusOk(post_record(server, admin, {"status": "completed"}))
 
     Setting().set(PluginSettings.RETENTION_DAYS, 0.0)
-    long_ago = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=30)
+    long_ago = datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=30)
     Folder().collection.update_one(
         {"_id": folder["_id"]}, {"$set": {"created": long_ago}}
     )
@@ -369,7 +370,7 @@ def test_a_real_run_records_itself_end_to_end(
     # The image had to be on the machine too, and rocker is not small.
     assert record["stages"][0]["image_size_bytes"] > 100 * 1024**2
     assert record["package_size_bucket"] == "<10MB"
-    assert record["date"] == datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+    assert record["date"] == datetime.datetime.now(datetime.UTC).date().isoformat()
     # The size the submission asked for, beside mem_limit_bytes -- the cap it
     # actually got. It reaches here as a task argument rather than being read
     # off the job (build_execution_record must not touch the job at all), so a
@@ -440,7 +441,7 @@ def test_reaper_records_the_run_the_worker_could_not(
             "stages": [{"image_name": "dataeditors/stata18_5-mp", "image_tag": "2024"}],
         },
     )
-    stale = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=48)
+    stale = datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=48)
     Job().collection.update_one(
         {"_id": job["_id"]}, {"$set": {"created": stale, "updated": stale}}
     )

@@ -12,13 +12,15 @@ Every test here covers one of those, plus the two traps in the implementation
 (a streamed pull does not raise on error; a failed heartbeat must not fail a run).
 """
 
+from unittest import mock
+
 import docker
-import mock
 import pytest
+
 from girder_sivacor.errors import FailureCode, SubmissionError
 from girder_sivacor.worker_plugin.lib import (
-    DISK_FLOOR_BYTES,
     _IMAGE_FAMILY_COMPRESSED_GB,
+    DISK_FLOOR_BYTES,
     HEARTBEAT_INTERVAL,
     _is_out_of_space,
     disk_floor_bytes,

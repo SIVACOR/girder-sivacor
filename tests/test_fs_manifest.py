@@ -323,7 +323,7 @@ def test_plugin_widens_the_file_schema_site_wide(server, db, admin, user, tree):
     own: every ``File`` response in this Girder grows these fields, including
     the ones aea-sivacor consumes.
     """
-    path = "/file/%s" % tree.alpha["_id"]
+    path = f"/file/{tree.alpha['_id']}"
 
     resp = server.request(path=path, method="GET", user=user)
     assertStatusOk(resp)

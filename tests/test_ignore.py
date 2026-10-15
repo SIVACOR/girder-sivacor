@@ -107,12 +107,11 @@ def test_ignore(
     # Verify that files in the ado/ directory were ignored
     replpack_file_id = submission_folder["meta"]["replpack_file_id"]
     replpack_file = File().load(replpack_file_id, force=True)
-    with File().open(replpack_file) as f:
-        with zipfile.ZipFile(f) as zipf:
-            file_names = zipf.namelist()
-            print("Files in replpack archive:", file_names)
-            assert not any("ado/" in name for name in file_names)
-            assert not any(name.endswith("fail.do") for name in file_names)
+    with File().open(replpack_file) as f, zipfile.ZipFile(f) as zipf:
+        file_names = zipf.namelist()
+        print("Files in replpack archive:", file_names)
+        assert not any("ado/" in name for name in file_names)
+        assert not any(name.endswith("fail.do") for name in file_names)
 
     # Verify that TRO has two TRPs and 3 arrangements
     tro_file_id = submission_folder["meta"]["tro_file_id"]

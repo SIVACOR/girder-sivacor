@@ -10,8 +10,10 @@ sign step simply keeps running on the worker, and while workers still carry key
 material during the transition, nothing looks wrong.
 """
 
-import mock
+from unittest import mock
+
 import pytest
+
 from girder_sivacor.settings import PluginSettings
 from girder_sivacor.worker_plugin.routing import (
     DISPATCH_QUEUE,

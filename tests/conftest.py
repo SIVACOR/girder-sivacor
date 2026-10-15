@@ -1,7 +1,9 @@
 import json
-from typing import Any, Generator
 import os
-import mock
+from collections.abc import Generator
+from typing import Any
+from unittest import mock
+
 import pytest
 from girder.models.api_key import ApiKey
 from girder.models.collection import Collection
@@ -9,6 +11,7 @@ from girder.models.folder import Folder
 from girder.models.setting import Setting
 from girder.models.upload import Upload
 from girder_plugin_worker.constants import PluginSettings as WorkerSettings
+
 from girder_sivacor.settings import PluginSettings
 
 

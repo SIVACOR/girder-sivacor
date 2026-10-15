@@ -18,13 +18,14 @@ unreachable server is never read as a cancellation, and the answer latches.
 """
 
 import logging
+from unittest import mock
 
-import mock
 import pytest
 from girder_jobs.constants import JobStatus
 from girder_jobs.models.job import Job
-from girder_sivacor.worker_plugin.lib import CHECKIN_INTERVAL, CancelWatcher
 from pytest_girder.assertions import assertStatusOk
+
+from girder_sivacor.worker_plugin.lib import CHECKIN_INTERVAL, CancelWatcher
 
 from .test_reaper import make_submission
 

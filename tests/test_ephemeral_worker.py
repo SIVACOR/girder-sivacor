@@ -13,8 +13,10 @@ Two things these tests pin down, both of which would be silent in production:
   ``cancel_consumer`` broadcasts, which would stop the entire fleet consuming.
 """
 
-import mock
+from unittest import mock
+
 import pytest
+
 from girder_sivacor.worker_plugin.routing import (
     DISPATCH_QUEUE,
     is_ephemeral_worker,
@@ -102,7 +104,7 @@ def test_private_queue_is_never_cancelled(monkeypatch, task):
 
     stop_accepting_submissions(app, task)
 
-    (queue,), kwargs = app.control.cancel_consumer.call_args
+    (queue,), _kwargs = app.control.cancel_consumer.call_args
     assert queue == DISPATCH_QUEUE
     assert not queue.startswith(f"{DISPATCH_QUEUE}.")
 
@@ -118,7 +120,7 @@ def test_private_queue_is_never_cancelled(monkeypatch, task):
 # These pin the startup half of the fix. They run without Redis: the client is mocked,
 # which is also the only way to exercise the "Redis is down" branch.
 
-from girder_sivacor.worker_plugin.run_submission import (  # noqa: E402
+from girder_sivacor.worker_plugin.run_submission import (
     SPENT_KEY_PREFIX,
     SPENT_MARKER_TTL_SECONDS,
     _decline_dispatch_if_spent,

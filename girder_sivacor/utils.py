@@ -1,6 +1,7 @@
-import os
-import json
 import base64
+import json
+import os
+
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 MASTER_KEY_HEX = os.environ.get(

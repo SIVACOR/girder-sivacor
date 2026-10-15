@@ -21,14 +21,15 @@ import pytest
 from girder.exceptions import ValidationException
 from girder.models.setting import Setting
 from girder.settings import SettingDefault
-from girder_sivacor.settings import PluginSettings
-from girder_sivacor.worker_plugin.run_submission import _run_instant
-from girder_sivacor import is_conforming_capability_id
 from tro_utils.models.trs import (
     UNIDENTIFIED_TRS_ID,
     TrustedResearchSystem,
     is_conforming_trs_id,
 )
+
+from girder_sivacor import is_conforming_capability_id
+from girder_sivacor.settings import PluginSettings
+from girder_sivacor.worker_plugin.run_submission import _run_instant
 
 #: Identifiers an admin might plausibly type that cannot identify a TRS.
 BAD_IDS = [
@@ -217,7 +218,7 @@ class TestRunInstant:
         parsed = _run_instant("2026-07-31T10:00:00+02:00")
         assert parsed.utcoffset() == datetime.timedelta(hours=2)
         assert parsed == datetime.datetime(
-            2026, 7, 31, 8, 0, tzinfo=datetime.timezone.utc
+            2026, 7, 31, 8, 0, tzinfo=datetime.UTC
         )
 
     def test_naive_is_read_as_utc(self):
@@ -230,12 +231,12 @@ class TestRunInstant:
         parsed = _run_instant("2026-07-31T10:00:00")
         assert parsed.tzinfo is not None
         assert parsed == datetime.datetime(
-            2026, 7, 31, 10, 0, tzinfo=datetime.timezone.utc
+            2026, 7, 31, 10, 0, tzinfo=datetime.UTC
         )
 
     def test_utc_input_round_trips(self):
         assert _run_instant("2026-07-31T10:00:00+00:00") == datetime.datetime(
-            2026, 7, 31, 10, 0, tzinfo=datetime.timezone.utc
+            2026, 7, 31, 10, 0, tzinfo=datetime.UTC
         )
 
     def test_result_is_always_aware(self):

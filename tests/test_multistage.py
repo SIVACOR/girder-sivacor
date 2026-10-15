@@ -1,4 +1,5 @@
 import json
+
 import pytest
 from girder.models.file import File
 from girder.models.folder import Folder
@@ -6,11 +7,12 @@ from girder.models.item import Item
 from girder_jobs.constants import JobStatus
 from girder_jobs.models.job import Job
 from pytest_girder.assertions import assertStatusOk
+
 from .conftest import (
-    upload_test_file,
-    submit_sivacor_job,
-    get_submission_folder,
     assert_submission_metadata,
+    get_submission_folder,
+    submit_sivacor_job,
+    upload_test_file,
 )
 
 

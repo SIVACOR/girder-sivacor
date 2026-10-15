@@ -580,7 +580,7 @@ def report() -> dict:
 
 
 def _now():
-    return datetime.datetime.now(datetime.timezone.utc)
+    return datetime.datetime.now(datetime.UTC)
 
 
 def _hours_between(start, end) -> float | None:
@@ -597,8 +597,8 @@ def _hours_between(start, end) -> float | None:
 def _as_utc(value):
     """Mongo hands back naive datetimes; everything written here is UTC."""
     if value.tzinfo is None:
-        return value.replace(tzinfo=datetime.timezone.utc)
-    return value.astimezone(datetime.timezone.utc)
+        return value.replace(tzinfo=datetime.UTC)
+    return value.astimezone(datetime.UTC)
 
 
 def _reason_key(reason) -> str:

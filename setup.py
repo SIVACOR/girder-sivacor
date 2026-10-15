@@ -1,4 +1,4 @@
-from setuptools import setup, find_packages
+from setuptools import find_packages, setup
 
 with open("README.md") as readme_file:
     readme = readme_file.read()
@@ -48,6 +48,12 @@ requirements = [
 setup(
     author="Kacper Kowalik",
     author_email="xarthisius.kk@gmail.com",
+    # Declared at last, and the reason is `datetime.UTC` (3.11+): applying
+    # ruff's UP017 across the codebase raises the floor, so the floor has to be
+    # stated rather than inferred. 3.12 rather than 3.11 because that is what
+    # actually runs -- the Dockerfile builds on `python:3.12-slim` and CI tests
+    # 3.12 only, so anything lower has never been exercised.
+    python_requires=">=3.12",
     classifiers=[
         "Development Status :: 2 - Pre-Alpha",
         "Natural Language :: English",

@@ -1,19 +1,22 @@
 import json
-import tempfile
 import os
-import pytest
+import tempfile
 from unittest.mock import Mock
+
+import pytest
 from girder.models.file import File
 from girder.models.folder import Folder
 from girder.models.item import Item
 from girder_jobs.constants import JobStatus
 from girder_jobs.models.job import Job
 from pytest_girder.assertions import assertStatusOk
+
 from girder_sivacor.worker_plugin.lib import DockerStatsCollectorThread, NpEncoder
+
 from .conftest import (
-    upload_test_file,
-    submit_sivacor_job,
     get_submission_folder,
+    submit_sivacor_job,
+    upload_test_file,
 )
 
 
@@ -111,7 +114,8 @@ class TestDockerStatsCollectorThread:
             stats_thread.start()
             stats_thread.join(timeout=2)
 
-            rows = open(output_path + ".csv").read().splitlines()
+            with open(output_path + ".csv") as fp:
+                rows = fp.read().splitlines()
             header, data = rows[0].split(","), rows[1].split(",")
             assert header[-1] == "CPU Seconds"
             assert float(data[-1]) == pytest.approx(4.0), "4e9 ns of CPU time = 4 s"

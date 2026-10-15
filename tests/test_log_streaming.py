@@ -9,8 +9,8 @@ So the relay test below runs against an actual uvicorn instance.
 
 import asyncio
 import threading
+from unittest import mock
 
-import mock
 import pytest
 
 
@@ -55,7 +55,7 @@ def test_relay_forwards_str_over_a_real_asgi_server():
         try:
             await websocket.send_text(b"bytes payload")
             outcome["bytes_raised"] = None
-        except Exception as exc:  # noqa: BLE001 - recording it is the point
+        except Exception as exc:
             outcome["bytes_raised"] = type(exc).__name__
         await asyncio.sleep(0.3)
 
@@ -73,10 +73,10 @@ def test_relay_forwards_str_over_a_real_asgi_server():
                     try:
                         await asyncio.wait_for(conn.recv(), timeout=1)
                         outcome["second_frame"] = "delivered"
-                    except Exception as exc:  # noqa: BLE001
+                    except Exception as exc:
                         outcome["second_frame"] = type(exc).__name__
                     return
-            except (OSError, asyncio.TimeoutError):
+            except (TimeoutError, OSError):
                 await asyncio.sleep(0.25)
         pytest.skip("could not reach the local uvicorn instance")
 

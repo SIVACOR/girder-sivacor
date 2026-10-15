@@ -3,6 +3,7 @@ from girder.models.setting import Setting
 from girder.models.user import User
 from girder.settings import SettingKey
 from girder_oauth.settings import PluginSettings
+
 from girder_sivacor.auth.orcid import ORCID, RestException
 
 
