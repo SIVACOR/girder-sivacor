@@ -63,8 +63,9 @@ is not an option for the suite.
 
 ### Expected healthy result
 
-Everything passes except **2 `xfailed`** in `test_girder_upload_race.py`. Those are
-`xfail(strict=True)` and are *supposed* to fail; see the section on them below.
+Everything passes, with no `xfailed` and no `xpassed`. (Until 2026-10-15 the healthy
+state was **2 `xfailed`** in `test_girder_upload_race.py`; upstream fixed the bug and
+those are plain tests now — see the section on them below.)
 
 ## Commands
 
@@ -134,16 +135,21 @@ full story.
 The rationale is written up for review in
 `../development_notes/compliance/LEGITIMATE_INTERESTS_ASSESSMENT.md`.
 
-## `test_girder_upload_race.py` — 2 xfails that are supposed to fail
+## `test_girder_upload_race.py` — upstream's bug, now pinned as fixed
 
-The suite reports **2 xfailed**, and that is the healthy state. That file tests
-*Girder's* upload model, not ours: it reproduces an upstream bug where a failed
-chunk's rollback truncates other chunks' bytes and the upload still finalises,
-leaving a file document larger than its blob. Both tests are
-`xfail(strict=True)`, so **a pass is a failure** — it means upstream fixed the
-bug and the mitigation in `rest.py` (`verify_upload_complete`, and
-`GET /sivacor/upload_integrity`) can be reconsidered. If you see `xpassed`, read
-`../development_notes/08_girder_upload_race_plan.md` before deleting anything.
+That file tests *Girder's* upload model, not ours: a failed chunk's rollback
+truncated other chunks' bytes and the upload still finalised, leaving a file
+document larger than its blob. **Fixed upstream in girder/girder#3934, first
+released in girder 5.0.19**, which `setup.py` now sets as the floor — that floor
+is what these tests protect, so a failure here means the floor slipped or
+upstream regressed, not that SIVACOR broke.
+
+Both tests were `xfail(strict=True)` until 2026-10-15; they are plain assertions
+now, so the suite reports **no xfailed and no xpassed**. The SIVACOR-side
+mitigation in `rest.py` (`verify_upload_complete`, and
+`GET /sivacor/upload_integrity`) is **kept**: it covers deployments still running
+below the floor and is the only thing that detects a short blob already on disk.
+Background: `../development_notes/08_girder_upload_race_plan.md`.
 
 ## `tools/` — operator scripts, and not scratch
 

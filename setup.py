@@ -3,7 +3,17 @@ from setuptools import setup, find_packages
 with open("README.md") as readme_file:
     readme = readme_file.read()
 
-girder_version = "5.0.12"
+# >=5.0.19 is load-bearing. 5.0.19 is the first release carrying
+# girder/girder#3934 ("Prevent concurrent chunk collisions", fixing #3925),
+# which makes concurrent /file/chunk requests for one upload safe: progress is
+# advanced with a database update instead of a save of a stale in-memory
+# document, and a failed chunk's rollback truncates to the temp file's actual
+# size rather than to the `received` its own copy happened to hold. Against
+# 5.0.18 an aborted chunk deletes bytes another request wrote and counted, and
+# the upload still finalises -- a file document reporting a size its blob
+# cannot deliver. tests/test_girder_upload_race.py pins the fixed behaviour;
+# see development_notes/08_girder_upload_race_plan.md.
+girder_version = "5.0.19"
 requirements = [
     "cryptography",
     f"girder>={girder_version}",
