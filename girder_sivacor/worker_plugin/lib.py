@@ -26,6 +26,13 @@ from girder_worker.utils import JobStatus
 
 from ..errors import FailureCode, SubmissionError
 
+# The last module here to get one. Everything else in the plugin has logged
+# through a module logger since it was written; this file was calling the root
+# logger's convenience functions, so its lines arrived unattributed and
+# `logging.getLogger("girder_sivacor.worker_plugin.lib").setLevel(...)` -- the
+# ordinary way to turn one noisy module up or down -- did nothing at all.
+logger = logging.getLogger(__name__)
+
 MASTER_KEY_HEX = os.environ.get(
     "MASTER_KEY_HEX", "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
 )
@@ -120,14 +127,14 @@ def reap_orphaned_containers() -> list[str]:
             all=True, filters={"label": f"{ORPHAN_LABEL_QUEUE}={queue}"}
         )
     except Exception:
-        logging.warning("Orphan sweep skipped: docker unavailable", exc_info=True)
+        logger.warning("Orphan sweep skipped: docker unavailable", exc_info=True)
         return reaped
 
     for container in stale:
         job_id = (container.labels or {}).get(ORPHAN_LABEL_JOB, "unknown")
         try:
             if container.status == "running":
-                logging.warning(
+                logger.warning(
                     "Killing orphaned analysis container %s (job %s) left by a "
                     "previous worker incarnation",
                     container.name,
@@ -139,11 +146,11 @@ def reap_orphaned_containers() -> list[str]:
         except docker.errors.NotFound:
             pass
         except Exception:
-            logging.warning(
+            logger.warning(
                 "Could not reap orphaned container %s", container.name, exc_info=True
             )
     if reaped:
-        logging.warning("Orphan sweep reaped %d container(s): %s", len(reaped), reaped)
+        logger.warning("Orphan sweep reaped %d container(s): %s", len(reaped), reaped)
     return reaped
 
 
@@ -234,7 +241,7 @@ class DockerStatsCollectorThread(Thread):
             # daemon thread, where it would surface only as an unhandled-exception
             # warning and silently stop collection for the rest of the run.
             if not isinstance(d, dict):
-                logging.warning("Ignoring unexpected docker stats payload: %r", type(d))
+                logger.warning("Ignoring unexpected docker stats payload: %r", type(d))
                 continue
             ts = d.get("read")
 
@@ -502,21 +509,21 @@ class CancelWatcher:
             # document, once, so a cancel still lands during a rolling upgrade.
             if self._status_in_response:
                 self._status_in_response = False
-                logging.info(
+                logger.info(
                     "Server does not report status on check-in; falling back to "
                     "GET /job for job %s",
                     self.job_id,
                 )
             return (self.api.job(self.job_id) or {}).get("status")
         except Exception:
-            logging.warning(
+            logger.warning(
                 "Could not check in for job %s", self.job_id, exc_info=True
             )
             return None
 
     def _note_success(self, status):
         if self._failures:
-            logging.info(
+            logger.info(
                 "Check-in for job %s recovered after %d consecutive failures",
                 self.job_id,
                 self._failures,
@@ -527,7 +534,7 @@ class CancelWatcher:
             # expecting this run -- a cancel, or a failure recorded elsewhere.
             # Either way there is nothing left to finish, and the same
             # predicate submission_task uses for its pre-flight.
-            logging.info(
+            logger.info(
                 "Job %s is no longer RUNNING (status %s); stopping the run",
                 self.job_id,
                 status,
@@ -537,7 +544,7 @@ class CancelWatcher:
     def _note_failure(self):
         self._failures += 1
         if self._failures <= self.NOISY_FAILURES:
-            logging.warning(
+            logger.warning(
                 "Check-in %d for job %s failed; assuming NOT cancelled and "
                 "retrying in %ds",
                 self._failures,
@@ -545,7 +552,7 @@ class CancelWatcher:
                 self._delay(),
             )
         elif self._failures % self.QUIET_EVERY == 0:
-            logging.warning(
+            logger.warning(
                 "Still cannot reach Girder for job %s: %d consecutive check-ins "
                 "have failed. The run continues; the server-side reaper will "
                 "settle it if this is permanent.",
@@ -604,7 +611,7 @@ def aggregate_container_stats(dstats_path, performance_data):
         if "CPU Seconds" in df.columns:
             performance_data["CPUSecondsTotal"] = float(df["CPU Seconds"].max())
     except Exception:
-        logging.warning(
+        logger.warning(
             "Could not aggregate container stats from %s", dstats_path, exc_info=True
         )
 
@@ -713,7 +720,7 @@ class LogRelay:
     def _note_success(self):
         if self._failures:
             self._log(
-                logging.info,
+                logger.info,
                 "Job log writing for job %s recovered after %d consecutive "
                 "failures",
                 self.job_id,
@@ -725,7 +732,7 @@ class LogRelay:
         self._failures += 1
         if self._failures <= self.NOISY_FAILURES:
             self._log(
-                logging.warning,
+                logger.warning,
                 "Could not write to the job log for job %s (failure %d: %s); "
                 "the line stays buffered and the run continues",
                 self.job_id,
@@ -734,7 +741,7 @@ class LogRelay:
             )
         elif self._failures % self.QUIET_EVERY == 0:
             self._log(
-                logging.warning,
+                logger.warning,
                 "Still cannot write to the job log for job %s: %d consecutive "
                 "failures. The run continues; output is buffered and the "
                 "check-in is what the server is judging liveness by.",
@@ -842,7 +849,7 @@ def stata_license_mount_source(api, submission, host_tmp_root: str) -> str:
     os.chmod(
         container_path, 0o644
     )  # read-only mount, but the container's uid must read it
-    logging.info("Materialized Stata license for submission %s", submission["job_id"])
+    logger.info("Materialized Stata license for submission %s", submission["job_id"])
     return os.path.join(host_tmp_root, container_path.lstrip("/"))
 
 
@@ -901,11 +908,11 @@ def stop_container(container: docker.models.containers.Container):
             if container.status == "exited":
                 break
         if container.status != "exited":
-            logging.error(f"Unable to stop container: {container.id}")
+            logger.error(f"Unable to stop container: {container.id}")
     except docker.errors.NotFound:
-        logging.warning(f"Container {container.id} was already gone.")
+        logger.warning(f"Container {container.id} was already gone.")
     except docker.errors.DockerException as dex:
-        logging.error(dex)
+        logger.error(dex)
         raise
 
 
@@ -1088,11 +1095,11 @@ def container_memory_limit(mem_total) -> int | None:
     every submission instantly.
     """
     if not isinstance(mem_total, int) or mem_total <= 0:
-        logging.warning("Docker reported no MemTotal; analysis container uncapped")
+        logger.warning("Docker reported no MemTotal; analysis container uncapped")
         return None
     limit = mem_total - MEMORY_HEADROOM_BYTES
     if limit < MIN_CONTAINER_MEMORY_BYTES:
-        logging.warning(
+        logger.warning(
             "Host has %.1f GiB total, too little to reserve %.1f GiB; "
             "analysis container uncapped",
             mem_total / 1024**3,
@@ -1205,7 +1212,7 @@ def workspace_has_own_filesystem(path) -> bool:
     try:
         return os.stat(path).st_dev != os.stat(IMAGE_STORE_PATH).st_dev
     except OSError:
-        logging.warning("Could not compare filesystems for %s", path, exc_info=True)
+        logger.warning("Could not compare filesystems for %s", path, exc_info=True)
         return False
 
 
@@ -1247,7 +1254,7 @@ def _workspace_disk_total(submission) -> int | None:
     try:
         return shutil.disk_usage(path).total
     except OSError:
-        logging.warning("Could not determine size of %s", path, exc_info=True)
+        logger.warning("Could not determine size of %s", path, exc_info=True)
         return None
 
 
@@ -1267,7 +1274,7 @@ def disk_shortfall(submission) -> str | None:
         free = shutil.disk_usage(path).free
     except OSError:
         # Never fail a run because the check itself could not run.
-        logging.warning("Could not determine free space for %s", path, exc_info=True)
+        logger.warning("Could not determine free space for %s", path, exc_info=True)
         return None
     floor = disk_floor_bytes(submission)
     if free >= floor:
@@ -1504,7 +1511,7 @@ def image_on_disk_estimate(cli, image_reference) -> tuple[int, str] | None:
     except docker.errors.ImageNotFound:
         pass
     except Exception:
-        logging.warning(
+        logger.warning(
             "Could not check whether %s is present locally",
             image_reference,
             exc_info=True,
@@ -1515,7 +1522,7 @@ def image_on_disk_estimate(cli, image_reference) -> tuple[int, str] | None:
     family = image_family(image_reference)
     compressed_gb = _IMAGE_FAMILY_COMPRESSED_GB.get(family)
     if compressed_gb is None:
-        logging.info(
+        logger.info(
             "No recorded size for image family %r, so the pull is not pre-checked",
             family,
         )
@@ -1564,7 +1571,7 @@ def pull_space_shortfall(cli, submission, image_reference) -> str | None:
     try:
         free = shutil.disk_usage(measured).free
     except OSError:
-        logging.warning(
+        logger.warning(
             "Could not determine free space for %s", measured, exc_info=True
         )
         return None
@@ -1661,13 +1668,13 @@ class ProgressBeat:
                 # Best effort on purpose: a submission that is running fine must
                 # not be killed because one ping lost a race with a proxy
                 # restart. Missing several in a row is what the reaper acts on.
-                logging.warning("Heartbeat during a long step failed", exc_info=True)
+                logger.warning("Heartbeat during a long step failed", exc_info=True)
         if self.log_message is not None and now - self._last_log >= self.log_interval:
             self._last_log = now
             try:
                 self.api.update_job(self.job_id, log=self.log_message() + "\n")
             except Exception:
-                logging.warning("Progress report during a long step failed", exc_info=True)
+                logger.warning("Progress report during a long step failed", exc_info=True)
 
     def on_upload_progress(self, _info):
         """Adapter for ``girder_client``'s ``progressCallback``.
@@ -1758,7 +1765,7 @@ def pull_image(cli, api, submission, image_reference):
         )
     msg = f"Pulled {image_reference} ({len(layers)} layers)"
     api.update_job(job_id, log=msg + "\n")
-    logging.info(msg)
+    logger.info(msg)
 
 
 def recorded_run(api, submission, stage, env_vars):
@@ -1838,7 +1845,7 @@ def recorded_run(api, submission, stage, env_vars):
     # Same contract, for the other remote call this loop makes. See LogRelay.
     log_relay = LogRelay(submission["job_id"])
     log_queue = queue.Queue()
-    logging.info("Starting recorded run")
+    logger.info("Starting recorded run")
     api.update_job(submission["job_id"], log="Starting recorded run\n")
 
     submission_folder = api.folder(submission["folder_id"])
@@ -1895,11 +1902,11 @@ def recorded_run(api, submission, stage, env_vars):
 
     entrypoint, command, sub_dir, home_dir = _infer_run_command(submission, stage)
     project_dir = get_project_dir(submission)
-    logging.info(
+    logger.info(
         "Setting working directory to: "
         + os.path.join(target_workspace_dir, "project", sub_dir)
     )
-    logging.info("Running Tale with command: " + " ".join(entrypoint + [command]))
+    logger.info("Running Tale with command: " + " ".join(entrypoint + [command]))
     if is_matlab(image_reference):
         user = "1001:100"
         read_only = False  # Matlab needs write access to its home dir for preferences, so we set
@@ -1955,7 +1962,7 @@ def recorded_run(api, submission, stage, env_vars):
         # workers have no swap today, so this is insurance against a host that
         # does, not a change in behaviour on the current fleet.
         container_kwargs["memswap_limit"] = mem_limit
-        logging.info(
+        logger.info(
             "Analysis container capped at %.1f GiB of %.1f GiB total",
             mem_limit / 1024**3,
             info["MemTotal"] / 1024**3,
@@ -2100,13 +2107,13 @@ def recorded_run(api, submission, stage, env_vars):
         # can ever have, which is the failure this branch exists to prevent.
         oom_killed = oom_flagged or ret["StatusCode"] == 137
         if oom_killed and not oom_flagged:
-            logging.warning(
+            logger.warning(
                 "Container exited 137 without the daemon's OOMKilled flag; "
                 "reporting it as an OOM kill. Expected on cgroup v2, where the "
                 "flag is lost for short-lived containers."
             )
-        logging.info(f"Container exited with status: {ret['StatusCode']}")
-        logging.info("Collecting performance data...")
+        logger.info(f"Container exited with status: {ret['StatusCode']}")
+        logger.info("Collecting performance data...")
         performance_data.update(
             {
                 "ImageRepoTags": container.image.attrs.get("RepoTags", []),
@@ -2152,7 +2159,7 @@ def recorded_run(api, submission, stage, env_vars):
                 "Size"
             ]
         except Exception:
-            logging.warning(
+            logger.warning(
                 "Could not determine size of %s", image_reference, exc_info=True
             )
         aggregate_container_stats(dstats_tmppath, performance_data)
@@ -2175,7 +2182,7 @@ def recorded_run(api, submission, stage, env_vars):
             mime_type="text/plain",
             item_type="performance_data",
         )
-        logging.info("Performance data collected and uploaded.")
+        logger.info("Performance data collected and uploaded.")
 
         # Dump run std{out,err} and entrypoint used.
         main_file = stage["main_file"]
@@ -2188,9 +2195,9 @@ def recorded_run(api, submission, stage, env_vars):
             if key != "dockerstats":
                 with open(target_file, "wb") as fp:
                     fp.write(container.logs(stdout=stdout, stderr=stderr))
-                logging.info(f"Dumped docker {key} to {target_file}")
+                logger.info(f"Dumped docker {key} to {target_file}")
 
-        logging.info(
+        logger.info(
             "Checking for extra log files containing stdout content, which may be "
             "generated by R or Stata if the main file is detected in the project."
         )
@@ -2198,12 +2205,12 @@ def recorded_run(api, submission, stage, env_vars):
         extra_logfile = None
         if main_file.endswith(".R"):
             extra_logfile = main_file_noext + ".Rout"
-            logging.info(f"Looking for R log file: {extra_logfile}")
+            logger.info(f"Looking for R log file: {extra_logfile}")
         elif main_file.endswith(".do") or is_stata(image_reference):
             extra_logfile = main_file_noext.split(".", 1)[0] + ".log"
-            logging.info(f"Looking for Stata log file: {extra_logfile}")
+            logger.info(f"Looking for Stata log file: {extra_logfile}")
         else:
-            logging.info(
+            logger.info(
                 f"Cannot infer log file for main file {main_file}, skipping..."
             )
 
@@ -2257,7 +2264,7 @@ def recorded_run(api, submission, stage, env_vars):
 
             stage_stamp = f"\n\n===== Stage {stage_num} Output =====\n\n"
             with open(target_file, "rb") as fp:
-                logging.info(
+                logger.info(
                     f"Reading {key} from {target_file} and appending to {log_file}..."
                 )
                 with open(log_file, "ab") as out_f:
