@@ -447,6 +447,119 @@ def test_a_rung_that_left_the_catalogue_charges_nothing_rather_than_guessing(
     assert counters["instanceHours"] == pytest.approx(1.0)
 
 
+# --- scratch volumes, on every branch --------------------------------------
+#
+# #128: `accrue()` read `volumeGb` for every lifetime and spent it on the user
+# branch alone, so a run the house paid for lost all of its gigabytes and a run
+# that overran the cap lost the over-cap slice. The conservation test at the end
+# is the one that refuses to let a fourth branch repeat it.
+
+
+def house_volume_gb_hours():
+    house = UsageTotals().collection.find_one({"_id": usage.TOTALS_ID}) or {}
+    return house.get("volumeGbHours", 0.0)
+
+
+def user_volume_gb_hours(user):
+    counters = User().load(user["_id"], force=True).get(usage.USER_USAGE_FIELD) or {}
+    return counters.get("volumeGbHours", 0.0)
+
+
+@pytest.mark.plugin("sivacor")
+def test_an_unclaimed_instance_s_volume_is_house_burn_too(clean, priced):
+    """An instance nobody claimed still had a volume attached and still paid
+    Cinder for it."""
+    usage.accrue(lifetime_row(hours=2.0, size=60, volume_gb=100), None)
+    assert house_volume_gb_hours() == pytest.approx(200.0)
+
+
+@pytest.mark.plugin("sivacor")
+def test_our_own_defect_s_volume_is_charged_to_the_house(clean, priced, user):
+    """The case that cost 24,409 GB-hours on 2026-10-12: a platform fault on a
+    480 GB volume, recorded nowhere. /sivacor/volume_usage cannot see it either
+    -- it derives from job documents, and that submission has been deleted."""
+    usage.accrue(
+        lifetime_row(hours=50.852, size=60, volume_gb=480),
+        {"userId": user["_id"], "memoryGb": 60, "billable": False, "code": "unexpected"},
+    )
+    assert house_volume_gb_hours() == pytest.approx(50.852 * 480)
+    assert user_volume_gb_hours(user) == 0.0
+
+
+@pytest.mark.plugin("sivacor")
+def test_the_over_cap_slice_of_a_volume_goes_to_the_house(clean, server, user):
+    """The quiet half: the user's row looks complete, and the gigabytes past the
+    cap were simply dropped."""
+    Setting().set(PluginSettings.WORKER_SIZES, LADDER)
+    Setting().set(PluginSettings.MAX_RUNTIME, 2.0)  # cap is 2.5 h
+    usage.accrue(
+        lifetime_row(hours=10.0, size=60, volume_gb=100),
+        {"userId": user["_id"], "memoryGb": 60, "billable": True},
+    )
+    assert user_volume_gb_hours(user) == pytest.approx(2.5 * 100)
+    assert house_volume_gb_hours() == pytest.approx(7.5 * 100)
+
+
+@pytest.mark.plugin("sivacor")
+@pytest.mark.parametrize(
+    "attribution",
+    [
+        None,
+        {"memoryGb": 60, "billable": True},
+        {"memoryGb": 60, "billable": False, "code": "unexpected"},
+        {"memoryGb": 60, "billable": False},
+        {"memoryGb": 999, "billable": True},
+    ],
+    ids=["unclaimed", "billable", "our-defect", "unstamped", "no-rung"],
+)
+def test_volume_gb_hours_are_conserved_whoever_pays(
+    clean, server, user, attribution
+):
+    """The invariant, over every branch and across the cap: for any lifetime,
+    what the user is charged plus what the house absorbs equals
+    ``hours * volume_gb``. Nothing may evaporate in between.
+
+    Same instinct as ``_assert_table_is_exhaustive`` -- make the rule refuse to
+    be violated rather than hope the next branch remembers. Note the runtime
+    ceiling is set low enough that every case here also crosses the cap, so the
+    split is exercised on all of them rather than only on the billable one.
+    """
+    Setting().set(PluginSettings.WORKER_SIZES, LADDER)
+    Setting().set(PluginSettings.MAX_RUNTIME, 2.0)  # cap is 2.5 h
+    if attribution is not None:
+        attribution = dict(attribution, userId=user["_id"])
+
+    usage.accrue(lifetime_row(hours=10.0, size=60, volume_gb=100), attribution)
+
+    assert user_volume_gb_hours(user) + house_volume_gb_hours() == pytest.approx(
+        10.0 * 100
+    )
+
+
+@pytest.mark.plugin("sivacor")
+def test_a_lifetime_with_no_volume_charges_no_gigabytes(clean, priced, user):
+    """Most submissions have no scratch volume; the house row must not acquire a
+    zero-size counter's worth of noise."""
+    usage.accrue(lifetime_row(hours=1.0, size=60), None)
+    assert house_volume_gb_hours() == 0.0
+
+
+@pytest.mark.plugin("sivacor")
+def test_the_report_sums_volume_gb_hours_the_way_it_sums_su_hours(
+    clean, priced, user
+):
+    usage.accrue(
+        lifetime_row(instance_id="i-1", hours=2.0, size=60, volume_gb=50),
+        {"userId": user["_id"], "memoryGb": 60, "billable": True},
+    )
+    usage.accrue(lifetime_row(instance_id="i-2", hours=1.0, size=60, volume_gb=80), None)
+
+    report = usage.report()
+    assert report["house"]["volume_gb_hours"] == pytest.approx(80.0)
+    assert report["users"][0]["volume_gb_hours"] == pytest.approx(100.0)
+    assert report["total_volume_gb_hours"] == pytest.approx(180.0)
+
+
 @pytest.mark.plugin("sivacor")
 def test_a_backwards_lifetime_is_skipped_not_credited(clean, priced, user):
     """Charging a negative would *credit* the user, which is worse than
@@ -570,17 +683,22 @@ def test_the_house_bucket_carries_no_identifier(clean, priced, user):
     """Permanent *because* it is not personal data -- the same basis as
     sivacor_execution_record. A user or job id here would give it an erasure
     obligation it has no machinery for."""
-    usage.accrue(lifetime_row(hours=1.0, size=60), None)
+    usage.accrue(lifetime_row(hours=1.0, size=60, volume_gb=100), None)
     house = UsageTotals().collection.find_one({"_id": usage.TOTALS_ID})
     flat = str(house)
     assert str(user["_id"]) not in flat
     assert "i-1" not in flat
+    # The volume counter is here because this document has no owner -- that is
+    # the whole argument for being allowed to count gigabytes at all (#128), so
+    # the allow-list is where it has to be admitted.
+    assert house["volumeGbHours"] == pytest.approx(100.0)
     assert set(house) <= {
         "_id",
         "since",
         "lastAt",
         "suHours",
         "instanceHours",
+        "volumeGbHours",
         "instances",
         "byReason",
     }

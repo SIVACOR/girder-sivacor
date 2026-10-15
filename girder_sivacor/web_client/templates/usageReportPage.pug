@@ -64,7 +64,10 @@ mixin tile(label, value, modifier)
           | Fleet burn with no submission behind it, and runs we declined to
           |  charge because they were our own defects. Real SU against the same
           |  allocation, so it is listed beside the accounts rather than hidden:
-          |  the per-user total is never the whole bill.
+          |  the per-user total is never the whole bill. The scratch volumes
+          |  below are the same spend against the #[em Cinder] quota, which is
+          |  the smaller of the two grants and the one a new approval is argued
+          |  against.
         if !Object.keys(report.house.by_reason || {}).length
           p.g-sivacor-empty Nothing has been charged to the house.
         else
@@ -78,6 +81,10 @@ mixin tile(label, value, modifier)
                 tr
                   td: code= reason
                   td.g-sivacor-number= formatHours(hours)
+              tr
+                td
+                  strong Scratch volume GB-hours
+                td.g-sivacor-number= formatHours(report.house.volume_gb_hours)
               tr
                 td
                   strong Instances
