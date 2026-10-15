@@ -15,8 +15,8 @@ import json
 import os
 import tarfile
 import tempfile
+from unittest import mock
 
-import mock
 import pytest
 from girder.models.file import File
 from girder_jobs.constants import JobStatus
@@ -24,8 +24,8 @@ from girder_jobs.models.job import Job
 from pytest_girder.assertions import assertStatusOk
 
 from girder_sivacor.errors import FailureCode
-from girder_sivacor.rest import SIVACOR
 from girder_sivacor.models.execution_record import ExecutionRecord
+from girder_sivacor.rest import SIVACOR
 
 from .conftest import (
     assert_submission_metadata,

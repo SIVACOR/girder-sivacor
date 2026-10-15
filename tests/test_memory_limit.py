@@ -30,17 +30,18 @@ tested here.
 import os
 import tarfile
 import tempfile
+from unittest import mock
 
-import mock
 import pytest
 from girder_jobs.constants import JobStatus
+from pytest_girder.assertions import assertStatusOk
+
 from girder_sivacor.errors import FailureCode
 from girder_sivacor.worker_plugin.lib import (
     MEMORY_HEADROOM_BYTES,
     MIN_CONTAINER_MEMORY_BYTES,
     container_memory_limit,
 )
-from pytest_girder.assertions import assertStatusOk
 
 from .conftest import (
     get_submission_folder,

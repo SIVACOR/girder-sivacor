@@ -16,17 +16,19 @@ The row is now appended before the container starts and completed afterwards, so
 the static half always survives and the measured half is salvaged on the way out.
 """
 
-import mock
+from unittest import mock
+
 import pytest
 from girder_jobs.constants import JobStatus
 from girder_jobs.models.job import Job
+from pytest_girder.assertions import assertStatusOk
+
 from girder_sivacor.models.execution_record import ExecutionRecord
 from girder_sivacor.worker_plugin.lib import (
     LogRelay,
     aggregate_container_stats,
     measured_stage_telemetry,
 )
-from pytest_girder.assertions import assertStatusOk
 
 CSV_HEADER = "Timestamp,CPU %,Memory Usage,Memory Limit,Net In,Net Out,Block Read,Block Write,PIDs,CPU Seconds\n"
 

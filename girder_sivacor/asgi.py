@@ -8,7 +8,6 @@ from starlette.routing import Mount, WebSocketRoute
 
 from .logs import DockerLogStreamer
 
-
 app = Starlette(
     lifespan=lifespan,
     routes=[

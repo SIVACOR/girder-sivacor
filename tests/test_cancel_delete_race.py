@@ -23,13 +23,15 @@ See ``development_notes/incidents/2026-09-03-cancel-delete-race.md``.
 """
 
 import datetime
+from unittest import mock
 
-import mock
 import pytest
 from girder.models.folder import Folder
 from girder_client import HttpError
 from girder_jobs.constants import JobStatus
 from girder_jobs.models.job import Job
+from pytest_girder.assertions import assertStatus, assertStatusOk
+
 from girder_sivacor.errors import FailureCode, SubmissionError
 from girder_sivacor.statuses import CANCELING, COMPLETED, DELETABLE, FAILED
 from girder_sivacor.worker_plugin.girder_api import GirderApi
@@ -40,10 +42,8 @@ from girder_sivacor.worker_plugin.run_submission import (
     settle_canceling_folder,
     submission_task,
 )
-from pytest_girder.assertions import assertStatus, assertStatusOk
 
 from .test_reaper import backdate, make_submission, reap
-
 
 # --- the vocabulary itself ------------------------------------------------
 
@@ -328,9 +328,8 @@ def test_submission_task_records_the_deletion_rather_than_a_bug():
     with mock.patch(
         "girder_sivacor.worker_plugin.run_submission.GirderApi.for_task",
         return_value=api,
-    ):
-        with pytest.raises(SubmissionError) as raised:
-            decorated(mock.MagicMock(), {"job_id": "job-id", "folder_id": "gone"})
+    ), pytest.raises(SubmissionError) as raised:
+        decorated(mock.MagicMock(), {"job_id": "job-id", "folder_id": "gone"})
 
     assert raised.value.code is FailureCode.SUBMISSION_DELETED
     # The HttpError is still the cause, so a traceback still shows the 400.
@@ -401,7 +400,7 @@ def test_reap_settles_a_submission_whose_worker_died_mid_cancel(
     Folder().collection.update_one(
         {"_id": folder["_id"]}, {"$set": {"meta.status": CANCELING}}
     )
-    stale = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=2)
+    stale = datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=2)
     backdate(job, hours=2, heartbeat=stale)
     Folder().collection.update_one({"_id": folder["_id"]}, {"$set": {"updated": stale}})
 
@@ -442,7 +441,7 @@ def test_reap_leaves_a_still_running_job_to_the_main_sweep(
     Folder().collection.update_one(
         {"_id": folder["_id"]}, {"$set": {"meta.status": CANCELING}}
     )
-    stale = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=2)
+    stale = datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=2)
     backdate(job, hours=2, heartbeat=stale)
     Folder().collection.update_one({"_id": folder["_id"]}, {"$set": {"updated": stale}})
 

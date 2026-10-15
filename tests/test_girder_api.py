@@ -1,8 +1,10 @@
 """Tests for the REST layer the remote workers reach Girder through."""
 
-import mock
+from unittest import mock
+
 import pytest
 from girder_client import HttpError
+
 from girder_sivacor.worker_plugin.girder_api import GirderApi
 
 

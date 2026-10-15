@@ -2,6 +2,7 @@ import asyncio
 import datetime
 import os
 from unittest.mock import AsyncMock, Mock, patch
+
 import pytest
 
 
@@ -94,7 +95,7 @@ class TestDockerLogStreamerMethods:
     async def test_on_connect_expired_token(self, streamer_instance, mock_websocket):
         """Test connection rejection with expired token."""
         expired_time = datetime.datetime.now(
-            datetime.timezone.utc
+            datetime.UTC
         ) - datetime.timedelta(hours=1)
         expired_token = {
             "userId": "test_user_123",
@@ -115,7 +116,7 @@ class TestDockerLogStreamerMethods:
     @pytest.mark.asyncio
     async def test_on_connect_missing_user_id(self, streamer_instance, mock_websocket):
         """Test connection rejection when token missing userId."""
-        future_time = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+        future_time = datetime.datetime.now(datetime.UTC) + datetime.timedelta(
             hours=1
         )
         token_without_user = {
@@ -136,7 +137,7 @@ class TestDockerLogStreamerMethods:
     @pytest.mark.asyncio
     async def test_on_connect_invalid_scope(self, streamer_instance, mock_websocket):
         """Test connection rejection when token has invalid scope."""
-        future_time = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+        future_time = datetime.datetime.now(datetime.UTC) + datetime.timedelta(
             hours=1
         )
         valid_token = {
@@ -162,7 +163,7 @@ class TestDockerLogStreamerMethods:
     @pytest.mark.asyncio
     async def test_on_connect_success(self, streamer_instance, mock_websocket):
         """Test successful WebSocket connection."""
-        future_time = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+        future_time = datetime.datetime.now(datetime.UTC) + datetime.timedelta(
             hours=1
         )
         valid_token = {
@@ -367,8 +368,8 @@ class TestRedisMessageProcessing:
 
 if __name__ == "__main__":
     # Run tests with: python -m pytest tests/test_logs.py -v
-    import sys
     import subprocess
+    import sys
 
     result = subprocess.run(
         [sys.executable, "-m", "pytest", __file__, "-v"], capture_output=False

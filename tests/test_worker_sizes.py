@@ -17,6 +17,8 @@ from girder.models.group import Group
 from girder.models.setting import Setting
 from girder.models.user import User
 from girder_jobs.models.job import Job
+from pytest_girder.assertions import assertStatus, assertStatusOk
+
 from girder_sivacor.rest import (
     default_worker_size,
     may_select_gated_sizes,
@@ -26,7 +28,6 @@ from girder_sivacor.rest import (
 )
 from girder_sivacor.settings import PluginSettings
 from girder_sivacor.telemetry import sanitize_record
-from pytest_girder.assertions import assertStatus, assertStatusOk
 
 from .conftest import submit_sivacor_job, upload_test_file
 

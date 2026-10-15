@@ -18,6 +18,8 @@ from girder.exceptions import ValidationException
 from girder.models.setting import Setting
 from girder.models.user import User
 from girder_jobs.models.job import Job
+from pytest_girder.assertions import assertStatus, assertStatusOk
+
 from girder_sivacor.rest import (
     USER_VOLUME_QUOTA_FIELD,
     VOLUME_GRANULARITY_GB,
@@ -29,7 +31,6 @@ from girder_sivacor.rest import (
 )
 from girder_sivacor.settings import PluginSettings
 from girder_sivacor.telemetry import sanitize_record
-from pytest_girder.assertions import assertStatus, assertStatusOk
 
 from .conftest import (
     get_submission_folder,

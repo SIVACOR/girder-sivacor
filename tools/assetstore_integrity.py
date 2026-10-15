@@ -567,8 +567,7 @@ def main(argv=None):
 
     if args.jsonl:
         with open(args.jsonl, "w", encoding="utf-8") as handle:
-            for finding in file_findings + upload_findings:
-                handle.write(json.dumps(finding, sort_keys=True) + "\n")
+            handle.writelines(json.dumps(finding, sort_keys=True) + "\n" for finding in file_findings + upload_findings)
         print(f"  Wrote {len(file_findings) + len(upload_findings)} findings to {args.jsonl}")
         print("  It names researcher files; treat it as transient.")
         print()

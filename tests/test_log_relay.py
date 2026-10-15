@@ -15,9 +15,10 @@ write does not spin.
 """
 
 import queue
+from unittest import mock
 
-import mock
 import pytest
+
 from girder_sivacor.worker_plugin.lib import LogRelay
 
 

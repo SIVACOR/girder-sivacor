@@ -6,8 +6,8 @@ when their submission jobs complete (success or failure).
 """
 
 import json
+from unittest import mock
 
-import mock
 import pytest
 from girder_jobs.constants import JobStatus
 from girder_jobs.models.job import Job

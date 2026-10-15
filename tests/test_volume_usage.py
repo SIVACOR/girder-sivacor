@@ -23,9 +23,10 @@ from girder.models.setting import Setting
 from girder.models.user import User
 from girder_jobs.constants import JobStatus
 from girder_jobs.models.job import Job
+from pytest_girder.assertions import assertStatus, assertStatusOk
+
 from girder_sivacor.rest import USER_VOLUME_QUOTA_FIELD, volume_usage
 from girder_sivacor.settings import PluginSettings
-from pytest_girder.assertions import assertStatus, assertStatusOk
 
 
 def _approve(user, max_gb):
@@ -41,7 +42,7 @@ def _submission(user, disk_gb, hours=None, status=JobStatus.SUCCESS, started_ago
     and a status timeline -- and a real submission cannot be made to have
     finished two hours ago.
     """
-    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
     start = now - datetime.timedelta(hours=started_ago if started_ago is not None else (hours or 0))
     job = Job().createJob(
         title="accounting fixture",

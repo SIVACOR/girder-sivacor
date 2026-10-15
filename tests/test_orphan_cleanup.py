@@ -153,7 +153,8 @@ def test_a_real_run_stamps_the_labels(
     removes its container immediately -- so there is nothing left to inspect
     afterwards.
     """
-    import mock
+    from unittest import mock
+
     from docker.models.containers import ContainerCollection
 
     from .conftest import submit_sivacor_job, upload_test_file

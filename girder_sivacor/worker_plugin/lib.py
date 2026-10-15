@@ -12,7 +12,6 @@ import stat
 import tempfile
 import time
 import zipfile
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from pathlib import Path
 from threading import Event, Thread
 
@@ -22,6 +21,7 @@ import numpy as np
 import pandas as pd
 import redis
 import requests
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from girder_worker.utils import JobStatus
 
 from ..errors import FailureCode, SubmissionError
@@ -60,7 +60,7 @@ class NpEncoder(json.JSONEncoder):
             return float(obj)
         if isinstance(obj, np.ndarray):
             return obj.tolist()
-        return super(NpEncoder, self).default(obj)
+        return super().default(obj)
 
 
 def decrypt_job_secrets(encrypted_secrets_b64, wrapped_job_key_b64):
@@ -192,7 +192,7 @@ class LogPublisher(Thread):
 
 class DockerStatsCollectorThread(Thread):
     def __init__(self, container, output_path):
-        super(DockerStatsCollectorThread, self).__init__()
+        super().__init__()
         self.daemon = True
         self.container = container
         self.output_path = output_path

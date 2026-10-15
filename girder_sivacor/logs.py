@@ -40,7 +40,7 @@ class DockerLogStreamer(WebSocketEndpoint):
         token = Token().load(token_id, force=True, objectId=False)
         if (
             token is None
-            or token["expires"] < datetime.datetime.now(datetime.timezone.utc)
+            or token["expires"] < datetime.datetime.now(datetime.UTC)
             or "userId" not in token
             or not Token().hasScope(token, TokenScope.USER_AUTH)
         ):
@@ -85,7 +85,7 @@ class DockerLogStreamer(WebSocketEndpoint):
         Logs are read-only; we can optionally handle commands here.
         e.g., await websocket.send_text(f"Received command: {data}")
         """
-        pass  # Not needed for simple log streaming
+        # Not needed for simple log streaming
 
     async def on_disconnect(self, websocket, close_code):
         """Called when the client closes the connection."""

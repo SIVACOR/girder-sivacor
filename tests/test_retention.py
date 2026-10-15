@@ -6,8 +6,9 @@ from girder.models.folder import Folder
 from girder.models.setting import Setting
 from girder_jobs.constants import JobStatus
 from girder_jobs.models.job import Job
-from girder_sivacor.settings import PluginSettings
 from pytest_girder.assertions import assertStatusOk
+
+from girder_sivacor.settings import PluginSettings
 
 from .conftest import (
     get_submission_folder,
@@ -51,7 +52,7 @@ def test_retention_cleanup_old_folders(
     submission_folder = Folder().load(folder_id_str, force=True)
 
     # Simulate aging — backdate the folder by more than 30 days
-    old_date = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+    old_date = datetime.datetime.now(datetime.UTC) - datetime.timedelta(
         days=31
     )
     Folder().update({"_id": submission_folder["_id"]}, {"$set": {"created": old_date}})

@@ -8,8 +8,9 @@ numbers look plausible enough that nobody notices.
 import json
 
 import pytest
-from girder_sivacor.models.execution_record import ExecutionRecord
 from pytest_girder.assertions import assertStatus, assertStatusOk
+
+from girder_sivacor.models.execution_record import ExecutionRecord
 
 
 def seed(server, admin, **payload):

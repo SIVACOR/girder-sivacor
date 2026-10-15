@@ -3,8 +3,9 @@ import json
 import pytest
 from girder.exceptions import ValidationException
 from girder.models.setting import Setting
-from girder_sivacor.settings import PluginSettings
 from pytest_girder.assertions import assertStatus, assertStatusOk
+
+from girder_sivacor.settings import PluginSettings
 
 
 @pytest.mark.plugin("sivacor")

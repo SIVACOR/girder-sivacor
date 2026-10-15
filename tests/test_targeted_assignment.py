@@ -16,8 +16,8 @@ Two failure shapes drive everything here, and both are silent in production:
 """
 
 import datetime
+from unittest import mock
 
-import mock
 import pytest
 from girder.exceptions import ValidationException
 from girder.models.folder import Folder
@@ -25,6 +25,8 @@ from girder.models.setting import Setting
 from girder.models.token import Token
 from girder_jobs.constants import REST_CREATE_JOB_TOKEN_SCOPE, JobStatus
 from girder_jobs.models.job import Job
+from pytest_girder.assertions import assertStatusOk
+
 from girder_sivacor.rest import build_submission_chain, targeted_assignment
 from girder_sivacor.settings import PluginSettings
 from girder_sivacor.worker_plugin.routing import (
@@ -33,7 +35,6 @@ from girder_sivacor.worker_plugin.routing import (
     UNPINNED_TASKS,
 )
 from girder_sivacor.worker_plugin.run_submission import sign_tro
-from pytest_girder.assertions import assertStatusOk
 
 from .conftest import submit_sivacor_job, upload_test_file
 
@@ -250,7 +251,7 @@ def _running_submission(
             "status": "processing",
         },
     )
-    then = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+    then = datetime.datetime.now(datetime.UTC) - datetime.timedelta(
         minutes=age_minutes
     )
     updates = {"created": then, "updated": then}
@@ -320,7 +321,7 @@ def test_being_assigned_counts_as_a_sign_of_life(
         submission_collection,
         awaiting=True,
         age_minutes=90,
-        assigned_at=datetime.datetime.now(datetime.timezone.utc),
+        assigned_at=datetime.datetime.now(datetime.UTC),
     )
     Setting().set(PluginSettings.HEARTBEAT_TIMEOUT, 30.0)
 
@@ -333,7 +334,7 @@ def test_the_runtime_limit_starts_when_the_worker_does(
     server, db, admin, user, submission_collection
 ):
     """Waiting is not running: a queued hour must not eat the runtime budget."""
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     job = _running_submission(
         user,
         submission_collection,

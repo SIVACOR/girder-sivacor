@@ -8,13 +8,15 @@ This test module verifies:
 4. The StatusCode -123 handling in execute_workflow properly stops execution
 """
 
-import mock
+from unittest import mock
+
 import pytest
 from girder_jobs.constants import JobStatus
 from girder_jobs.models.job import Job
+from pytest_girder.assertions import assertStatusOk
+
 from girder_sivacor.worker_plugin.routing import QUEUE_PREFIX, pin_chain, worker_queue
 from girder_sivacor.worker_plugin.run_submission import submission_task
-from pytest_girder.assertions import assertStatusOk
 
 
 def _decorate(func, status=JobStatus.RUNNING, failure="Task failed"):

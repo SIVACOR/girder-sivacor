@@ -1,6 +1,7 @@
 import pytest
-from girder_sivacor.rest import stage_schema
 from pytest_girder.assertions import assertStatusOk
+
+from girder_sivacor.rest import stage_schema
 
 
 @pytest.mark.plugin("sivacor")

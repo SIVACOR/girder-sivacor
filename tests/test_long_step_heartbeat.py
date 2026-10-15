@@ -23,19 +23,19 @@ import pathlib
 import shutil
 import uuid
 import zipfile
+from unittest import mock
 
-import mock
 from girder_jobs.constants import JobStatus
-from girder_sivacor.worker_plugin.run_submission import (
-    create_workspace,
-    upload_workspace,
-)
+
 from girder_sivacor.worker_plugin.lib import (
     HEARTBEAT_INTERVAL,
     PROGRESS_LOG_INTERVAL,
     ProgressBeat,
 )
-
+from girder_sivacor.worker_plugin.run_submission import (
+    create_workspace,
+    upload_workspace,
+)
 
 # --- ProgressBeat itself ------------------------------------------------------
 

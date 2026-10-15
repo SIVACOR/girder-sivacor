@@ -167,7 +167,7 @@ def _elapsed_since(started_iso):
         started = datetime.datetime.fromisoformat(started_iso)
     except ValueError:
         return None
-    return (datetime.datetime.now(datetime.timezone.utc) - started).total_seconds()
+    return (datetime.datetime.now(datetime.UTC) - started).total_seconds()
 
 
 def record_execution(api, submission, status, step=None, exc=None):
@@ -474,7 +474,7 @@ def prepare_submission(
     # Everything the execution record needs that is known before the run
     # starts. Carried on the submission dict so each step hands it to the next.
     telemetry = {
-        "telemetry_started": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "telemetry_started": datetime.datetime.now(datetime.UTC).isoformat(),
         "telemetry_requested_memory_gb": requested_memory_gb,
         "telemetry_requested_disk_gb": requested_disk_gb,
     }
@@ -825,7 +825,7 @@ def _run_instant(value):
     """
     parsed = datetime.datetime.fromisoformat(value)
     if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=datetime.timezone.utc)
+        return parsed.replace(tzinfo=datetime.UTC)
     return parsed
 
 
@@ -853,7 +853,7 @@ def execute_workflow(task, api, submission, stage, env_vars):
     # one. tro-utils >=0.5.0 reads an offset-less timestamp as local time, so a
     # naive value recorded here would land in a signed declaration shifted by
     # the difference between the two hosts' zones.
-    start_time = datetime.datetime.now(datetime.timezone.utc)
+    start_time = datetime.datetime.now(datetime.UTC)
     ret = recorded_run(api, submission, stage, env_vars)
     if ret["StatusCode"] == -123:
         print("Termination requested, stopping execution.")
@@ -869,7 +869,7 @@ def execute_workflow(task, api, submission, stage, env_vars):
             f"Workflow execution failed with code {ret['StatusCode']}",
             detail=ret["StatusCode"],
         )
-    end_time = datetime.datetime.now(datetime.timezone.utc)
+    end_time = datetime.datetime.now(datetime.UTC)
     # recorded_run appended this stage's metrics; only it knows the wall-clock
     # span including the image pull.
     if telemetry_stages := submission.get("telemetry_stages"):
@@ -902,7 +902,7 @@ def execute_workflow(task, api, submission, stage, env_vars):
 def prune_workspace(task, api, submission):
     logger.info(f"Pruning workspace for submission {submission['folder_id']}")
     # UTC for the same reason as in execute_workflow above.
-    start_time = datetime.datetime.now(datetime.timezone.utc)
+    start_time = datetime.datetime.now(datetime.UTC)
     project_dir = pathlib.Path(get_project_dir(submission))
     patterns = copy.deepcopy(DEFAULT_SIVACOR_IGNORE)
     # Check if user provided a custom .sivacorignore
@@ -944,7 +944,7 @@ def prune_workspace(task, api, submission):
                 removed_paths.append(relative_file_str)
                 file_p.unlink()
 
-    end_time = datetime.datetime.now(datetime.timezone.utc)
+    end_time = datetime.datetime.now(datetime.UTC)
     if removed_paths:
         logger.info(
             "Pruned the following paths from the workspace:\n - "
@@ -1124,7 +1124,7 @@ def _mark_spent(instance: str) -> None:
     try:
         _redis_client_sync().set(
             f"{SPENT_KEY_PREFIX}{instance}",
-            datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            datetime.datetime.now(datetime.UTC).isoformat(),
             ex=SPENT_MARKER_TTL_SECONDS,
         )
     except Exception:
@@ -1257,7 +1257,7 @@ def _announce_ready(sender=None, **kwargs):
     try:
         _redis_client_sync().set(
             f"{READY_KEY_PREFIX}{instance}",
-            datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            datetime.datetime.now(datetime.UTC).isoformat(),
             ex=READY_MARKER_TTL_SECONDS,
         )
         logger.info("Announced worker readiness for instance %s", instance)

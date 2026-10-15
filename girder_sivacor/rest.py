@@ -321,7 +321,7 @@ def volume_usage():
     # timestamps, but reads them from Mongo without a timezone, so a job just
     # written and a job loaded later disagree about tzinfo. _naive_utc settles
     # that for the stored values; this is the same convention for "now".
-    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
     users = {}
 
     def slot(user_id, user=None):
@@ -700,7 +700,7 @@ def _as_utc(value):
     rather than a wrong answer -- silent in a periodic task.
     """
     if value.tzinfo is None:
-        return value.replace(tzinfo=datetime.timezone.utc)
+        return value.replace(tzinfo=datetime.UTC)
     return value
 
 
@@ -716,7 +716,7 @@ def _iso8601(value):
         return None
     return (
         _as_utc(value)
-        .astimezone(datetime.timezone.utc)
+        .astimezone(datetime.UTC)
         .isoformat(timespec="microseconds")
         .replace("+00:00", "Z")
     )
@@ -805,7 +805,7 @@ ACTIVE_JOB_STATUSES = (JobStatus.INACTIVE, JobStatus.QUEUED, JobStatus.RUNNING)
 
 class SIVACOR(Resource):
     def __init__(self):
-        super(SIVACOR, self).__init__()
+        super().__init__()
         self.resourceName = "sivacor"
         self.route("POST", ("submit_job",), self.submit_job)
         self.route("POST", ("cleanup",), self.cleanup_submissions)
@@ -1040,7 +1040,7 @@ class SIVACOR(Resource):
             return {"removed": 0}
 
         admin = self.getCurrentUser()
-        cutoff_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+        cutoff_time = datetime.datetime.now(datetime.UTC) - datetime.timedelta(
             days=Setting().get(PluginSettings.RETENTION_DAYS)
         )
         removed = 0
@@ -1091,7 +1091,7 @@ class SIVACOR(Resource):
         )
     )
     def heartbeat(self, job):
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.UTC)
         # Straight to the collection rather than through updateJob(): that
         # fires jobs.job.update.after, and re-running the status handler --
         # folder write, possibly an email -- once a minute per submission is
@@ -1244,7 +1244,7 @@ class SIVACOR(Resource):
         # The date is stamped here, not taken from the payload, and is
         # deliberately only a date: at pilot scale a wall-clock submission time
         # is close enough to an identifier to undo the rest of this.
-        today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+        today = datetime.datetime.now(datetime.UTC).date().isoformat()
         document = sanitize_record(
             payload,
             today,
@@ -1413,7 +1413,7 @@ class SIVACOR(Resource):
         )
     )
     def reap_submissions(self):
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.UTC)
         stale_after = datetime.timedelta(
             minutes=Setting().get(PluginSettings.HEARTBEAT_TIMEOUT)
         )
@@ -2062,7 +2062,7 @@ class SIVACOR(Resource):
         return {
             "manifestVersion": FS_MANIFEST_VERSION,
             "root": {"type": "folder", "id": str(folder["_id"])},
-            "generatedAt": _iso8601(datetime.datetime.now(datetime.timezone.utc)),
+            "generatedAt": _iso8601(datetime.datetime.now(datetime.UTC)),
             "folders": folders,
             "items": items,
             "files": files,
