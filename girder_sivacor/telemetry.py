@@ -290,12 +290,41 @@ def _sanitize_error(error):
             "code": FailureCode.UNEXPECTED.value,
             "detail": None,
         }
-    validator = _DETAIL_VALIDATORS.get(code)
     return {
         "step": _matching(error.get("step"), _IDENTIFIER),
         "code": code.value,
-        "detail": validator(error.get("detail")) if validator else None,
+        "detail": safe_detail(code, error.get("detail")),
     }
+
+
+def safe_step(step):
+    """Validate a pipeline step name, or ``None``.
+
+    The same identifier allow-list execution records use. A step name is one we
+    chose -- ``create_workspace``, ``fetch_images`` -- never anything read out
+    of the researcher's package, and validating it here keeps that true for the
+    callers that only *look* like they cannot be given something else.
+    """
+    return _matching(step, _IDENTIFIER)
+
+
+def safe_detail(code, detail):
+    """Validate one ``detail`` against the code it qualifies, or ``None``.
+
+    Split out of :func:`_sanitize_error` so that anything else keeping a
+    ``(code, detail)`` pair reuses *this* boundary instead of inventing a
+    second one -- :mod:`girder_sivacor.alerts` counts failures by that pair, and
+    a counter is a store like any other. A charset loose enough for
+    ``rocker/r-ver:4.6.1`` is also loose enough for ``/home/jane/thesis.dta``,
+    which is why the validation is per code rather than by charset, and why
+    a code with no validator stores nothing rather than storing the input.
+    """
+    try:
+        code = FailureCode(code)
+    except ValueError:
+        return None
+    validator = _DETAIL_VALIDATORS.get(code)
+    return validator(detail) if validator else None
 
 
 def _sanitize_worker(worker):
