@@ -8,8 +8,9 @@ see:
 * a long silent pull looks exactly like a dead worker to the server-side reaper;
 * a payload that fills the disk wedges the VM rather than failing its own run.
 
-Every test here covers one of those, plus the two traps in the implementation
-(a streamed pull does not raise on error; a failed heartbeat must not fail a run).
+Every test here covers one of those, plus the three traps in the implementation
+(a streamed pull does not raise on a *registry* error but does raise on a
+*daemon* one; a failed heartbeat must not fail a run).
 """
 
 from unittest import mock
@@ -17,7 +18,7 @@ from unittest import mock
 import docker
 import pytest
 
-from girder_sivacor.errors import FailureCode, SubmissionError
+from girder_sivacor.errors import FailureCode, SubmissionError, classify
 from girder_sivacor.worker_plugin.lib import (
     _IMAGE_FAMILY_COMPRESSED_GB,
     DISK_FLOOR_BYTES,
@@ -120,6 +121,179 @@ def test_failed_pull_raises_rather_than_looking_like_success():
     # registry's own error text -- is safe to keep in the execution record.
     assert exc.value.code is FailureCode.IMAGE_PULL_FAILED
     assert exc.value.detail == IMAGE
+
+
+def _api_error(status, explanation):
+    """The exception docker-py raises when the *daemon* answers with an error.
+
+    Built from a real response rather than by hand, because ``APIError.__str__``
+    reads ``response.status_code``/``.url``/``.reason`` -- a stub that lacks them
+    would make the message under test unlike the one production produces.
+    """
+    response = mock.Mock()
+    response.status_code = status
+    response.url = (
+        "http+docker://localhost/v1.52/images/create"
+        "?tag=4.4.2&fromImage=rocker%2Fgeospatial"
+    )
+    response.reason = "Internal Server Error" if status >= 500 else "Not Found"
+    return docker.errors.APIError(
+        response.reason, response=response, explanation=explanation
+    )
+
+
+def _raising_pull(exc, events=()):
+    """A pull stream that yields ``events`` and then raises, like the real one.
+
+    With no events this raises on the generator's first ``next()``, which is what
+    ``_raise_for_status()`` does for a daemon-level failure -- before any event,
+    before any heartbeat.
+    """
+
+    def stream(*_args, **_kwargs):
+        yield from events
+        raise exc
+
+    return stream
+
+
+def test_a_daemon_level_failure_is_a_pull_failure_not_a_platform_defect():
+    """The trap's other half, and what it cost.
+
+    `cli.api.pull(stream=True)` ends in `_raise_for_status()`, so a 4xx/5xx from
+    the daemon is raised by the generator's first iteration -- it never arrives
+    as an event, so the branch written for exactly this situation could not see
+    it. The exception escaped to `submission_task`'s generic handler and
+    `classify()` recorded it as `unexpected`/`APIError`: the code reserved for
+    our own bugs, keeping only the class name.
+
+    On 2026-10-12 that was a transient DNS failure, 7.9 s into stage 5 of a
+    50 h 39 m run. The permanent record said nothing true about why it ended,
+    and the one earlier `APIError` could not be compared against it.
+    """
+    cli = mock.MagicMock()
+    cli.api.pull.side_effect = _raising_pull(
+        _api_error(
+            500,
+            'failed to resolve reference "docker.io/rocker/geospatial:4.4.2": '
+            'failed to do request: Head "https://registry-1.docker.io/v2/'
+            'rocker/geospatial/manifests/4.4.2": dial tcp: lookup '
+            "registry-1.docker.io on 127.0.0.53:53: server misbehaving",
+        )
+    )
+
+    with pytest.raises(SubmissionError) as exc:
+        pull_image(cli, mock.MagicMock(), {"job_id": "job-1"}, IMAGE)
+
+    assert exc.value.code is FailureCode.IMAGE_PULL_FAILED
+    assert exc.value.detail == IMAGE
+    # And the whole point: the permanent record no longer calls this a defect.
+    assert classify(exc.value) == (FailureCode.IMAGE_PULL_FAILED, IMAGE)
+
+
+def test_a_daemon_level_failure_does_not_read_as_a_broken_package():
+    """The researcher's half. They cannot fix our DNS, and a wall of registry
+    jargon under the heading of their own submission invites them to try."""
+    cli = mock.MagicMock()
+    cli.api.pull.side_effect = _raising_pull(
+        _api_error(500, "server misbehaving")
+    )
+
+    with pytest.raises(SubmissionError) as exc:
+        pull_image(cli, mock.MagicMock(), {"job_id": "job-1"}, IMAGE)
+
+    message = str(exc.value)
+    assert IMAGE in message
+    assert "not with your replication package" in message
+    # The daemon's own words still reach the job log, where they are useful.
+    assert "server misbehaving" in message
+
+
+def test_the_daemons_traceback_survives_the_reclassification():
+    """`raise ... from exc` rather than a bare raise: the frames naming
+    `_raise_for_status` are the only record of *which* remote call failed, and
+    a post-mortem reads them. #129 will carry this same traceback through the
+    chain redaction."""
+    original = _api_error(500, "server misbehaving")
+    cli = mock.MagicMock()
+    cli.api.pull.side_effect = _raising_pull(original)
+
+    with pytest.raises(SubmissionError) as exc:
+        pull_image(cli, mock.MagicMock(), {"job_id": "job-1"}, IMAGE)
+
+    assert exc.value.__cause__ is original
+
+
+def test_a_daemon_error_that_is_really_enospc_is_still_a_disk_failure():
+    """Disk is tested before registry on the exception path too.
+
+    Routing an ENOSPC daemon error to IMAGE_PULL_FAILED would reintroduce
+    through a new door exactly the misattribution C0.1 closed.
+    """
+    cli = mock.MagicMock()
+    cli.api.pull.side_effect = _raising_pull(
+        _api_error(
+            500,
+            "failed to register layer: write /var/lib/docker/overlay2/abc/diff: "
+            "no space left on device",
+        )
+    )
+
+    with pytest.raises(SubmissionError) as exc:
+        pull_image(cli, mock.MagicMock(), {"job_id": "job-1"}, IMAGE)
+
+    assert exc.value.code is FailureCode.OUT_OF_DISK
+    assert exc.value.detail is None
+
+
+def test_a_tag_that_does_not_exist_is_a_pull_failure():
+    """ImageNotFound is an APIError subclass, so the 404 lands in the same
+    branch -- which is right: a tag nobody can fetch is a failed pull, whether
+    the daemon says so by raising or by emitting an event."""
+    response = mock.Mock(status_code=404, url="http+docker://localhost/images/create")
+    response.reason = "Not Found"
+    cli = mock.MagicMock()
+    cli.api.pull.side_effect = _raising_pull(
+        docker.errors.ImageNotFound(
+            "Not Found", response=response, explanation="manifest unknown"
+        )
+    )
+
+    with pytest.raises(SubmissionError) as exc:
+        pull_image(cli, mock.MagicMock(), {"job_id": "job-1"}, IMAGE)
+
+    assert exc.value.code is FailureCode.IMAGE_PULL_FAILED
+    assert exc.value.detail == IMAGE
+
+
+def test_a_failure_part_way_through_a_stream_is_caught_too():
+    """The daemon can also give up mid-pull, after some layers have arrived."""
+    cli = mock.MagicMock()
+    cli.api.pull.side_effect = _raising_pull(
+        _api_error(500, "server misbehaving"), events=_pull_events(3)
+    )
+
+    with pytest.raises(SubmissionError) as exc:
+        pull_image(cli, mock.MagicMock(), {"job_id": "job-1"}, IMAGE)
+
+    assert exc.value.code is FailureCode.IMAGE_PULL_FAILED
+
+
+def test_a_docker_py_bug_is_still_recorded_as_a_defect():
+    """Only APIError is caught, not DockerException. "The daemon answered with
+    an error" is a pull failure; a broken socket or a docker-py surprise is a
+    platform defect, and `unexpected` is the honest code for those -- turning
+    every docker exception into IMAGE_PULL_FAILED would hide our own bugs in a
+    bucket labelled "the registry's fault"."""
+    cli = mock.MagicMock()
+    cli.api.pull.side_effect = _raising_pull(
+        docker.errors.DockerException("Error while fetching server API version")
+    )
+
+    with pytest.raises(docker.errors.DockerException) as exc:
+        pull_image(cli, mock.MagicMock(), {"job_id": "job-1"}, IMAGE)
+
+    assert classify(exc.value) == (FailureCode.UNEXPECTED, "DockerException")
 
 
 def test_heartbeat_failure_does_not_abort_a_healthy_pull():
