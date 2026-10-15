@@ -12,6 +12,7 @@ from functools import wraps
 from importlib.metadata import version
 from zoneinfo import ZoneInfo
 
+import docker
 import pathspec
 import posix1e
 import randomname
@@ -29,11 +30,13 @@ from ..statuses import CANCELING, FAILED
 from ..telemetry import size_bucket
 from .girder_api import GirderApi, dump_to_zip
 from .lib import (
+    CancelWatcher,
     ProgressBeat,
     _redis_client_sync,
     get_project_dir,
     is_julia,
     performance_data_name,
+    prefetch_images,
     reap_orphaned_containers,
     recorded_run,
     zip_symlink,
@@ -623,6 +626,38 @@ def create_workspace(task, api, submission):
         if os.path.exists(temp_filename):
             os.remove(temp_filename)
 
+    return submission
+
+
+@app.task(queue=DISPATCH_QUEUE, bind=True)
+@submission_task("Failed to fetch analysis images")
+def fetch_images(task, api, submission):
+    """Fetch every image this submission needs, once, before stage 1.
+
+    A step of its own rather than a few lines inside ``create_workspace``,
+    because it is the step most likely to fail and the one whose failure a
+    reader most needs to find: it gets its own entry in the job tree, its own
+    duration, and its own name in the permanent execution record, so "failed
+    before any stage ran" becomes countable instead of being folded into
+    workspace creation.
+
+    It runs *before* the initial arrangement rather than after. Pulling touches
+    no workspace file, so the TRO is unaffected either way -- but hashing the
+    whole workspace is real work, and there is no reason to do it for a
+    submission whose images cannot be fetched.
+
+    See :func:`~girder_sivacor.worker_plugin.lib.prefetch_images` for why the
+    pull moved here from ``recorded_run``.
+    """
+    report(api, submission["job_id"], "Fetching analysis images.")
+    if not prefetch_images(
+        docker.from_env(), api, submission, CancelWatcher(api, submission["job_id"])
+    ):
+        # Cancelled between images. Same exit as a cancelled container run: the
+        # chain is dropped, the workspace goes, and the folder's transitional
+        # `canceling` status is settled here because this worker is provably
+        # finished with it.
+        return abandon(task, api, submission)
     return submission
 
 
