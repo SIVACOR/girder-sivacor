@@ -143,6 +143,20 @@ class PluginSettings:
     #: every worker rather than only the ones running Stata.
     STATA_LICENSE = "sivacor.stata_license"
 
+    #: HMAC key for the pseudonyms a redacted chain job carries.
+    #:
+    #: Generated on first use and never rotated, because rotating it would
+    #: split every cohort in two: the whole value of a pseudonym here is that
+    #: "the same account appears in two incidents" survives the identifier
+    #: being dropped (see :mod:`girder_sivacor.chain`).
+    #:
+    #: **Deleting it is the kill switch.** Without the key no pseudonym can be
+    #: tied to a user or to another pseudonym, which is the property that makes
+    #: keeping them defensible in the first place. Never log or export it, and
+    #: note that it is a secret in the same class as
+    #: :attr:`TRO_GPG_PASSPHRASE` rather than a tunable.
+    PSEUDONYM_SALT = "sivacor.pseudonym_salt"
+
 
 SettingDefault.defaults.update(
     {

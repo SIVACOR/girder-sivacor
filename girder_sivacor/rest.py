@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 import yaml
+from bson.errors import InvalidId
 from girder.api import access
 from girder.api.describe import Description, autoDescribeRoute
 from girder.api.rest import Resource, boundHandler, filtermodel
@@ -26,12 +27,12 @@ from girder_jobs.constants import REST_CREATE_JOB_TOKEN_SCOPE, JobStatus
 from girder_jobs.models.job import Job
 from girder_plugin_worker.utils import getWorkerApiUrl
 
-from . import alerts, usage
+from . import alerts, chain, usage
 from .errors import FailureCode
 from .models.execution_record import ExecutionRecord
 from .settings import PluginSettings
 from .statuses import CANCELING, DELETABLE, FAILED
-from .telemetry import safe_step, sanitize_record
+from .telemetry import safe_step, sanitize_failure, sanitize_record
 from .utils import encrypt_job_secrets
 from .worker_plugin.routing import DISPATCH_QUEUE, instance_id_of
 from .worker_plugin.run_submission import (
@@ -836,6 +837,8 @@ class SIVACOR(Resource):
         self.route("POST", ("claim", ":id"), self.claim)
         self.route("POST", ("execution_record",), self.record_execution)
         self.route("PUT", ("outcome", ":id"), self.record_outcome)
+        self.route("PUT", ("failure", ":id"), self.record_failure)
+        self.route("POST", ("redact_orphans",), self.redact_orphans)
         self.route("POST", ("alerts", "digest"), self.send_alert_digest)
         self.route("POST", ("alerts", "sweep"), self.sweep_unalerted)
         self.route("POST", ("usage", "drain"), self.drain_usage)
@@ -1077,7 +1080,10 @@ class SIVACOR(Resource):
             if job_id := folder.get("meta", {}).get("job_id"):
                 if main_job := Job().load(job_id, force=True):
                     Job().remove(main_job)
-                Job().collection.delete_many({"args.0.job_id": job_id})
+                # chain.chain_query, not a second spelling of it: this used to
+                # match only {"args.0.job_id": ...} and so left the head of
+                # every expired chain behind. See girder-sivacor#129.
+                Job().collection.delete_many(chain.chain_query(job_id))
             logger.info(
                 "Cleaning up submission folder %s created at %s",
                 str(folder["_id"]),
@@ -1249,6 +1255,112 @@ class SIVACOR(Resource):
             return {"stamped": False}
         usage.stamp_outcome(instance_id, code)
         return {"stamped": True, "billable": usage.is_billable(code)}
+
+    # @access.token, not @access.admin, and that is the whole reason this is
+    # not folded into /sivacor/outcome: girder_worker's failure hook runs with
+    # the per-job token out of `jobInfoSpec`, which carries the scope
+    # "jobs.job_<id>" and nothing else. The authorization below is Girder's own
+    # on PUT /job/:id, copied deliberately -- a caller may write this field for
+    # exactly the job its token names.
+    @access.token
+    @autoDescribeRoute(
+        Description("Record the traceback of a failed pipeline step.")
+        .modelParam(
+            "id",
+            "The ID of the job that failed -- usually a chain step.",
+            model=Job,
+            force=True,
+            required=True,
+        )
+        .jsonParam(
+            "failure",
+            "The structured failure, as errors.failure_record builds it.",
+            paramType="body",
+            requireObject=True,
+        )
+        .notes(
+            "**Gives the traceback a field of its own**, which is the whole "
+            "point. girder_worker's failure hook appends it to the job's "
+            "'log', where it sits in the same stream as the researcher's "
+            "container stdout -- so the log cannot be dropped without dropping "
+            "the traceback too, and a reader cannot tell the two apart. "
+            "2026-09-18 spent a whole section on a red-herring traceback that "
+            "arrived first only because two threads shared one log stream.\n\n"
+            "Stored on 'meta', which a redacted chain job keeps (see "
+            "girder_sivacor.chain), so this outlives the submission while the "
+            "log does not.\n\n"
+            "The body is not stored as sent: sanitize_failure rebuilds it "
+            "field by field, and the exception *message* survives only for the "
+            "types errors.PLATFORM_EXCEPTIONS names. A SubmissionError's "
+            "message is the researcher's by contract and a ContainerError's is "
+            "their container's stderr; both are dropped, and their class name "
+            "and frames are not."
+        )
+    )
+    def record_failure(self, job, failure):
+        user = self.getCurrentUser()
+        if user:
+            Job().requireAccess(job, user, level=AccessType.WRITE)
+        else:
+            self.ensureTokenScopes("jobs.job_" + str(job["_id"]))
+        record = sanitize_failure(failure)
+        if record is None:
+            # Nothing recognisable survived the filter, so there is nothing to
+            # store. Not an error: the caller is an exception handler and must
+            # not be handed one of its own.
+            return {"stored": False}
+        Job().collection.update_one(
+            {"_id": job["_id"]}, {"$set": {f"meta.{chain.FAILURE_KEY}": record}}
+        )
+        return {"stored": True}
+
+    @access.admin
+    @autoDescribeRoute(
+        Description("Redact chain jobs whose submission no longer exists.")
+        .param(
+            "limit",
+            "How many documents to examine in this call.",
+            required=False,
+            dataType="integer",
+            default=500,
+        )
+        .param(
+            "after",
+            "Continue from this job id -- the previous call's 'next'.",
+            required=False,
+        )
+        .notes(
+            "The backfill for girder-sivacor#129. Pressing Delete used to "
+            "remove the submission's folder and job but not its celery chain, "
+            "and cleanup_submissions finds work by iterating folders -- so "
+            "those chains became permanent. Production held 1,450 of them on "
+            "2026-10-14, 89% of every chain job it had, the oldest from "
+            "2026-08-05, each with a Girder-Token and most with a log.\n\n"
+            "Safe while the platform is live, and safe to call twice: a "
+            "redacted document leaves the query, and a chain whose submission "
+            "job still exists is counted and left alone. Paged by job id "
+            "rather than by offset, so a page that redacts nothing still "
+            "advances -- pass the returned 'next' back as 'after' until it is "
+            "null.\n\n"
+            "Neither the narration nor a traceback can be recovered here: the "
+            "submission job that held them is already gone, which is exactly "
+            "what the forward path fixes. The creator *is* recovered, from the "
+            "log's 'docker:logs:<userId>' line, and kept as a salted "
+            "pseudonym -- that line is the only place those 13 accounts "
+            "survive, and 'the same account appears in two incidents' is a "
+            "question past post-mortems have actually asked."
+        )
+    )
+    def redact_orphans(self, limit, after):
+        # Bounded at both ends: this walks a collection with every job in it,
+        # so an unbounded limit is a request to hold the whole thing in a
+        # cursor. Paging is the intended way to clear a backlog.
+        if not 1 <= limit <= 5000:
+            raise ValidationException("limit must be between 1 and 5000.")
+        try:
+            return chain.redact_orphans(limit=limit, after=after or None)
+        except InvalidId:
+            raise ValidationException(f"Not a job id: {after!r}")
 
     @access.admin
     @autoDescribeRoute(
@@ -1934,16 +2046,12 @@ class SIVACOR(Resource):
         # touch them. They carry no submission status of their own, so update
         # the collection directly rather than replaying the event handler.
         Job().collection.update_many(
-            {
-                "type": "celery",
-                "$or": [
-                    {"args.0.job_id": str(job["_id"])},
-                    {"args.3": str(job["_id"])},
-                ],
-                "status": {
+            dict(
+                chain.chain_query(job["_id"]),
+                status={
                     "$in": [JobStatus.INACTIVE, JobStatus.QUEUED, JobStatus.RUNNING]
                 },
-            },
+            ),
             {"$set": {"status": JobStatus.ERROR}},
         )
 
@@ -2372,7 +2480,28 @@ class SIVACOR(Resource):
         if not root or folder["parentId"] != root["_id"]:
             raise ValidationException("Invalid submission folder.")
 
-        job = Job().load(meta.get("job_id"), force=True)
+        # includeLog, which Job().load does *not* do by default
+        # (`_computeFields` projects it away): that log is the narration, and
+        # loading without it would copy an empty one onto the chain and look
+        # like it had worked.
+        job = Job().load(meta.get("job_id"), force=True, includeLog=True)
+        # Before the job is removed, because its log is the only copy of the
+        # platform's narration of this run and the chain is where it has to
+        # land. Never raises: a submission the researcher asked to delete must
+        # be deleted whatever the bookkeeping does -- failing here would leave
+        # the folder, the job and the chain all in place, which is the one
+        # outcome worse than losing a post-mortem.
+        try:
+            chain.redact_chain(
+                meta.get("job_id"),
+                creator_id=creator_id,
+                narration_log=(job or {}).get("log"),
+            )
+        except Exception:
+            logger.exception(
+                "Could not redact the chain of submission %s; deleting anyway",
+                meta.get("job_id"),
+            )
         if job:
             Job().remove(job)
         deleteFolderTask.delay(
@@ -2405,9 +2534,16 @@ class SIVACOR(Resource):
 @filtermodel(model=Job)
 @boundHandler
 def get_submission_child_jobs(self, job):
-    child_jobs = []
-    workspace_job = Job().findOne({"type": "celery", "args.3": str(job["_id"])})
-    if workspace_job:
-        child_jobs.append(workspace_job)
-    child_jobs += list(Job().find({"type": "celery", "args.0.job_id": str(job["_id"])}))
+    # The head of the chain first -- it is the one step whose job id sits at
+    # args[3] rather than args[0]["job_id"] -- then the rest in creation order.
+    # Both halves come out of chain.chain_query so that "this submission's
+    # chain" has one definition; see girder-sivacor#129.
+    query = chain.chain_query(job["_id"])
+    head = Job().findOne({"type": "celery", "args.3": str(job["_id"])})
+    child_jobs = [head] if head else []
+    child_jobs += [
+        child
+        for child in Job().find(query, sort=[("created", 1)])
+        if not head or child["_id"] != head["_id"]
+    ]
     return child_jobs

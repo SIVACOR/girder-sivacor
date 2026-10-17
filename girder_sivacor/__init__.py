@@ -22,6 +22,7 @@ from girder_oauth.settings import PluginSettings as OAuthSettings
 from tro_utils.models.trs import is_conforming_capability_id, is_conforming_trs_id
 
 from .auth.orcid import ORCID
+from .chain import chain_query
 from .notifications import (
     _createMessage,
     _sendmail,
@@ -39,6 +40,16 @@ def _validate_uploads_folder_name(doc):
     value = doc.get("value")
     if not isinstance(value, str) or not value:
         raise ValidationException("Uploads folder name must be a non-empty string.")
+    return value
+
+
+@setting_utilities.validator(PluginSettings.PSEUDONYM_SALT)
+def _validate_pseudonym_salt(doc):
+    value = doc.get("value")
+    if not isinstance(value, str) or len(value) < 32:
+        raise ValidationException(
+            "The pseudonym salt must be a string of at least 32 characters."
+        )
     return value
 
 
@@ -389,20 +400,16 @@ def cancel_jobs(event):
     if job["type"] != "sivacor_submission":
         return
 
-    q = {
-        "type": "celery",
-        "$or": [
-            {"args.0.job_id": str(job["_id"])},
-            {"args.3": str(job["_id"])},
-        ],
-        "status": {
+    q = dict(
+        chain_query(job["_id"]),
+        status={
             "$in": [
                 JobStatus.INACTIVE,
                 JobStatus.QUEUED,
                 JobStatus.RUNNING,
             ]
         },
-    }
+    )
     for child_job in JobModel().find(q):
         JobModel().cancelJob(child_job)
 

@@ -167,6 +167,22 @@ class GirderApi:
             parameters["detail"] = str(detail)
         return self.client.put(f"sivacor/outcome/{job_id}", parameters=parameters)
 
+    def record_failure(self, job_id, failure):
+        """Put a step's traceback somewhere other than the job log.
+
+        ``failure`` is :func:`girder_sivacor.errors.failure_record`'s output.
+        The server re-filters it -- this side builds, it does not decide.
+
+        Sent as a body rather than as parameters because ``frames`` is a list
+        and a query string serialises one by iterating it, which is the same
+        trap ``build_submission_chain`` documents for ``kwargs``.
+        """
+        return self.client.put(
+            f"sivacor/failure/{job_id}",
+            data=json.dumps(failure),
+            headers={"Content-Type": "application/json"},
+        )
+
     # -- collections, groups and access -----------------------------------
 
     def _find_collection(self, name):

@@ -42,6 +42,14 @@ contract point 1 already says the first half out loud. So:
 3. Every girder_worker celery signal handler is wrapped, so a network exception
    inside one is logged against the job it belongs to instead of appearing as
    celery's generic ``Signal handler ... raised``.
+4. One of them -- ``gw_task_failure`` -- is **replaced** rather than merely
+   wrapped, by :func:`sivacor_task_failure`. Upstream appends the traceback to
+   the job *log*, which is the same field the researcher's container output is
+   teed into; that mixed stream is what made a deleted submission's chain
+   impossible to either keep or drop. The traceback now goes to ``meta``
+   through ``PUT /sivacor/failure/:id``, with upstream's log write kept as the
+   fallback when that cannot be reached. girder-sivacor#129 and
+   :mod:`girder_sivacor.chain`.
 
 **None of that can be sufficient**, which is why it is only half the fix. A
 retry still fails if the outage outlasts it, and the failure is still only a log
@@ -77,8 +85,10 @@ of view. Every call site of ``JobManager._flush``:
 from __future__ import annotations
 
 import functools
+import json
 import logging
 import time
+import traceback as tb
 
 from celery.signals import (
     task_failure,
@@ -87,8 +97,16 @@ from celery.signals import (
     task_revoked,
     task_success,
 )
-from girder_worker.utils import JobManager, StateTransitionException
+from girder_worker.utils import (
+    JobManager,
+    JobStatus,
+    StateTransitionException,
+    _update_status,
+    is_builtin_celery_task,
+)
 from requests import HTTPError
+
+from ..errors import failure_record
 
 logger = logging.getLogger(__name__)
 
@@ -264,6 +282,87 @@ def resilient_update_status(self, status):
             return
 
 
+def _failure_url(manager):
+    """``PUT /sivacor/failure/:id`` for the job ``manager`` writes to.
+
+    Derived from ``JobManager.url`` -- ``<apiUrl>/job/<id>`` -- because that is
+    the only thing in a signal handler that knows both the API base and the job
+    id. ``jobInfoSpec`` builds it that way (``girder_plugin_worker.utils``), and
+    a worker that overrides the API base rewrites the same field, so deriving
+    from it follows the override for free.
+    """
+    base, separator, job_id = (manager.url or "").rpartition("/job/")
+    if not separator or not job_id:
+        return None
+    return f"{base}/sivacor/failure/{job_id}"
+
+
+def sivacor_task_failure(sender=None, exception=None, traceback=None, **rest):
+    """girder_worker's ``gw_task_failure``, with the traceback given a field.
+
+    Upstream appends ``"%s: %s\n%s" % (class, exception, frames)`` to the job
+    *log*. That log is the same field the researcher's container stdout is
+    teed into, which makes it a mixed stream -- and a mixed stream can be
+    neither dropped nor kept. Dropping it on deletion would have destroyed
+    2026-10-12's ``APIError`` frames (girder-sivacor#126) and 2026-09-25's
+    ``Invalid state transition to '3'``; keeping it retains a researcher's
+    stdout forever. So the traceback goes to ``meta`` instead, through a
+    server-side allow-list, and ``log`` becomes droppable in one move.
+    See girder-sivacor#129 and :mod:`girder_sivacor.chain`.
+
+    **The log write is the fallback, not the removal.** If the PUT cannot be
+    made -- an old server with no such route, an outage, a job whose URL this
+    cannot parse -- upstream's line is written after all. Losing a traceback
+    entirely is a worse outcome than keeping one in the stream it used to live
+    in, and that stream is dropped on deletion either way.
+    """
+    if is_builtin_celery_task(getattr(sender, "name", "")):
+        return
+    manager = getattr(sender, "job_manager", None)
+    if manager is None:
+        # Upstream reaches the same no-op through AttributeError.
+        return
+
+    frames = tb.format_tb(traceback) if traceback is not None else []
+    if not _put_failure(manager, failure_record(exception, frames)):
+        _quiet_log(
+            logger.warning,
+            "Could not record the traceback for %s out of band; "
+            "falling back to the job log",
+            getattr(manager, "url", "an unidentified job"),
+        )
+        try:
+            manager.write(
+                f"{type(exception).__name__}: {exception}\n{''.join(frames)}"
+            )
+        except Exception as exc:
+            _quiet_log(logger.error, "Could not write the traceback at all (%s)", exc)
+
+    _update_status(sender, JobStatus.ERROR)
+
+
+def _put_failure(manager, record):
+    """Send one failure record. Returns whether it landed. Never raises."""
+    url = _failure_url(manager)
+    if not url:
+        return False
+    try:
+        response = manager._session.request(
+            "PUT",
+            url,
+            headers={**(manager.headers or {}), "Content-Type": "application/json"},
+            data=json.dumps(record),
+            allow_redirects=True,
+        )
+        response.raise_for_status()
+        return True
+    except Exception as exc:
+        _quiet_log(
+            logger.warning, "Failure record for %s was refused (%s)", url, exc
+        )
+        return False
+
+
 def _subject(kwargs):
     """Whatever identifies the job this handler was working on.
 
@@ -336,6 +435,11 @@ _GUARDED_SIGNALS = (
     (task_postrun, "gw_task_postrun"),
 )
 
+#: girder_worker handlers replaced outright rather than merely guarded. The
+#: key names the upstream handler that is disconnected; the value is what takes
+#: its place, and is wrapped by :func:`_guarded` like the rest.
+_REPLACEMENTS = {"gw_task_failure": sivacor_task_failure}
+
 _installed = False
 #: Kept alive, and kept reachable for :func:`uninstall`. Celery's ``connect``
 #: stores receivers weakly by default, so a wrapper nothing references would be
@@ -364,7 +468,7 @@ def install():
             # would be the exact failure mode this module is about.
             logger.warning("girder_worker has no %s to guard", name)
             continue
-        wrapper = _guarded(handler)
+        wrapper = _guarded(_REPLACEMENTS.get(name, handler))
         signal.disconnect(handler)
         signal.connect(wrapper, weak=False)
         _wrappers[name] = wrapper

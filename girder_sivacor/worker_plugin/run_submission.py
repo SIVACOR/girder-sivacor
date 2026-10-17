@@ -7,6 +7,7 @@ import pathlib
 import shutil
 import tarfile
 import tempfile
+import traceback
 import zipfile
 from functools import wraps
 from importlib.metadata import version
@@ -24,7 +25,7 @@ from girder_worker.utils import JobStatus
 from tro_utils import TRPAttribute
 from tro_utils.tro_utils import TRO
 
-from ..errors import FailureCode, SubmissionError, classify
+from ..errors import FailureCode, SubmissionError, classify, failure_record
 from ..settings import PluginSettings
 from ..statuses import CANCELING, FAILED
 from ..telemetry import size_bucket
@@ -93,17 +94,46 @@ def report(api, job_id, message, status=JobStatus.RUNNING):
     api.update_job(job_id, log=f"{timestamp()} {message}\n", status=status)
 
 
-def report_failure(api, job_id, failure, exc):
+def report_failure(api, job_id, failure, exc, step=None):
     """Mark the job failed, without letting that replace ``exc``.
 
     Reporting is itself a REST call and has its own ways to fail -- most
     routinely, a job the user cancelled rejects the transition to ERROR. The
     original exception is the one worth propagating.
+
+    Two writes, to two audiences, and the split is the point. The log line is
+    the researcher's: it quotes their filenames and their Stata output, and it
+    is deleted with the submission. The failure record is the operator's: it is
+    kept on ``meta``, survives the submission (see
+    :mod:`girder_sivacor.chain`), and holds the class, the frames and -- only
+    for the types :data:`~girder_sivacor.errors.PLATFORM_EXCEPTIONS` names --
+    the message. Before girder-sivacor#129 there was one stream carrying both,
+    which meant it could be neither dropped nor kept.
     """
     try:
         report(api, job_id, f"{failure}: \n\t{exc}", status=JobStatus.ERROR)
     except Exception:
         logger.exception("Could not mark job %s as failed", job_id)
+    record_failure(api, job_id, exc, step)
+
+
+def record_failure(api, job_id, exc, step=None):
+    """Send the structured traceback. Never fails the submission.
+
+    Best effort on the same grounds as :func:`report_outcome`: it is called
+    from inside an ``except`` that is already handling the researcher's real
+    problem, and a post-mortem field must never be allowed to raise a fresh
+    exception out of an error path.
+    """
+    try:
+        record = failure_record(exc, traceback.format_tb(exc.__traceback__))
+        if step:
+            record["step"] = step
+        api.record_failure(job_id, record)
+    except Exception:
+        logger.warning(
+            "Could not record the traceback of job %s", job_id, exc_info=True
+        )
 
 
 def report_outcome(api, job_id, exc, step=None):
@@ -294,7 +324,7 @@ def submission_task(failure):
                 # the submission was deleted underneath it is not a defect, and
                 # this is the one place that can still tell.
                 failed_with = _classify_vanished_submission(api, submission, exc)
-                report_failure(api, job_id, failure, failed_with)
+                report_failure(api, job_id, failure, failed_with, func.__name__)
                 # After report_failure, which is what transitions the job to
                 # ERROR and so fires the hook that creates the attribution row.
                 # Stamping first would write onto a row that does not exist yet.
@@ -522,7 +552,9 @@ def prepare_submission(
             **telemetry,
         }
     except Exception as exc:
-        report_failure(api, job_id, "Failed to prepare submission", exc)
+        report_failure(
+            api, job_id, "Failed to prepare submission", exc, "prepare_submission"
+        )
         # This step is not wrapped by submission_task, so it needs its own
         # stamp -- the head of the chain does its own job bookkeeping.
         report_outcome(api, job_id, exc, "prepare_submission")
