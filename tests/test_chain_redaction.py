@@ -12,6 +12,7 @@ import hashlib
 import json
 
 import pytest
+from bson.objectid import ObjectId
 from girder.models.folder import Folder
 from girder.models.setting import Setting
 from girder_jobs.constants import JobStatus
@@ -809,6 +810,163 @@ def test_backfill_is_bounded_and_pages(server, db, user, admin):
     )
     assertStatusOk(resp)
     assert resp.json["redacted"] == 1
+
+
+@pytest.mark.plugin("sivacor")
+def test_the_head_step_is_found_by_its_positional_job_id(db, user):
+    """``args[3]``, which is the half of ``chain_query`` that was missing.
+
+    ``prepare_submission`` is published positionally, so it is the one step
+    whose submission is not at ``args[0]["job_id"]``. The sweep matched only
+    the latter, which is how a restored production database comes to hold chain
+    jobs older than any submission.
+    """
+    head = Job().createJob(
+        title="Moving thesis.zip to submission collection",
+        type="celery",
+        user=user,
+        args=[str(user["_id"]), "f" * 24, R_STAGES, "a" * 24, 60, None],
+    )
+    rest = Job().createJob(
+        title="Create Workspace",
+        type="celery",
+        user=user,
+        args=[{"job_id": "a" * 24}],
+    )
+    assert chain.submission_id_of(Job().load(head["_id"], force=True)) == "a" * 24
+    assert chain.submission_id_of(Job().load(rest["_id"], force=True)) == "a" * 24
+    found = {j["_id"] for j in Job().collection.find(chain.chain_query("a" * 24))}
+    assert found == {head["_id"], rest["_id"]}
+    # And a job that names no submission at all is not attributed to one.
+    assert chain.submission_id_of({"args": ["just-a-folder-id"]}) is None
+    assert chain.submission_id_of({}) is None
+
+
+@pytest.mark.plugin("sivacor")
+def test_redact_job_itself_refuses_to_run_twice(db, user):
+    """Not the same assertion as the backfill's.
+
+    ``redact_orphans`` skips a redacted document in its *query*, so a second
+    pass there proves nothing about this guard -- and neither does
+    ``redact_chain``, which after a redaction finds nothing at all because
+    ``args`` is what ``chain_query`` matches on. This is the only thing
+    standing between a re-run and a skeleton whose ``at`` has been moved and
+    whose narration has been replaced by a later caller's.
+    """
+    job = _chain_job(user, submission_id="0" * 24)
+    assert chain.redact_job(
+        Job().load(job["_id"], force=True, includeLog=True), chain_key="c-1"
+    )
+    first = Job().load(job["_id"], force=True)["meta"][chain.REDACTED_KEY]
+
+    assert not chain.redact_job(Job().load(job["_id"], force=True), chain_key="c-2")
+    again = Job().load(job["_id"], force=True)["meta"][chain.REDACTED_KEY]
+    assert again == first
+    assert again["chain"] == "c-1"
+
+
+@pytest.mark.plugin("sivacor")
+def test_the_creator_is_recovered_from_the_log_when_there_is_no_user_id(db, user):
+    """The fallback, for the older documents that are why it exists."""
+    job = _chain_job(user, submission_id="0" * 24)
+    Job().collection.update_one({"_id": job["_id"]}, {"$set": {"userId": None}})
+
+    # Deliberately loaded *without* includeLog, which is how Job().load behaves
+    # by default: the fallback has to go back to the collection for the log
+    # rather than conclude there is none.
+    chain.redact_job(Job().load(job["_id"], force=True), chain_key="c-1")
+    skeleton = Job().load(job["_id"], force=True)["meta"][chain.REDACTED_KEY]
+    assert skeleton["user"] == chain.pseudonym(str(user["_id"]), prefix="u-")
+
+    # Nothing to find is not an error; it is a chain with no pseudonym.
+    other = _chain_job(user, submission_id="0" * 24)
+    Job().collection.update_one(
+        {"_id": other["_id"]}, {"$set": {"userId": None, "log": ["quiet\n"]}}
+    )
+    chain.redact_job(Job().load(other["_id"], force=True), chain_key="c-1")
+    assert (
+        Job().load(other["_id"], force=True)["meta"][chain.REDACTED_KEY]["user"] is None
+    )
+    assert chain._creator_from_log(None) is None
+    assert chain._creator_from_log([b"not a string"]) is None
+    assert chain._creator_from_log("docker:logs:" + "a" * 24) == "a" * 24
+
+
+@pytest.mark.plugin("sivacor")
+def test_a_step_with_no_stage_records_none(db, user):
+    """Only ``execute_workflow`` carries an image; the rest are bookkeeping."""
+    assert chain._stage_of({"args": [{"job_id": "x"}]}) is None
+    assert chain._stage_of({"args": [{}, "add_arrangement", 0]}) is None
+    assert chain._stage_of({}) is None
+    # ...and an image name that is not one is not stored.
+    assert chain._stage_of({"args": [{}, {"image_name": "/home/jane/x"}]}) is None
+
+
+@pytest.mark.plugin("sivacor")
+def test_the_backfill_leaves_alone_what_it_cannot_attribute(server, db, user, admin):
+    """611 documents in a restored production database take this path.
+
+    Girder's own ``deleteFolderTask`` (``[folderId, progress, userId]``) and the
+    retired ``Cleanup submission folder`` (``[folderId]``) are ``type:
+    "celery"`` and name no submission. Not touching them is the fail-closed
+    answer -- it is also the case where we cannot tell whether a live run is
+    reading them.
+    """
+    stray = Job().createJob(
+        title="<unnamed job>",
+        type="celery",
+        user=user,
+        args=[str(ObjectId()), False, str(user["_id"])],
+    )
+    # An args[3] that is not a valid ObjectId, which 25 real documents have. A
+    # malformed id cannot name a live submission, so this one IS redacted.
+    malformed = Job().createJob(
+        title="Moving old.zip to submission collection",
+        type="celery",
+        user=user,
+        args=["u", "f", [], "not-an-object-id", 60],
+    )
+
+    resp = server.request(
+        path="/sivacor/redact_orphans", method="POST", user=admin, params={"limit": 50}
+    )
+    assertStatusOk(resp)
+    assert resp.json["unknown"] == 1
+    assert resp.json["redacted"] == 1
+
+    assert chain.REDACTED_KEY not in (
+        Job().load(stray["_id"], force=True).get("meta") or {}
+    )
+    assert Job().load(stray["_id"], force=True, includeLog=True).get("args")
+    assert chain.REDACTED_KEY in Job().load(malformed["_id"], force=True)["meta"]
+
+
+@pytest.mark.plugin("sivacor")
+def test_a_very_long_narration_is_kept_from_both_ends(db):
+    """A ProgressBeat ticks for the length of the run.
+
+    A 50-hour submission is thousands of "still pulling" lines, and a
+    post-mortem reads the start and the end of a run, not its middle.
+    """
+    line = "Still pulling dynare/dynare:6.5-R2025b (39 layers seen)"
+    kept, dropped = narration.scrub([f"{line}\n" * (narration.MAX_LINES + 50)])
+    assert dropped == 0
+    assert len(kept) == narration.MAX_LINES + 1
+    assert kept[0] == line
+    assert kept[-1] == line
+    assert "50 lines" in kept[narration.MAX_LINES // 2]
+
+
+@pytest.mark.plugin("sivacor")
+def test_narration_cannot_be_fed_something_that_is_not_a_log(db):
+    """``scrub`` is a boundary, so it takes whatever the document holds."""
+    assert narration.scrub(None) == ([], 0)
+    assert narration.scrub([]) == ([], 0)
+    assert narration.scrub([None, 42, {"not": "a line"}]) == ([], 3)
+    # A bare string, which is Girder's legacy log shape.
+    assert narration.scrub("Starting recorded run\n") == (["Starting recorded run"], 0)
+    # Blank lines are neither kept nor counted as lost.
+    assert narration.scrub(["\n   \n"]) == ([], 0)
 
 
 @pytest.mark.plugin("sivacor")

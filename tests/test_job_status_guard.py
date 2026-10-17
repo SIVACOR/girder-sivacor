@@ -530,3 +530,74 @@ def test_the_failure_url_follows_an_api_base_override(manager):
     )
     manager.url = "nonsense"
     assert job_status._failure_url(manager) is None
+
+
+def test_a_builtin_celery_task_is_left_alone(manager):
+    """Upstream's first line, and it has to stay first.
+
+    celery's own housekeeping tasks have no Girder job behind them, so
+    reporting a failure for one would be a PUT to a job that does not exist.
+
+    ``celery.chain`` rather than ``celery.backend_cleanup``, and that is not
+    arbitrary: upstream's ``BUILTIN_CELERY_TASKS`` is missing a comma after
+    ``'celery.accumulate'``, so the two implicitly concatenate into
+    ``'celery.accumulatecelery.backend_cleanup'`` and neither name is in the
+    list. Not ours to fix here, but a test asserting the guard works has to
+    pick a name the guard can actually see.
+    """
+    sender = FakeSender(manager)
+    sender.name = "celery.chain"
+    with mock.patch.object(job_status, "_update_status") as update, mock.patch.object(
+        JobManager, "write"
+    ) as write:
+        job_status.sivacor_task_failure(sender=sender, exception=ValueError())
+    update.assert_not_called()
+    write.assert_not_called()
+
+
+def test_an_unparseable_job_url_falls_back_rather_than_guessing(manager):
+    """``_failure_url`` returning None must not cost the traceback."""
+    manager.url = "not-a-job-url"
+    exc, frames = _raised(ValueError("boom"))
+    with mock.patch.object(JobManager, "write") as write, mock.patch.object(
+        job_status, "_update_status"
+    ):
+        job_status.sivacor_task_failure(
+            sender=FakeSender(manager), exception=exc, traceback=frames
+        )
+    assert write.call_count == 1
+    assert "ValueError: boom" in write.call_args.args[0]
+
+
+def test_a_failure_with_no_traceback_still_records_what_it_knows():
+    """``task_failure`` can fire without one; the class is still worth having."""
+    manager = JobManager(logPrint=False, url=JOB_URL)
+    session = fake_session(manager, FakeResponse())
+    manager.headers = {}
+    with mock.patch.object(job_status, "_update_status"):
+        job_status.sivacor_task_failure(
+            sender=FakeSender(manager), exception=ValueError("boom"), traceback=None
+        )
+    record = json.loads(session.request.call_args.kwargs["data"])
+    assert record["type"] == "builtins.ValueError"
+    assert record["frames"] == []
+
+
+def test_reporting_a_traceback_cannot_itself_destroy_a_run(manager):
+    """Both channels down, and still nothing escapes.
+
+    The same contract as ``LogRelay`` and ``_quiet_log``: this runs inside an
+    ``except`` that is already handling the researcher's real problem. If the
+    PUT fails *and* the log write fails, the failure is swallowed and the
+    status is still written -- which is the one thing that must happen.
+    """
+    fake_session(manager, requests.ConnectionError("no route"))
+    manager.headers = {}
+    exc, frames = _raised(ValueError("boom"))
+    with mock.patch.object(
+        JobManager, "write", side_effect=requests.HTTPError("502")
+    ), mock.patch.object(job_status, "_update_status") as update:
+        job_status.sivacor_task_failure(
+            sender=FakeSender(manager), exception=exc, traceback=frames
+        )
+    assert update.call_args.args[1] == 4  # JobStatus.ERROR

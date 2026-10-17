@@ -500,3 +500,38 @@ def test_cpu_seconds_total_rejects_anything_that_is_not_a_duration(value):
     )
     (stage,) = stored["stages"]
     assert stage["cpu_seconds_total"] is None
+
+
+# -- sanitize_failure's remaining edges (girder-sivacor#129) ---------------
+
+
+@pytest.mark.plugin("sivacor")
+def test_a_frame_longer_than_the_cap_is_dropped_whole(db):
+    """Match-or-drop applies to length too; a truncated frame is not one."""
+    from girder_sivacor.errors import MAX_FRAME
+    from girder_sivacor.telemetry import sanitize_failure
+
+    long_frame = '  File "%s.py", line 1, in f\n' % ("a" * MAX_FRAME)
+    assert sanitize_failure(
+        {"type": "docker.errors.APIError", "frames": [long_frame]}
+    )["frames"] == []
+    assert sanitize_failure(
+        {"type": "docker.errors.APIError", "frames": [None, 42]}
+    )["frames"] == []
+
+
+@pytest.mark.plugin("sivacor")
+def test_an_unknown_failure_code_is_dropped_with_its_detail(db):
+    """Same rule execution records use: a code we cannot name stores nothing."""
+    from girder_sivacor.telemetry import sanitize_failure
+
+    record = sanitize_failure(
+        {
+            "type": "docker.errors.APIError",
+            "code": "a_code_from_the_future",
+            "detail": "/home/jane/thesis.dta",
+            "frames": [],
+        }
+    )
+    assert record["code"] is None
+    assert record["detail"] is None
