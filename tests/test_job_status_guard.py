@@ -459,7 +459,14 @@ def _raised(exc):
         return caught, caught.__traceback__
 
 
-def test_the_traceback_goes_to_its_own_field_not_the_log(manager):
+def test_the_frames_leave_the_log_and_the_headline_stays(manager):
+    """The split, and the reason it is a split rather than a move.
+
+    Girder's job detail page renders the log and no ``meta``, so a traceback
+    written only out of band is invisible exactly where an operator looks --
+    and the playbook in ``2026-10-12-dns-pull-kills-run.md`` says to read it
+    off the job's log. So one line stays behind and only the frames move.
+    """
     session = fake_session(manager, FakeResponse())
     manager.headers = {"Girder-Token": "t"}
     exc, frames = _raised(ValueError("boom"))
@@ -470,7 +477,13 @@ def test_the_traceback_goes_to_its_own_field_not_the_log(manager):
             sender=FakeSender(manager), exception=exc, traceback=frames
         )
 
-    write.assert_not_called()
+    assert write.call_count == 1
+    logged = write.call_args.args[0]
+    assert logged == "ValueError: boom\n"
+    # One line, and specifically not the frames -- that is the whole point.
+    assert "_raised" not in logged
+    assert logged.count("\n") == 1
+
     call = session.request.call_args
     assert call.args[0] == "PUT"
     assert call.args[1].endswith("/sivacor/failure/6acfd0ac81e3e6792c37096f")
@@ -509,8 +522,12 @@ def test_the_log_is_the_fallback_when_the_field_cannot_be_written(manager):
             sender=FakeSender(manager), exception=exc, traceback=frames
         )
 
+    # The *full* thing this time, frames included: with the field unreachable
+    # the log is the only copy left.
     assert write.call_count == 1
-    assert "ValueError: boom" in write.call_args.args[0]
+    logged = write.call_args.args[0]
+    assert "ValueError: boom" in logged
+    assert "_raised" in logged
 
 
 def test_a_task_with_no_job_manager_is_a_no_op():
@@ -570,7 +587,9 @@ def test_an_unparseable_job_url_falls_back_rather_than_guessing(manager):
             sender=FakeSender(manager), exception=exc, traceback=frames
         )
     assert write.call_count == 1
-    assert "ValueError: boom" in write.call_args.args[0]
+    logged = write.call_args.args[0]
+    assert "ValueError: boom" in logged
+    assert "_raised" in logged
 
 
 def test_a_failure_with_no_traceback_still_records_what_it_knows():

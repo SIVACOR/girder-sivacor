@@ -310,11 +310,27 @@ def sivacor_task_failure(sender=None, exception=None, traceback=None, **rest):
     server-side allow-list, and ``log`` becomes droppable in one move.
     See girder-sivacor#129 and :mod:`girder_sivacor.chain`.
 
-    **The log write is the fallback, not the removal.** If the PUT cannot be
-    made -- an old server with no such route, an outage, a job whose URL this
-    cannot parse -- upstream's line is written after all. Losing a traceback
-    entirely is a worse outcome than keeping one in the stream it used to live
-    in, and that stream is dropped on deletion either way.
+    **The frames leave the log; the headline stays.** Moving the whole thing
+    out was a regression nobody would have noticed until the next incident:
+    Girder's job detail page renders ``title``, ``type``, ``_id``, ``status``,
+    a timeline, ``created`` and the *log* -- and no ``meta`` at all. So a
+    traceback written only to ``meta`` is invisible exactly where an operator
+    looks first, and step 2 of the playbook in
+    ``2026-10-12-dns-pull-kills-run.md`` says to read it off the job's log.
+
+    One line -- ``ClassName: message`` -- therefore still goes to the log, and
+    only the frames move. That costs nothing the move was buying: the line is
+    not the researcher's content, it is dropped with the log on deletion like
+    everything else there, and a single line cannot reproduce 2026-09-18's
+    red-herring, which was a *whole traceback* interleaved with another
+    thread's. ``sivacor job get <id>`` and ``GET /job/:id`` show the frames;
+    girder-sivacor#143 is the view that would put them on the page.
+
+    **The full log write is the fallback, not the removal.** If the PUT cannot
+    be made -- an old server with no such route, an outage, a job whose URL
+    this cannot parse -- upstream's line is written in full, frames and all.
+    Losing a traceback entirely is a worse outcome than keeping one in the
+    stream it used to live in, and that stream is dropped on deletion anyway.
     """
     if is_builtin_celery_task(getattr(sender, "name", "")):
         return
@@ -324,21 +340,32 @@ def sivacor_task_failure(sender=None, exception=None, traceback=None, **rest):
         return
 
     frames = tb.format_tb(traceback) if traceback is not None else []
-    if not _put_failure(manager, failure_record(exception, frames)):
+    headline = f"{type(exception).__name__}: {exception}"
+    if _put_failure(manager, failure_record(exception, frames)):
+        _write(manager, f"{headline}\n")
+    else:
         _quiet_log(
             logger.warning,
             "Could not record the traceback for %s out of band; "
             "falling back to the job log",
             getattr(manager, "url", "an unidentified job"),
         )
-        try:
-            manager.write(
-                f"{type(exception).__name__}: {exception}\n{''.join(frames)}"
-            )
-        except Exception as exc:
-            _quiet_log(logger.error, "Could not write the traceback at all (%s)", exc)
+        _write(manager, f"{headline}\n{''.join(frames)}")
 
     _update_status(sender, JobStatus.ERROR)
+
+
+def _write(manager, text):
+    """Append to the job log. Never raises.
+
+    Same contract as :meth:`LogRelay._emit` and for the same reason: this runs
+    inside an ``except`` that is already handling the researcher's real
+    problem, and a narration write must never be the thing that replaces it.
+    """
+    try:
+        manager.write(text)
+    except Exception as exc:
+        _quiet_log(logger.error, "Could not write the failure to the log (%s)", exc)
 
 
 def _put_failure(manager, record):
