@@ -662,6 +662,18 @@ class LogRelay:
     the never-raise rule. The ``print()`` one line above it did not. This closes
     that gap, and the two classes should be read together.
 
+    **This class covers one call site of ``_flush``, and the docstring above
+    used to read as though it covered the only one.** That is the same mistake
+    ``CancelWatcher`` made before 2026-09-18, one incident later:
+    ``JobManager.updateStatus`` flushes too, before writing a chain task's
+    status, and on 2026-10-16 that flush -- or the status ``PUT`` after it --
+    threw and the status was lost for good while the run finished perfectly.
+    Nothing here could have helped: it is a different call site, reached once
+    per stage at completion rather than from this loop.
+    :mod:`girder_sivacor.worker_plugin.job_status` holds the fix and the full
+    audit of every ``_flush`` call site, which is what should be read before
+    assuming any particular one is covered.
+
     **The contract, deliberately the same as CancelWatcher's:**
 
     1. *It never raises.* A progress line is the least important thing in the

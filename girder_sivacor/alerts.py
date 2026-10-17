@@ -148,6 +148,8 @@ def policy_for(code) -> Alert:
     alternative, returning ``NEVER``, would make a version skew invisible in
     precisely the way this module exists to prevent.
     """
+    if code in NON_FAILURE_POLICY:
+        return NON_FAILURE_POLICY[code]
     try:
         return ALERT_POLICY[FailureCode(code)]
     except (ValueError, KeyError):
@@ -165,6 +167,50 @@ def _now():
 #: a value into the permanent execution-record vocabulary that no raise site
 #: can ever produce.
 UNKNOWN_CODE = "unknown"
+
+#: The label for a chain job whose status write was lost and which
+#: ``/sivacor/reap`` had to reconcile. Not a ``FailureCode`` either, and for a
+#: sharper reason than ``UNKNOWN_CODE``: **nothing failed**. The run finished,
+#: signed its TRO and emailed the researcher; only the job document was wrong.
+#: See ``2026-10-16-lost-job-status.md`` and ``girder-sivacor#139``.
+LOST_STATUS_CODE = "lost_job_status"
+
+#: What to do about the labels that are not failure codes.
+#:
+#: Consulted before :data:`ALERT_POLICY`, so neither falls through to
+#: ``policy_for``'s "unrecognised, therefore a defect, therefore email" -- which
+#: is the right default for a code a worker sent and the wrong one here, where
+#: the label was chosen on this side and the decision is already made.
+#:
+#: ``LOST_STATUS_CODE`` is ``DIGEST`` rather than ``EMAIL`` on the module's own
+#: second rule -- *an alert nobody reads is worse than none*. By the time an
+#: operator could read it the backstop has already repaired the document, so
+#: there is nothing to do within the hour; what is worth seeing is the **rate**,
+#: because the measured one is once in eleven months and a jump away from that
+#: means something changed. An email per occurrence would also be an email per
+#: *job* during an outage that lost a whole chain's worth at once.
+NON_FAILURE_POLICY: dict[str, Alert] = {
+    UNKNOWN_CODE: Alert.EMAIL,
+    LOST_STATUS_CODE: Alert.DIGEST,
+}
+
+
+def note_lost_status(detail=None) -> None:
+    """Count one job whose status had to be inferred. Never raises.
+
+    Counted rather than mailed, for the reason :data:`NON_FAILURE_POLICY`
+    gives. The counter is what the daily digest reports, so a sweep that
+    reconciles eleven jobs at once is one line and the number eleven.
+
+    Never raises for the same reason :func:`consider` does not: this runs
+    inside ``/sivacor/reap``, and an alert that aborts the sweep it is
+    reporting on would strand every submission that sweep had not reached yet.
+    """
+    try:
+        AlertCounter().note(LOST_STATUS_CODE, detail)
+    except Exception:
+        logger.exception("Could not count a reconciled job for the digest")
+
 
 #: Field on the job marking that an alert decision has been taken.
 #:

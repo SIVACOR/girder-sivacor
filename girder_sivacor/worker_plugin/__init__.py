@@ -2,6 +2,8 @@ import socket
 
 from girder_worker import GirderWorkerPluginABC
 
+from .job_status import install as install_status_guards
+
 
 def _keepalive_transport_options() -> dict:
     """Broker/backend socket settings that let a dead peer actually be noticed.
@@ -95,6 +97,12 @@ class SIVACORWorkerPlugin(GirderWorkerPluginABC):
         # covered too. weak=False because the only reference to this receiver is
         # the connection itself.
         app.on_after_configure.connect(_apply_transport_options, weak=False)
+
+        # Not deferred, unlike the transport options: this patches
+        # girder_worker's own module-level objects rather than app.conf, so
+        # nothing later discards it, and it has to be in place before the first
+        # task signal fires. See job_status.py -- girder-sivacor#139.
+        install_status_guards()
 
     def task_imports(self):
         return [
