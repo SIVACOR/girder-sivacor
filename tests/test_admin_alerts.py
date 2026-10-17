@@ -328,6 +328,35 @@ def test_the_digest_is_what_makes_collapsing_a_storm_lossless(
     assert "10" in text
 
 
+def test_a_reconciled_job_is_digested_and_not_claimed_to_be_mailed(
+    clean, sent, user, admin
+):
+    """A lost status is counted, not mailed, and the digest must say so plainly.
+
+    ``lost_job_status`` is not a ``FailureCode`` -- nothing failed; a run
+    finished perfectly and only its job document was wrong (#139). So
+    ``policy_for`` would otherwise fall through to "unrecognised, therefore a
+    defect, therefore email", and the digest would append *"already mailed
+    once"* to a line about an email nobody ever received.
+    """
+    for _ in range(2):
+        alerts.note_lost_status()
+
+    result = alerts.send_digest()
+
+    assert result == {"sent": True, "signatures": 1, "failures": 2}
+    # The plain-text part, not `body()`: the HTML has a standing footnote about
+    # repeats that is about the digest as a whole, while the per-signature
+    # suffix -- the thing that would be a lie here -- is on this line.
+    plain = next(
+        part.get_content()
+        for part in messages(sent)[-1].walk()
+        if part.get_content_type() == "text/plain"
+    )
+    assert "lost_job_status" in plain
+    assert "already mailed" not in plain
+
+
 def test_the_digest_holds_no_identifier(clean, sent, user, admin):
     alerts.consider(failed_job(user), FailureCode.OUT_OF_MEMORY, 32212254720)
     alerts.send_digest()
@@ -337,6 +366,19 @@ def test_the_digest_holds_no_identifier(clean, sent, user, admin):
 
 
 # --- never breaking the thing it reports on --------------------------------
+
+
+def test_counting_a_reconciled_job_never_breaks_the_sweep(clean, admin):
+    """``note_lost_status`` runs inside ``/sivacor/reap``.
+
+    An alert that aborts the sweep it is reporting on would strand every
+    submission that sweep had not reached yet -- and this one is reporting
+    something that has already been repaired.
+    """
+    with mock.patch.object(
+        AlertCounter, "note", side_effect=RuntimeError("mongo is down")
+    ):
+        alerts.note_lost_status()  # must not raise
 
 
 def test_smtp_being_down_does_not_change_the_submission_outcome(clean, user, admin):

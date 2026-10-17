@@ -52,6 +52,21 @@ logger = logging.getLogger(__name__)
 #: longest replication run, but it grants admin access, so not by much.
 WORKER_TOKEN_DAYS = 7
 
+#: The job statuses nothing will move a job out of again.
+TERMINAL_STATUSES = (JobStatus.SUCCESS, JobStatus.ERROR, JobStatus.CANCELED)
+
+#: How quiet a RUNNING chain job has to be before its successor's terminal
+#: status is allowed to settle it.
+#:
+#: There is a real race to leave room for, and it is the other way round from
+#: the obvious one: a chain publishes its successor from the task *body*, while
+#: the predecessor's own status is written afterwards from ``task_success``. So
+#: a short successor can finish before its predecessor is marked SUCCESS, and
+#: without a grace period this sweep would "reconcile" a job whose correct
+#: status was already on the wire. Ten minutes is the reaper's own cadence, so
+#: a lost status heals within twenty.
+RECONCILE_GRACE = datetime.timedelta(minutes=10)
+
 
 def worker_sizes():
     """The size catalogue, as the operator configured it.
@@ -1483,7 +1498,12 @@ class SIVACOR(Resource):
             "Also settles submissions left mid-cancel by a worker that never "
             "came back, which are reported separately as 'settled': their job "
             "is already terminal, so there is nothing left to fail -- only a "
-            "folder status to finish writing."
+            "folder status to finish writing.\n\n"
+            "And reconciles chain jobs whose own status write was lost, "
+            "reported as 'reconciled'. These are the opposite case: the run "
+            "succeeded and only the job document is wrong, so they are "
+            "finished rather than failed. A job in RUNNING whose successor "
+            "has reached a terminal state cannot still be running."
         )
     )
     def reap_submissions(self):
@@ -1596,6 +1616,7 @@ class SIVACOR(Resource):
         return {
             "reaped": reaped,
             "settled": self._settle_canceling_folders(now, stale_after),
+            "reconciled": self._reconcile_lost_statuses(now),
         }
 
     @classmethod
@@ -1653,6 +1674,134 @@ class SIVACOR(Resource):
             )
             settled.append(str(folder["_id"]))
         return settled
+
+    @classmethod
+    def _reconcile_lost_statuses(cls, now):
+        """Settle chain jobs whose own status write was lost.
+
+        **The rule, and why it is sound:** *a job in RUNNING whose child job
+        reached a terminal state cannot still be running.* A celery chain
+        publishes its successor from the predecessor's task body, and only when
+        that body returns -- so the existence of a child job is already proof
+        that the parent's task succeeded, whatever became of the parent's status
+        afterwards. Requiring the child to be *terminal* as well is simply the
+        conservative reading, and it costs nothing: the next sweep gets it.
+
+        It follows that SUCCESS is the right status even when the child is ERROR
+        or CANCELED. The child's own outcome says nothing about the parent; what
+        says something is that the child was dispatched at all.
+
+        **What it is for.** A chain task's status is written in exactly one
+        place -- ``gw_task_success`` -> ``JobManager.updateStatus`` -- over an
+        unprotected network call, in a celery signal handler that fires after
+        the chain has already moved on. When that write is lost the run is
+        completely unaffected: it finishes, signs its TRO, uploads and emails
+        the researcher, while its job document stays RUNNING forever. Nothing
+        retries it and, before this, nothing noticed -- not the reaper, not the
+        autoscaler, not the alert digest. ``job_status.py`` makes the write much
+        harder to lose; this is what catches it when it is lost anyway, and it
+        catches the next unguarded call site too, whatever that turns out to be.
+        See ``2026-10-16-lost-job-status.md`` and ``girder-sivacor#139``.
+
+        **Chain jobs only.** A ``sivacor_submission`` job is *legitimately*
+        RUNNING while the chain jobs beneath it terminate one after another --
+        that is what a submission in progress looks like. Applying this rule to
+        one would mark a live submission SUCCESS the moment its first step
+        finished, which is a far worse bug than the one being fixed. The filter
+        on ``type`` is load-bearing; ``test_reconciliation.py`` pins it.
+
+        **No lookback window**, unlike ``alerts.sweep_undecided``, which needs
+        one because every historical failure is undecided on first deploy. Here
+        the candidate set is bounded by construction: it is the jobs that are
+        still RUNNING, and a deployment has a handful at any moment -- three on
+        production on 2026-10-17, of which two belonged to a live submission.
+        So the first sweep repairs the backlog, which is the wanted behaviour.
+        """
+        reconciled = []
+        # Materialized, and through ``Job().find`` rather than the collection,
+        # for the two reasons the sweep above gives: this loop moves jobs out
+        # of the status its own query selects on, and ``find`` drops the log
+        # from the projection while still returning a document whole enough to
+        # hand to ``updateJob``.
+        candidates = list(
+            Job().find(
+                {
+                    "type": "celery",
+                    "status": JobStatus.RUNNING,
+                    "updated": {"$lt": now - RECONCILE_GRACE},
+                }
+            )
+        )
+        for job in candidates:
+            child = Job().collection.find_one(
+                {"parentId": job["_id"], "status": {"$in": list(TERMINAL_STATUSES)}},
+                projection={"_id": 1, "status": 1},
+            )
+            if child is None:
+                continue
+            logger.warning(
+                "Reconciling job %s (%s): it is RUNNING but its successor %s "
+                "has already finished, so its own status write was lost",
+                str(job["_id"]),
+                job.get("title"),
+                str(child["_id"]),
+            )
+            if cls._mark_succeeded(job, child):
+                reconciled.append(str(job["_id"]))
+                # Counted, not mailed: by now the document is already repaired,
+                # so what an operator acts on is the rate rather than any one
+                # occurrence. alerts.NON_FAILURE_POLICY has the reasoning.
+                alerts.note_lost_status()
+        return reconciled
+
+    @staticmethod
+    def _mark_succeeded(job, child):
+        """Write the status the worker could not, and say so in the job log.
+
+        ``updateJob`` rather than a direct collection write -- the opposite
+        choice from ``_fail_stranded``, which touches chain jobs through the
+        collection. The reason differs with the direction: that one is failing a
+        whole chain at once and must *not* replay the event handler, while this
+        one is restating what the worker would have written, and so should look
+        exactly like it did -- a timestamp entry, a log line, and the status.
+        The log line matters most: a reader of this job must be able to tell
+        that its status was inferred ten minutes late rather than reported.
+
+        The update is conditional on the job still being RUNNING, inside
+        ``updateJob``'s own query, so a status that arrives between the find and
+        the write wins and this raises instead of overwriting it. That is the
+        wanted outcome, which is why the exception is swallowed as a no-op.
+        """
+        stamp = (
+            datetime.datetime.now()
+            .astimezone(ZoneInfo("America/Chicago"))
+            .replace(microsecond=0)
+            .isoformat()
+        )
+        try:
+            Job().updateJob(
+                job,
+                log=(
+                    f"[{stamp}] Status reconciled to SUCCESS by /sivacor/reap: "
+                    f"this step's successor ({child['_id']}) has already "
+                    "finished, so this step returned successfully and the "
+                    "write of its own status was lost. The run is unaffected "
+                    "(girder-sivacor#139).\n"
+                ),
+                status=JobStatus.SUCCESS,
+            )
+            return True
+        except ValidationException:
+            # Someone wrote a status after the sweep selected this job. Theirs
+            # is the reported one and this one is inferred, so theirs wins.
+            logger.info(
+                "Job %s left RUNNING before it could be reconciled; "
+                "the status that arrived wins",
+                str(job["_id"]),
+            )
+        except Exception:
+            logger.exception("Could not reconcile job %s", str(job["_id"]))
+        return False
 
     @staticmethod
     def _load_job(job_id):
