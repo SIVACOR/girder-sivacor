@@ -26,6 +26,7 @@ the thing a fix here is most likely to break, since the CANCELING path in two
 of girder_worker's signal handlers is built on that exception.
 """
 
+import json
 from unittest import mock
 
 # ``girder_worker.app`` is imported for its side effect, and the side effect is
@@ -431,3 +432,101 @@ def test_a_handler_girder_worker_does_not_have_is_skipped_loudly(reinstalled):
     # And the other four are still guarded: one missing handler must not cost
     # the rest of them.
     assert len(job_status._wrappers) == len(job_status._GUARDED_SIGNALS) - 1
+
+
+# -- the traceback's own field (girder-sivacor#129) -------------------------
+#
+# Upstream's ``gw_task_failure`` appends the traceback to the job *log*, which
+# is the same field the researcher's container stdout is teed into. A mixed
+# stream can be neither dropped nor kept: dropping it on deletion destroys
+# 2026-10-12's ``APIError`` frames, keeping it retains their stdout forever.
+# ``sivacor_task_failure`` sends it to ``meta`` instead, and falls back to the
+# log only when it cannot.
+
+
+class FakeSender:
+    name = "girder_sivacor.worker_plugin.run_submission.execute_workflow"
+
+    def __init__(self, manager):
+        self.job_manager = manager
+
+
+def _raised(exc):
+    """``exc``, with a real ``__traceback__`` on it."""
+    try:
+        raise exc
+    except type(exc) as caught:
+        return caught, caught.__traceback__
+
+
+def test_the_traceback_goes_to_its_own_field_not_the_log(manager):
+    session = fake_session(manager, FakeResponse())
+    manager.headers = {"Girder-Token": "t"}
+    exc, frames = _raised(ValueError("boom"))
+    with mock.patch.object(JobManager, "write") as write, mock.patch.object(
+        job_status, "_update_status"
+    ):
+        job_status.sivacor_task_failure(
+            sender=FakeSender(manager), exception=exc, traceback=frames
+        )
+
+    write.assert_not_called()
+    call = session.request.call_args
+    assert call.args[0] == "PUT"
+    assert call.args[1].endswith("/sivacor/failure/6acfd0ac81e3e6792c37096f")
+    record = json.loads(call.kwargs["data"])
+    assert record["type"] == "builtins.ValueError"
+    # An unlisted type keeps its class and its frames and loses its prose.
+    assert record["message"] is None
+    assert any("_raised" in frame for frame in record["frames"])
+
+
+def test_the_status_is_still_written_when_a_task_fails(manager):
+    fake_session(manager, FakeResponse())
+    manager.headers = {}
+    exc, frames = _raised(ValueError("boom"))
+    with mock.patch.object(job_status, "_update_status") as update:
+        job_status.sivacor_task_failure(
+            sender=FakeSender(manager), exception=exc, traceback=frames
+        )
+    assert update.call_args.args[1] == 4  # JobStatus.ERROR
+
+
+def test_the_log_is_the_fallback_when_the_field_cannot_be_written(manager):
+    """Losing a traceback entirely is worse than keeping it where it was.
+
+    The log is dropped on deletion either way, so the fallback costs nothing
+    that was not already being lost -- and an old server with no such route,
+    or an outage, must not be the thing that silences a post-mortem.
+    """
+    fake_session(manager, FakeResponse(404))
+    manager.headers = {}
+    exc, frames = _raised(ValueError("boom"))
+    with mock.patch.object(JobManager, "write") as write, mock.patch.object(
+        job_status, "_update_status"
+    ):
+        job_status.sivacor_task_failure(
+            sender=FakeSender(manager), exception=exc, traceback=frames
+        )
+
+    assert write.call_count == 1
+    assert "ValueError: boom" in write.call_args.args[0]
+
+
+def test_a_task_with_no_job_manager_is_a_no_op():
+    """Upstream reaches the same answer through ``except AttributeError``."""
+    sender = mock.MagicMock(name="sender")
+    sender.job_manager = None
+    with mock.patch.object(job_status, "_update_status") as update:
+        job_status.sivacor_task_failure(sender=sender, exception=ValueError())
+    update.assert_not_called()
+
+
+def test_the_failure_url_follows_an_api_base_override(manager):
+    """Derived from ``JobManager.url``, which a worker override rewrites."""
+    manager.url = "http://worker-side:8080/api/v1/job/6acfd0ac81e3e6792c37096f"
+    assert job_status._failure_url(manager) == (
+        "http://worker-side:8080/api/v1/sivacor/failure/6acfd0ac81e3e6792c37096f"
+    )
+    manager.url = "nonsense"
+    assert job_status._failure_url(manager) is None
