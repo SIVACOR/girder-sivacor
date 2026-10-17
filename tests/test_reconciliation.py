@@ -20,6 +20,7 @@ needs the *successor* to be finished, not merely to exist.
 """
 
 import datetime
+from unittest import mock
 
 import pytest
 from girder_jobs.constants import JobStatus
@@ -28,6 +29,7 @@ from pytest_girder.assertions import assertStatusOk
 
 from girder_sivacor import rest
 from girder_sivacor.models.alerts import AlertCounter
+from girder_sivacor.rest import SIVACOR
 
 pytestmark = pytest.mark.plugin("sivacor")
 
@@ -190,6 +192,57 @@ def test_a_recent_job_is_inside_the_grace_period(server, db, admin, user):
 def test_the_grace_period_is_the_reapers_own_cadence():
     """Pinned because the healing time a post-mortem quotes depends on it."""
     assert rest.RECONCILE_GRACE == datetime.timedelta(minutes=10)
+
+
+# -- losing the race, and failing, are both allowed ------------------------
+
+
+def test_a_status_that_arrives_first_wins_the_race(server, db, admin, user):
+    """A reported status beats an inferred one, and the write is what enforces it.
+
+    Reproduced without mocks, because the race is real: the sweep reads a job
+    that says RUNNING and writes a moment later, and in between the worker's
+    own status can land. ``updateJob`` puts the old status in its *query*, so
+    the write simply matches nothing -- which is the wanted outcome, not an
+    error to recover from.
+    """
+    stuck = chain_job(user)
+    child = chain_job(user, status=JobStatus.SUCCESS, parent=stuck)
+    stale = Job().load(stuck["_id"], force=True)
+    # The worker's own write lands between the sweep's read and its write.
+    Job().updateJob(Job().load(stuck["_id"], force=True), status=JobStatus.ERROR)
+
+    assert SIVACOR._mark_succeeded(stale, child) is False
+    assert status_of(stuck) == JobStatus.ERROR
+
+
+def test_a_reconciliation_that_fails_does_not_abort_the_sweep(
+    server, db, admin, user
+):
+    """One job it cannot repair must not strand the ones behind it.
+
+    The same rule every other periodic sweep here follows: a sweep that stops
+    on the first failure leaves the rest of its work undone, and this one shares
+    an endpoint with the reaper, whose work is failing stranded submissions.
+    """
+    first = quiesce(chain_job(user))
+    chain_job(user, status=JobStatus.SUCCESS, parent=first)
+    second = quiesce(chain_job(user))
+    chain_job(user, status=JobStatus.SUCCESS, parent=second)
+
+    update_job = Job.updateJob
+
+    def flaky(self, job, *args, **kwargs):
+        if job["_id"] == first["_id"]:
+            raise RuntimeError("mongo went away mid-sweep")
+        return update_job(self, job, *args, **kwargs)
+
+    with mock.patch.object(Job, "updateJob", flaky):
+        result = reap(server, admin)
+
+    assert result["reconciled"] == [str(second["_id"])]
+    assert status_of(first) == JobStatus.RUNNING
+    assert status_of(second) == JobStatus.SUCCESS
 
 
 # -- what an operator is told ---------------------------------------------

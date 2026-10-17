@@ -241,6 +241,84 @@ def test_the_short_circuits_upstream_relies_on_are_intact(manager):
     session.request.assert_not_called()
 
 
+# -- the never-raise discipline, which is the whole point -----------------
+
+
+def test_reporting_a_failure_cannot_cause_one():
+    """Logging is not a safe operation in here.
+
+    girder_worker tees *stderr* into the JobManager as well as stdout, so a
+    handler writing there goes out over the very connection that just failed.
+    An exception from inside the ``except`` that is supposed to be containing
+    the failure would defeat the containment -- which is exactly how 2026-09-18
+    reached the poll loop. Same reasoning as ``LogRelay._log``.
+    """
+
+    def emit_that_fails(*_args):
+        raise requests.HTTPError("502 Bad Gateway")
+
+    job_status._quiet_log(emit_that_fails, "anything")  # must not raise
+
+
+def test_closing_a_broken_session_cannot_break_the_retry():
+    """The connection is already in an unknown state; that is why it is closed.
+
+    ``close()`` walking a pool of sockets that are mid-failure is the least
+    surprising place for a second exception, and it must not take the retry it
+    was about to enable.
+    """
+    manager = JobManager(logPrint=False, url=JOB_URL)
+    session = fake_session(manager, FakeResponse(502), FakeResponse())
+    session.close.side_effect = OSError("broken pipe")
+
+    manager.updateStatus(3)  # must not raise
+
+    assert statuses_put(session) == [3, 3]
+    assert manager.status == 3
+
+
+def test_a_400_that_is_not_json_stays_the_error_it_was(manager):
+    """Traefik's 400 is HTML, and Girder's is JSON. Only one can be read.
+
+    A ``json()`` that throws must leave the original ``HTTPError`` on its way
+    out rather than replacing it with a ``JSONDecodeError`` about the body --
+    which would name the parser in the log and not the request.
+    """
+    response = FakeResponse(400)
+    response.json = mock.Mock(side_effect=ValueError("not json"))
+    session = fake_session(manager, response)
+
+    with pytest.raises(requests.HTTPError):
+        manager.updateStatus(3)
+
+    assert len(statuses_put(session)) == 1
+
+
+# -- what the log line says about --------------------------------------------
+
+
+def test_the_guard_names_the_job_when_it_can_and_the_task_when_it_cannot():
+    """The handlers disagree about where the task is, and one fires too early.
+
+    ``gw_task_prerun`` takes it as ``task``; the rest as ``sender``. And prerun
+    is the one signal that can fire before a JobManager exists, which is the
+    case with no job URL to name.
+    """
+    sender = mock.Mock()
+    sender.job_manager.url = JOB_URL
+    assert job_status._subject({"sender": sender}) == JOB_URL
+
+    task = mock.Mock()
+    task.job_manager.url = JOB_URL
+    assert job_status._subject({"task": task}) == JOB_URL
+
+    unspecced = mock.Mock(spec=["name"])
+    unspecced.name = "girder_sivacor.worker_plugin.run_submission.execute_workflow"
+    assert job_status._subject({"sender": unspecced}) == unspecced.name
+
+    assert job_status._subject({}) == "an unidentified task"
+
+
 # -- the wiring -----------------------------------------------------------
 
 
@@ -301,3 +379,55 @@ def test_install_is_idempotent():
     assert {
         name: job_status._wrappers[name] for _, name in job_status._GUARDED_SIGNALS
     } == before
+
+
+@pytest.fixture
+def reinstalled():
+    """Run a test against a fresh ``install()``, and put the process back.
+
+    These two tests are the only ones that watch the patch being applied rather
+    than its result, and the patch is process-global -- so the restore is in a
+    ``finally``: a failure here must not leave every later test in this worker
+    running against an unpatched girder_worker.
+    """
+    job_status.uninstall()
+    try:
+        yield
+    finally:
+        job_status.uninstall()
+        job_status.install()
+
+
+def test_uninstall_puts_girder_workers_own_handlers_back(reinstalled):
+    """Because the tests below need it, and a half-applied patch is worse than none."""
+    import girder_worker.app as gw_app
+
+    assert not job_status._installed
+    assert JobManager.updateStatus is job_status._ORIGINAL_UPDATE_STATUS
+    for signal, name in job_status._GUARDED_SIGNALS:
+        receivers = [receiver for _, receiver in signal.receivers]
+        assert getattr(gw_app, name) in receivers
+
+
+def test_a_handler_girder_worker_does_not_have_is_skipped_loudly(reinstalled):
+    """An upstream that has been reshaped under us must not fail silently.
+
+    Guarding is the only thing standing between a network blip and a lost
+    status, so a handler that has been renamed or removed upstream has to be
+    *said*, not skipped. Silence here is the exact failure mode this module
+    exists to fix, which is why there is a log line rather than a bare
+    ``continue``.
+    """
+    import girder_worker.app as gw_app
+
+    with (
+        mock.patch.object(gw_app, "gw_task_success", None),
+        mock.patch.object(job_status.logger, "warning") as warned,
+    ):
+        job_status.install()
+
+    assert "gw_task_success" in warned.call_args.args
+    assert "gw_task_success" not in job_status._wrappers
+    # And the other four are still guarded: one missing handler must not cost
+    # the rest of them.
+    assert len(job_status._wrappers) == len(job_status._GUARDED_SIGNALS) - 1

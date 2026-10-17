@@ -368,6 +368,19 @@ def test_the_digest_holds_no_identifier(clean, sent, user, admin):
 # --- never breaking the thing it reports on --------------------------------
 
 
+def test_counting_a_reconciled_job_never_breaks_the_sweep(clean, admin):
+    """``note_lost_status`` runs inside ``/sivacor/reap``.
+
+    An alert that aborts the sweep it is reporting on would strand every
+    submission that sweep had not reached yet -- and this one is reporting
+    something that has already been repaired.
+    """
+    with mock.patch.object(
+        AlertCounter, "note", side_effect=RuntimeError("mongo is down")
+    ):
+        alerts.note_lost_status()  # must not raise
+
+
 def test_smtp_being_down_does_not_change_the_submission_outcome(clean, user, admin):
     """The same never-raise rule the heartbeat follows. The run already failed;
     failing it differently because we could not talk about it helps nobody."""
