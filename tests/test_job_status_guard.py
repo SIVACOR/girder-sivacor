@@ -542,8 +542,12 @@ def test_a_builtin_celery_task_is_left_alone(manager):
     arbitrary: upstream's ``BUILTIN_CELERY_TASKS`` is missing a comma after
     ``'celery.accumulate'``, so the two implicitly concatenate into
     ``'celery.accumulatecelery.backend_cleanup'`` and neither name is in the
-    list. Not ours to fix here, but a test asserting the guard works has to
-    pick a name the guard can actually see.
+    list. Fixed upstream in girder/girder#3959; until that is released, a test
+    asserting the guard works has to pick a name the guard can actually see.
+
+    ``celery.chain`` keeps working either way, so this does not need revisiting
+    when the fix lands -- and it is the more representative name regardless,
+    since a SIVACOR submission *is* a chain.
     """
     sender = FakeSender(manager)
     sender.name = "celery.chain"
