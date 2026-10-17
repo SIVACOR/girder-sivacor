@@ -135,6 +135,85 @@ full story.
 The rationale is written up for review in
 `../development_notes/compliance/LEGITIMATE_INTERESTS_ASSESSMENT.md`.
 
+## Deleting a submission — what goes, and what is kept redacted
+
+`chain.py` is the only definition of "this submission's chain", and it is a
+`$or`: the head step (`prepare_submission`) is published positionally and
+carries the submission's job id at `args[3]`, every step after it gets the
+previous step's return value and carries it at `args[0]["job_id"]`. Two
+spellings of that existed until girder-sivacor#129 and the narrower one was the
+one doing the deleting, so the retention sweep had been leaving the head of
+every expired chain behind since the pipeline was written.
+
+The two paths differ on purpose:
+
+* **The retention sweep deletes the chain outright**, with everything else.
+* **`DELETE /sivacor/submission/:id` redacts it and keeps the skeleton.** The
+  log, the `jobInfoSpec` token, `args` (workspace paths, the main file's name,
+  the secrets envelope) and the creator's id all go; `title`, `status`,
+  `timestamps`, the celery parent link, the image each stage ran, the
+  traceback and a scrubbed copy of the submission job's narration stay. That
+  set is not a guess — it is every column the appendix of
+  `../development_notes/incidents/2026-10-12-dns-pull-kills-run.md` found a
+  past write-up had actually depended on.
+
+Three things to know before changing any of it:
+
+* **`redact_job` is an allow-list applied as an unset of its complement.** A
+  field a future girder_worker invents is dropped with no one remembering to
+  drop it. Same rule as `telemetry.sanitize_record`, same reason.
+* **A traceback has its own field now** (`meta.sivacorFailure`, written by
+  `PUT /sivacor/failure/:id`). girder_worker's `gw_task_failure` is *replaced*,
+  not merely guarded, in `worker_plugin/job_status.py`: upstream appends the
+  traceback to the job log, which is where the researcher's container stdout
+  also goes, and a mixed stream can be neither kept nor dropped. The message
+  survives only for the exception types `errors.PLATFORM_EXCEPTIONS` names —
+  a `SubmissionError`'s text is the researcher's by contract.
+* **`narration.py` will rot, and is built to rot loudly.** It is a template
+  per log line the platform writes, and a line nobody listed is dropped and
+  counted.
+  `test_chain_redaction.py::test_the_platforms_narration_survives_the_submission`
+  runs a real submission and fails if that count is non-zero, naming the line.
+  **If you add a line to a submission job's log, add its template**; that test
+  is the only thing standing between a new line and its silent disappearance
+  from every future post-mortem.
+
+The backfill is `POST /sivacor/redact_orphans` (admin). Bounded, idempotent,
+and paged by job id rather than by offset so a page that redacts nothing still
+advances — pass the returned `next` back as `after` until it is null. It never
+touches a chain whose submission job still exists.
+
+**Measured against the 2026-10-16 production dump restored into `deploy-dev`**,
+which is the only way any of this was checked and is worth repeating before
+running it anywhere real (`deploy-dev/restore_dump.sh`):
+
+| | issue #129 (2026-10-14) | restored dump |
+|---|---|---|
+| celery chain jobs | 1,636 | **5,175** |
+| oldest | 2026-08-05 | **2025-11-14** |
+| orphaned | 1,450 (89 %) | **3,191 (62 %)** |
+| belonging to a live submission | 186 | 1,373 |
+| `userId` on the document | *"is `None`"* | **set on all 5,175** |
+
+The issue's counts are all low and its `userId` claim is wrong, so do not size
+anything from them. Two consequences in the code: the pseudonym is taken from
+`userId` first and only falls back to scraping `docker:logs:<id>` out of the
+log, and 25 chain jobs carry an `args[3]` that is not a valid ObjectId — a
+malformed id cannot name a live submission, so they are redacted rather than
+skipped.
+
+**611 `type: "celery"` jobs are left untouched and still hold a Girder-Token**:
+441 are Girder's own `deleteFolderTask` (titled `<unnamed job>`, args
+`[folderId, progress, userId]`) and 170 are the retired `Cleanup submission
+folder`, 169 of which still have a log. Neither is "this submission's chain" by
+`chain_query`'s definition, so the backfill counts them as `unknown` and does
+not touch them. That is the fail-closed answer and it is also an unclosed gap —
+it is not in #129's scope, and it is a real one.
+
+`sivacor.pseudonym_salt` is generated on first use and **deleting it is the
+kill switch**: every pseudonym ever written becomes unlinkable to every other,
+which is the property that makes keeping them defensible at all.
+
 ## `test_girder_upload_race.py` — upstream's bug, now pinned as fixed
 
 That file tests *Girder's* upload model, not ours: a failed chunk's rollback

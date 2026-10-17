@@ -26,6 +26,7 @@ the thing a fix here is most likely to break, since the CANCELING path in two
 of girder_worker's signal handlers is built on that exception.
 """
 
+import json
 from unittest import mock
 
 # ``girder_worker.app`` is imported for its side effect, and the side effect is
@@ -431,3 +432,176 @@ def test_a_handler_girder_worker_does_not_have_is_skipped_loudly(reinstalled):
     # And the other four are still guarded: one missing handler must not cost
     # the rest of them.
     assert len(job_status._wrappers) == len(job_status._GUARDED_SIGNALS) - 1
+
+
+# -- the traceback's own field (girder-sivacor#129) -------------------------
+#
+# Upstream's ``gw_task_failure`` appends the traceback to the job *log*, which
+# is the same field the researcher's container stdout is teed into. A mixed
+# stream can be neither dropped nor kept: dropping it on deletion destroys
+# 2026-10-12's ``APIError`` frames, keeping it retains their stdout forever.
+# ``sivacor_task_failure`` sends it to ``meta`` instead, and falls back to the
+# log only when it cannot.
+
+
+class FakeSender:
+    name = "girder_sivacor.worker_plugin.run_submission.execute_workflow"
+
+    def __init__(self, manager):
+        self.job_manager = manager
+
+
+def _raised(exc):
+    """``exc``, with a real ``__traceback__`` on it."""
+    try:
+        raise exc
+    except type(exc) as caught:
+        return caught, caught.__traceback__
+
+
+def test_the_traceback_goes_to_its_own_field_not_the_log(manager):
+    session = fake_session(manager, FakeResponse())
+    manager.headers = {"Girder-Token": "t"}
+    exc, frames = _raised(ValueError("boom"))
+    with mock.patch.object(JobManager, "write") as write, mock.patch.object(
+        job_status, "_update_status"
+    ):
+        job_status.sivacor_task_failure(
+            sender=FakeSender(manager), exception=exc, traceback=frames
+        )
+
+    write.assert_not_called()
+    call = session.request.call_args
+    assert call.args[0] == "PUT"
+    assert call.args[1].endswith("/sivacor/failure/6acfd0ac81e3e6792c37096f")
+    record = json.loads(call.kwargs["data"])
+    assert record["type"] == "builtins.ValueError"
+    # An unlisted type keeps its class and its frames and loses its prose.
+    assert record["message"] is None
+    assert any("_raised" in frame for frame in record["frames"])
+
+
+def test_the_status_is_still_written_when_a_task_fails(manager):
+    fake_session(manager, FakeResponse())
+    manager.headers = {}
+    exc, frames = _raised(ValueError("boom"))
+    with mock.patch.object(job_status, "_update_status") as update:
+        job_status.sivacor_task_failure(
+            sender=FakeSender(manager), exception=exc, traceback=frames
+        )
+    assert update.call_args.args[1] == 4  # JobStatus.ERROR
+
+
+def test_the_log_is_the_fallback_when_the_field_cannot_be_written(manager):
+    """Losing a traceback entirely is worse than keeping it where it was.
+
+    The log is dropped on deletion either way, so the fallback costs nothing
+    that was not already being lost -- and an old server with no such route,
+    or an outage, must not be the thing that silences a post-mortem.
+    """
+    fake_session(manager, FakeResponse(404))
+    manager.headers = {}
+    exc, frames = _raised(ValueError("boom"))
+    with mock.patch.object(JobManager, "write") as write, mock.patch.object(
+        job_status, "_update_status"
+    ):
+        job_status.sivacor_task_failure(
+            sender=FakeSender(manager), exception=exc, traceback=frames
+        )
+
+    assert write.call_count == 1
+    assert "ValueError: boom" in write.call_args.args[0]
+
+
+def test_a_task_with_no_job_manager_is_a_no_op():
+    """Upstream reaches the same answer through ``except AttributeError``."""
+    sender = mock.MagicMock(name="sender")
+    sender.job_manager = None
+    with mock.patch.object(job_status, "_update_status") as update:
+        job_status.sivacor_task_failure(sender=sender, exception=ValueError())
+    update.assert_not_called()
+
+
+def test_the_failure_url_follows_an_api_base_override(manager):
+    """Derived from ``JobManager.url``, which a worker override rewrites."""
+    manager.url = "http://worker-side:8080/api/v1/job/6acfd0ac81e3e6792c37096f"
+    assert job_status._failure_url(manager) == (
+        "http://worker-side:8080/api/v1/sivacor/failure/6acfd0ac81e3e6792c37096f"
+    )
+    manager.url = "nonsense"
+    assert job_status._failure_url(manager) is None
+
+
+def test_a_builtin_celery_task_is_left_alone(manager):
+    """Upstream's first line, and it has to stay first.
+
+    celery's own housekeeping tasks have no Girder job behind them, so
+    reporting a failure for one would be a PUT to a job that does not exist.
+
+    ``celery.chain`` rather than ``celery.backend_cleanup``, and that is not
+    arbitrary: upstream's ``BUILTIN_CELERY_TASKS`` is missing a comma after
+    ``'celery.accumulate'``, so the two implicitly concatenate into
+    ``'celery.accumulatecelery.backend_cleanup'`` and neither name is in the
+    list. Fixed upstream in girder/girder#3959; until that is released, a test
+    asserting the guard works has to pick a name the guard can actually see.
+
+    ``celery.chain`` keeps working either way, so this does not need revisiting
+    when the fix lands -- and it is the more representative name regardless,
+    since a SIVACOR submission *is* a chain.
+    """
+    sender = FakeSender(manager)
+    sender.name = "celery.chain"
+    with mock.patch.object(job_status, "_update_status") as update, mock.patch.object(
+        JobManager, "write"
+    ) as write:
+        job_status.sivacor_task_failure(sender=sender, exception=ValueError())
+    update.assert_not_called()
+    write.assert_not_called()
+
+
+def test_an_unparseable_job_url_falls_back_rather_than_guessing(manager):
+    """``_failure_url`` returning None must not cost the traceback."""
+    manager.url = "not-a-job-url"
+    exc, frames = _raised(ValueError("boom"))
+    with mock.patch.object(JobManager, "write") as write, mock.patch.object(
+        job_status, "_update_status"
+    ):
+        job_status.sivacor_task_failure(
+            sender=FakeSender(manager), exception=exc, traceback=frames
+        )
+    assert write.call_count == 1
+    assert "ValueError: boom" in write.call_args.args[0]
+
+
+def test_a_failure_with_no_traceback_still_records_what_it_knows():
+    """``task_failure`` can fire without one; the class is still worth having."""
+    manager = JobManager(logPrint=False, url=JOB_URL)
+    session = fake_session(manager, FakeResponse())
+    manager.headers = {}
+    with mock.patch.object(job_status, "_update_status"):
+        job_status.sivacor_task_failure(
+            sender=FakeSender(manager), exception=ValueError("boom"), traceback=None
+        )
+    record = json.loads(session.request.call_args.kwargs["data"])
+    assert record["type"] == "builtins.ValueError"
+    assert record["frames"] == []
+
+
+def test_reporting_a_traceback_cannot_itself_destroy_a_run(manager):
+    """Both channels down, and still nothing escapes.
+
+    The same contract as ``LogRelay`` and ``_quiet_log``: this runs inside an
+    ``except`` that is already handling the researcher's real problem. If the
+    PUT fails *and* the log write fails, the failure is swallowed and the
+    status is still written -- which is the one thing that must happen.
+    """
+    fake_session(manager, requests.ConnectionError("no route"))
+    manager.headers = {}
+    exc, frames = _raised(ValueError("boom"))
+    with mock.patch.object(
+        JobManager, "write", side_effect=requests.HTTPError("502")
+    ), mock.patch.object(job_status, "_update_status") as update:
+        job_status.sivacor_task_failure(
+            sender=FakeSender(manager), exception=exc, traceback=frames
+        )
+    assert update.call_args.args[1] == 4  # JobStatus.ERROR

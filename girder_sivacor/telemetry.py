@@ -33,13 +33,24 @@ log holds the full story, including the parts stripped here.
 import math
 import re
 
-from .errors import FailureCode
+from .errors import (
+    MAX_FRAME,
+    MAX_FRAMES,
+    MAX_MESSAGE,
+    PLATFORM_EXCEPTIONS,
+    FailureCode,
+)
 
 #: Hard cap on any single recorded string.
 _MAX_TEXT = 64
 
 #: A python identifier: pipeline step names and exception class names.
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+
+#: A dotted python path to an exception class, as ``errors.exception_key``
+#: spells it. The longest member of ``PLATFORM_EXCEPTIONS`` is well inside
+#: ``_MAX_TEXT``, so ``_matching``'s cap applies unchanged.
+_EXCEPTION_TYPE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*){0,8}$")
 
 #: A docker image reference without its tag (``dataeditors/stata18_5-mp``).
 #: Anchored and slash-bounded, so an absolute path or one containing ``..``
@@ -383,4 +394,135 @@ def sanitize_record(payload, date, allowed_sizes=()):
     }
     if status != "completed":
         record["error"] = _sanitize_error(payload.get("error"))
+    return record
+
+
+#: A pipeline step's title: our own words, letters and digits only.
+#:
+#: Checked against every distinct title in a restored production database
+#: (5,175 chain jobs, 2025-11-14 onward): **14 titles pass and every one of
+#: them is a step name we wrote**, including three retired ones -- "Cleanup
+#: submission folder", "Record Performance Metrics" and "Resolve declared
+#: dependencies", the Julia resolver that was reversed on 2026-09-19. That is
+#: the argument for a charset rule over a list of the current builder's
+#: strings: a list would have redacted all three as unrecognised, and a job
+#: document outlives the release that titled it.
+_STEP_TITLE = re.compile(r"^[A-Za-z][A-Za-z0-9 ]{0,62}$")
+
+#: The one chain step whose title is **generated**, and therefore the one that
+#: carries researcher content: ``build_submission_chain`` names the head step
+#: ``f"Moving {file['name']} to submission collection"``. 881 of those 5,175
+#: documents are this shape, across 264 distinct filenames -- ``Code.zip``,
+#: ``final_project_replication_package(3).zip``, and so on.
+_PACKAGE_TITLE = re.compile(r"^Moving .{1,255} to submission collection$", re.DOTALL)
+
+#: What that head step is called once its filename is gone. A constant, not
+#: anything derived from the title, so it carries nothing out.
+HEAD_STEP_TITLE = "Moving the replication package to submission collection"
+
+#: What anything else unrecognised becomes.
+REDACTED_TITLE = "(title redacted)"
+
+
+def safe_title(value):
+    """Validate a chain step's title, replacing what is not ours to keep.
+
+    Unlike every other validator here this **substitutes** rather than
+    returning ``None``, because a step with no title at all is harder to read
+    than one labelled as redacted -- and the substitutes are constants, so the
+    match-or-drop rule is intact: nothing of the input survives a failed match.
+    """
+    text = "" if value is None else str(value).strip()
+    if _STEP_TITLE.match(text):
+        return text
+    if _PACKAGE_TITLE.match(text):
+        return HEAD_STEP_TITLE
+    return REDACTED_TITLE
+
+
+def safe_image_name(value):
+    """Validate a docker image name (no tag), or ``None``."""
+    return _matching(value, _IMAGE_NAME)
+
+
+def safe_image_tag(value):
+    """Validate a docker image tag, or ``None``."""
+    return _matching(value, _TAG)
+
+
+#: One formatted traceback frame, as ``traceback.format_tb`` emits it: a
+#: ``File "...", line N, in name`` header and, usually, the source line under
+#: it.
+_FRAME = re.compile(
+    r'^\s*File "(?P<path>[^"\n]{1,512})", line \d{1,9}, in \S{1,128}'
+    r"(?:\n.{0,400})?\n?$"
+)
+
+#: Paths a frame may not come from. Nothing researcher-written ever appears in
+#: a python traceback -- their code runs in a container, in another process, in
+#: another language -- but a frame raised *while handling* their package can
+#: still name the file it was handling in its source line, and the workspace is
+#: where every such path lives.
+_WORKSPACE_PATH = re.compile(r"/tmp/(?:workspace|tmp)-")
+
+
+def _safe_frame(frame):
+    """Keep one traceback frame, or drop it.
+
+    Match-or-drop, exactly as :func:`_matching`: a frame that is not
+    recognisably ``format_tb`` output is not one we wrote, so it is not stored.
+    """
+    if not isinstance(frame, str):
+        return None
+    if len(frame) > MAX_FRAME:
+        return None
+    if _WORKSPACE_PATH.search(frame):
+        return None
+    return frame if _FRAME.match(frame) else None
+
+
+def sanitize_failure(payload):
+    """Rebuild an untrusted failure record as a storable one, or ``None``.
+
+    The boundary for :data:`girder_sivacor.chain.FAILURE_KEY` -- the field that
+    gives a traceback somewhere to live other than the job log. It is kept
+    after the submission is deleted, so it is a permanent store and gets the
+    same treatment as everything else in that class: an allow-list rebuild,
+    with the message validated **by exception type** rather than by charset.
+
+    ``message`` survives only for the types
+    :data:`girder_sivacor.errors.PLATFORM_EXCEPTIONS` names. That distinction
+    is the whole point and is not expressible any other way: 2026-09-25's
+    ``Invalid state transition to '3'`` and 2026-10-12's ``APIError`` are
+    platform prose that a post-mortem is built from, while a
+    ``SubmissionError``'s message is the researcher's by contract and a
+    ``docker.errors.ContainerError``'s is their container's stderr.
+
+    ``code``/``detail`` go through :func:`safe_detail`, which is the same
+    boundary execution records and the alert counters already use.
+    """
+    if not isinstance(payload, dict):
+        return None
+    exc_type = _matching(payload.get("type"), _EXCEPTION_TYPE)
+    frames = payload.get("frames")
+    frames = frames if isinstance(frames, list) else []
+    frames = [f for f in (_safe_frame(x) for x in frames[:MAX_FRAMES]) if f]
+    message = payload.get("message")
+    if exc_type not in PLATFORM_EXCEPTIONS or not isinstance(message, str):
+        message = None
+    try:
+        code = FailureCode(payload.get("code")).value
+    except ValueError:
+        code = None
+    record = {
+        "type": exc_type,
+        "message": message[:MAX_MESSAGE] if message else None,
+        "code": code,
+        "detail": safe_detail(code, payload.get("detail")) if code else None,
+        "step": safe_step(payload.get("step")),
+        "frames": frames,
+    }
+    # Nothing recognisable survived, so there is nothing worth a field.
+    if not any((record["type"], record["code"], record["frames"])):
+        return None
     return record

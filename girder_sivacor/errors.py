@@ -184,3 +184,95 @@ def classify(exc):
         # which is exactly what must never reach the permanent record.
         return FailureCode.OUT_OF_DISK, None
     return FailureCode.UNEXPECTED, type(exc).__name__
+
+
+#: Exception types whose ``str()`` is text *we* or our dependencies wrote.
+#:
+#: The traceback of a failed pipeline step is kept after the submission that
+#: produced it is gone (see :mod:`girder_sivacor.chain`), so its message is a
+#: permanent store and needs the same treatment as everything else in that
+#: class: an allow-list, never a charset.
+#:
+#: Membership is by **exact type**, not by module prefix, and that is
+#: deliberate -- ``docker.errors.ContainerError`` interpolates the container's
+#: command and its stderr, which is the researcher's content arriving through
+#: a module that otherwise only ever talks about itself. Picking the types one
+#: at a time is the only way to tell those apart.
+#:
+#: :class:`SubmissionError` is pointedly **not** here. Its message is the
+#: researcher's by contract (see the module docstring), and the operator-facing
+#: half of it -- ``code`` and ``detail`` -- is recorded separately and is
+#: already safe to keep forever.
+#:
+#: A type not listed keeps its class name and its frames and loses only its
+#: message. That is the fail-closed direction: a new exception type shows up as
+#: a traceback with no prose rather than as prose nobody vetted.
+PLATFORM_EXCEPTIONS = frozenset(
+    {
+        # The chain's own bookkeeping. 2026-09-25's "Invalid state transition
+        # to '3', Current state is '4'" is this one, and it is what proved the
+        # worker was alive and disagreeing with the reaper.
+        "girder_worker.utils.StateTransitionException",
+        # The daemon talking about itself. 2026-10-12 / girder-sivacor#126 is
+        # an APIError, and its message is the whole finding.
+        "docker.errors.APIError",
+        "docker.errors.DockerException",
+        "docker.errors.ImageNotFound",
+        "docker.errors.NotFound",
+        # Transport. Every one of these describes a URL and a socket.
+        "requests.exceptions.HTTPError",
+        "requests.exceptions.ConnectionError",
+        "requests.exceptions.ConnectTimeout",
+        "requests.exceptions.ReadTimeout",
+        "requests.exceptions.Timeout",
+        "requests.exceptions.ChunkedEncodingError",
+        "urllib3.exceptions.ProtocolError",
+        "urllib3.exceptions.ReadTimeoutError",
+        "urllib3.exceptions.MaxRetryError",
+        "girder_client.HttpError",
+        # The broker. 2026-09-06 came through here.
+        "kombu.exceptions.OperationalError",
+        "celery.exceptions.OperationalError",
+        "amqp.exceptions.ConnectionForced",
+        "redis.exceptions.ConnectionError",
+    }
+)
+
+#: Longest kept exception message, in characters.
+MAX_MESSAGE = 512
+
+#: Longest kept traceback frame, and how many of them.
+MAX_FRAME = 512
+MAX_FRAMES = 40
+
+
+def exception_key(exc):
+    """``module.QualName`` for an exception, as :data:`PLATFORM_EXCEPTIONS` spells it."""
+    cls = type(exc)
+    module = getattr(cls, "__module__", "") or ""
+    return f"{module}.{cls.__qualname__}" if module else cls.__qualname__
+
+
+def failure_record(exc, frames=None):
+    """Build the structured failure that outlives the job log.
+
+    ``frames`` is :func:`traceback.format_tb`'s output, or ``None``. The result
+    is handed to the server, which re-filters it through
+    :func:`girder_sivacor.telemetry.sanitize_failure` -- this side is a
+    convenience, not the boundary.
+
+    The point of the whole exercise is that a traceback stops being one line in
+    a stream shared with the researcher's container output. 2026-09-18 spent a
+    section on a red-herring traceback that arrived first only because two
+    threads were writing to the same log; and a ``log`` that mixes the two
+    cannot be dropped without dropping both.
+    """
+    code, detail = classify(exc)
+    message = str(exc) if exception_key(exc) in PLATFORM_EXCEPTIONS else None
+    return {
+        "type": exception_key(exc),
+        "message": message[:MAX_MESSAGE] if message else None,
+        "code": code.value,
+        "detail": detail,
+        "frames": [frame[:MAX_FRAME] for frame in (frames or [])[-MAX_FRAMES:]],
+    }
