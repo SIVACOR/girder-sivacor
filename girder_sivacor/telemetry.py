@@ -252,6 +252,11 @@ def _catalogue_size(value, allowed):
 #: code may be mid-submission during a rollout.
 _PHASES = frozenset({"analysis", "resolve"})
 
+#: Stage rows kept per record, and so also the largest ``error.stage`` that can
+#: name one of them. A shape bound on a payload the worker sends, not a limit on
+#: workflows.
+MAX_STAGES = 32
+
 
 def _sanitize_stage(stage, allowed_sizes=()):
     if not isinstance(stage, dict):
@@ -300,12 +305,20 @@ def _sanitize_error(error):
             "step": _matching(error.get("step"), _IDENTIFIER),
             "code": FailureCode.UNEXPECTED.value,
             "detail": None,
+            "stage": _stage_number(error.get("stage")),
         }
     return {
         "step": _matching(error.get("step"), _IDENTIFIER),
         "code": code.value,
         "detail": safe_detail(code, error.get("detail")),
+        "stage": _stage_number(error.get("stage")),
     }
+
+
+def _stage_number(value):
+    """A 1-based stage number within the bound :func:`sanitize_record` keeps."""
+    value = _safe_int(value, minimum=1)
+    return value if value is not None and value <= MAX_STAGES else None
 
 
 def safe_step(step):
@@ -371,7 +384,11 @@ def sanitize_record(payload, date, allowed_sizes=()):
     stages = stages if isinstance(stages, list) else []
     # Bound the fan-out: a malformed or hostile payload must not be able to
     # write an unbounded document.
-    stages = [s for s in (_sanitize_stage(x, allowed_sizes) for x in stages[:32]) if s]
+    stages = [
+        s
+        for s in (_sanitize_stage(x, allowed_sizes) for x in stages[:MAX_STAGES])
+        if s
+    ]
 
     bucket = payload.get("package_size_bucket")
     if bucket not in SIZE_BUCKETS:
