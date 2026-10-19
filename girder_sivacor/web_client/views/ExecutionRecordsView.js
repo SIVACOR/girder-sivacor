@@ -270,7 +270,9 @@ const ExecutionRecordsView = View.extend({
             const error = record.error
                 ? `${escapeHtml(record.error.code)}` +
                   (record.error.detail ? ` <code>${escapeHtml(record.error.detail)}</code>` : '') +
-                  (record.error.step ? `<br><small>in ${escapeHtml(record.error.step)}</small>` : '')
+                  (record.error.step ? `<br><small>in ${escapeHtml(record.error.step)}` +
+                      (record.error.stage ? `, stage ${escapeHtml(record.error.stage)}` : '') +
+                      '</small>' : '')
                 : '&mdash;';
             return `
                 <tr>

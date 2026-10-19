@@ -417,6 +417,72 @@ def test_a_failing_run_records_why(
     assert records[0]["error"]["code"] == FailureCode.MAIN_FILE_MISSING.value
     assert records[0]["error"]["step"] == "execute_workflow"
     assert "definitely_not_here" not in json.dumps(records[0], default=str)
+    assert records[0]["error"]["stage"] == 1
+    assert records[0]["n_stages"] == 1
+    assert records[0]["stages"][0]["image_name"] == "rocker/r-ver"
+
+
+@pytest.mark.plugin("sivacor")
+def test_a_later_stage_failing_is_not_blamed_on_the_one_before(
+    server,
+    db,
+    user,
+    eagerWorkerTasks,
+    fsAssetstore,
+    patched_gpg,
+    uploads_folder,
+    submission_collection,
+):
+    """2026-10-19, `free-auxiliary`: a Stata stage ran for 40 minutes and
+    succeeded, then a Dynare stage's main file was missing. The main-file lookup
+    ran before the stage's row was appended, so the record said n_stages: 1,
+    held only the healthy Stata row, and read as Stata losing its own do-file.
+
+    The failed stage must have its own row, and the error must say which row
+    it belongs to."""
+    fobj = upload_test_file(uploads_folder, user, "with_space_R.zip")
+    stages = [
+        {"image_name": "rocker/r-ver", "image_tag": "4.3.1", "main_file": "main.R"},
+        {
+            "image_name": "rocker/r-ver",
+            "image_tag": "4.3.1",
+            "main_file": "definitely_not_here.R",
+        },
+    ]
+    resp = submit_sivacor_job(server, user, fobj, stages, exception=True)
+    assertStatusOk(resp)
+
+    records = list(ExecutionRecord().find({}))
+    assert len(records) == 1
+    record = records[0]
+    assert record["error"]["code"] == FailureCode.MAIN_FILE_MISSING.value
+    assert record["error"]["stage"] == 2
+    assert record["n_stages"] == 2
+    first, second = record["stages"]
+    assert first["exit_code"] == 0
+    assert first["duration_seconds"] is not None
+    # Nothing ran, so nothing was measured -- but the row says what it was.
+    assert second["image_name"] == "rocker/r-ver"
+    assert second["exit_code"] is None
+    assert second["duration_seconds"] is None
+    assert "definitely_not_here" not in json.dumps(record, default=str)
+
+
+def test_error_stage_is_a_bounded_stage_number():
+    def stage_of(value):
+        return sanitize(
+            status="failed",
+            error={"step": "execute_workflow", "code": "unexpected", "stage": value},
+        )["error"]["stage"]
+
+    assert stage_of(2) == 2
+    assert stage_of(None) is None
+    for refused in (0, -1, 33, 2.0, "2", True, "/home/jane"):
+        assert stage_of(refused) is None
+    # An unknown code is downgraded, but the stage it happened in still holds.
+    assert sanitize(
+        status="failed", error={"step": "s", "code": "invented", "stage": 3}
+    )["error"]["stage"] == 3
 
 
 @pytest.mark.plugin("sivacor")

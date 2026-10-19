@@ -340,6 +340,7 @@ def test_submission_task_records_the_deletion_rather_than_a_bug():
         "step": "execute_workflow",
         "code": FailureCode.SUBMISSION_DELETED.value,
         "detail": None,
+        "stage": None,
     }
 
 

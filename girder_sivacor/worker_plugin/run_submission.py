@@ -182,7 +182,15 @@ def build_execution_record(submission, status, step=None, exc=None):
     }
     if exc is not None:
         code, detail = classify(exc)
-        record["error"] = {"step": step, "code": code.value, "detail": detail}
+        record["error"] = {
+            "step": step,
+            "code": code.value,
+            "detail": detail,
+            # 1-based, and the number of the stage row the failure belongs to,
+            # so a record no longer leaves the reader to assume it was the last
+            # row. None for a failure outside any stage's execution.
+            "stage": submission.get("telemetry_stage"),
+        }
     return record
 
 
@@ -912,6 +920,12 @@ def _performance_attributes(api, folder_id, stage_num):
 @app.task(queue=DISPATCH_QUEUE, bind=True)
 @submission_task("Failed to execute workflow")
 def execute_workflow(task, api, submission, stage, env_vars):
+    # recorded_run sets this once it knows which stage it is running, and it
+    # only means "a failure now belongs to that stage" while this step is
+    # running. Cleared on both edges, so a stage that fails before recorded_run
+    # gets that far is not blamed on the previous one, and a later step's
+    # failure (a TRO write, the prune) is not blamed on the last stage.
+    submission.pop("telemetry_stage", None)
     report(api, submission["job_id"], "Executing workflow on workspace.")
 
     # Placeholder for actual workflow execution logic
@@ -961,6 +975,7 @@ def execute_workflow(task, api, submission, stage, env_vars):
         }
     )
 
+    submission.pop("telemetry_stage", None)
     return submission
 
 

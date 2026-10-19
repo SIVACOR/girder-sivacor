@@ -2247,6 +2247,45 @@ def recorded_run(api, submission, stage, env_vars):
     folder_meta = submission_folder.get("meta", {})
     creator_id = folder_meta["creator_id"]
     stage_num = folder_meta["stages"].index(stage) + 1
+    # Which stage a failure from here on belongs to; see build_execution_record.
+    submission["telemetry_stage"] = stage_num
+    mem_limit = container_memory_limit(info.get("MemTotal"))
+
+    # Appended *before* the run rather than after it. This used to be built
+    # and appended once, at the end -- so any exception in between left
+    # `stages: []` on the execution record, and a run that failed recorded
+    # nothing at all about itself. That is what happened to `ferocious-fader`
+    # on 2026-09-18: 20 h of compute on a 16 vCPU worker, and the one store
+    # that outlives the submission got an empty list, which is precisely the
+    # case post-mortem telemetry exists for
+    # (``2026-09-18-log-flush-502-kills-run.md``).
+    #
+    # And before anything else in this function that can fail, not merely
+    # before the container: a stage that died at its main-file lookup used to
+    # leave no row, so a two-stage run whose *second* main file was missing
+    # recorded n_stages: 1, one healthy 40-minute Stata row, and
+    # main_file_missing -- read by anyone as Stata losing its own do-file
+    # (2026-10-19, `free-auxiliary`). error.stage says which row a failure
+    # belongs to; this is what makes sure that row exists.
+    #
+    # Everything here is known before the container runs; the measured half
+    # is filled in below, or salvaged by the handler if the run is torn down.
+    stage_telemetry = {
+        # The size the submission asked for, recorded beside the cap it
+        # actually got: mem_limit_bytes alone cannot say whether a run
+        # was sized deliberately or simply landed on whatever was free.
+        "requested_memory_gb": submission.get("telemetry_requested_memory_gb"),
+        "image_name": stage.get("image_name"),
+        "image_tag": stage.get("image_tag"),
+        "network_isolation": bool(stage.get("network_isolation", False)),
+        # The cap this run was given, so max_memory_bytes can be read as
+        # a fraction of what was allowed rather than an absolute number.
+        # Without it, a future flavor change silently re-baselines every
+        # comparison against older records.
+        "mem_limit_bytes": mem_limit,
+        **measured_stage_telemetry(performance_data),
+    }
+    submission.setdefault("telemetry_stages", []).append(stage_telemetry)
 
     image_reference = stage["image_name"] + ":" + stage["image_tag"]
     host_tmp_root = os.environ.get("DOCKER_HOST_TMP_ROOT", "/")
@@ -2348,7 +2387,7 @@ def recorded_run(api, submission, stage, env_vars):
             ORPHAN_LABEL_JOB: str(submission.get("job_id", "")),
         },
     }
-    if (mem_limit := container_memory_limit(info.get("MemTotal"))) is not None:
+    if mem_limit is not None:
         container_kwargs["mem_limit"] = mem_limit
         # Equal to mem_limit, which is how docker spells "no swap for this
         # container". Left unset, docker allows swap up to 2x the limit, and a
@@ -2385,33 +2424,6 @@ def recorded_run(api, submission, stage, env_vars):
         publisher.start()
 
         peak_disk = 0
-        # Appended *before* the run rather than after it. This used to be built
-        # and appended once, at the end -- so any exception in between left
-        # `stages: []` on the execution record, and a run that failed recorded
-        # nothing at all about itself. That is what happened to `ferocious-fader`
-        # on 2026-09-18: 20 h of compute on a 16 vCPU worker, and the one store
-        # that outlives the submission got an empty list, which is precisely the
-        # case post-mortem telemetry exists for
-        # (``2026-09-18-log-flush-502-kills-run.md``).
-        #
-        # Everything here is known before the container runs; the measured half
-        # is filled in below, or salvaged by the handler if the run is torn down.
-        stage_telemetry = {
-            # The size the submission asked for, recorded beside the cap it
-            # actually got: mem_limit_bytes alone cannot say whether a run
-            # was sized deliberately or simply landed on whatever was free.
-            "requested_memory_gb": submission.get("telemetry_requested_memory_gb"),
-            "image_name": stage.get("image_name"),
-            "image_tag": stage.get("image_tag"),
-            "network_isolation": bool(stage.get("network_isolation", False)),
-            # The cap this run was given, so max_memory_bytes can be read as
-            # a fraction of what was allowed rather than an absolute number.
-            # Without it, a future flavor change silently re-baselines every
-            # comparison against older records.
-            "mem_limit_bytes": mem_limit,
-            **measured_stage_telemetry(performance_data),
-        }
-        submission.setdefault("telemetry_stages", []).append(stage_telemetry)
 
         try:
             container = cli.containers.get(container.id)
