@@ -171,7 +171,12 @@ Three things to know before changing any of it:
   a `SubmissionError`'s text is the researcher's by contract.
 * **`narration.py` will rot, and is built to rot loudly.** It is a template
   per log line the platform writes, and a line nobody listed is dropped and
-  counted.
+  counted. **But `narration_dropped` on a skeleton is not that alarm**: a
+  failure's headline is kept and the exception it interpolates is dropped on
+  purpose -- 127 of the 128 drops across 227 real submission logs are exactly
+  that, and the detail has its own home in `meta.sivacorFailure`. The alarm
+  that works needs the live logs, which is
+  `tools/chain_redaction_audit.py --narration`.
   `test_chain_redaction.py::test_the_platforms_narration_survives_the_submission`
   runs a real submission and fails if that count is non-zero, naming the line.
   **If you add a line to a submission job's log, add its template**; that test
@@ -261,6 +266,49 @@ ordinary debris (an abandoned upload outlives its temp file), which is why
 those are counted rather than listed; and its first production run reported 0
 short blobs among 177 documents, because the two known-corrupt files had
 already gone away with their deleted submissions.
+
+`tools/chain_redaction_audit.py` is the equivalent for the redacted chains of
+issue #129, and exists because **running the backfill proves nothing and
+re-running it proves less**: `redact_orphans` filters on
+`meta.sivacorRedacted.version`, so everything it has already rewritten has
+left its own query, and a second pass returns `redacted: 0` whether the first
+cleared three thousand documents or none.
+
+It recovers the figure instead of re-deriving it -- `redact_job` stamps
+`meta.sivacorRedacted.at`, so the backfill is a burst in a histogram long
+after the scrollback is gone -- and separately checks the thing #129 was
+actually closed on: that no skeleton kept a `log`, a `jobInfoSpec`, `args`,
+`kwargs` or a non-null `userId`. A non-zero count there means
+`chain.KEEP_FIELDS` has a hole and the redaction was cosmetic. Read-only, same
+invocation as above, and arguments pass through the `python3 -` form:
+
+```sh
+docker exec -i $(docker ps -qf name=wt_girder) \
+    python3 - --by-hour < tools/chain_redaction_audit.py
+```
+
+Against the restored 2026-10-16 dump it reconciles with the table above --
+5,175 chain jobs, 3,191 redacted in one burst across 665 chains, 1,373
+belonging to a live submission -- and the row to read first is **`submission is
+gone`, which must be 0**: that is the "was the backfill paged to `next: null`"
+question answered without writing anything.
+
+**Production, 2026-10-19:** 3,235 skeletons across 669 chains in one burst at
+2026-10-17 20:00 UTC, 0 orphans left, every skeleton clean. (`deploy-dev`
+restored from that day's dump reproduces those figures exactly, so the tool can
+be exercised locally without touching production.) That is the only
+record of what the backfill cleared -- the run's own per-page counts were never
+captured, and re-running it could not have recovered them.
+
+Do not read the `jobInfoSpec` census as a fixed backlog. **#142's population
+grows by one per folder deletion**: `delete_submission` ends in
+`deleteFolderTask.delay(...)`, a celery job holding a token whose args are
+Girder's own `[folderId, progress, userId]` and which names no submission, so
+it is unattributable by construction. That is 452 of production's 622 on
+2026-10-19 (the other 170 are the retired `Cleanup submission folder`), against
+441 in the 2026-10-16 dump. So a count above #142's 611 baseline is the
+ordinary passage of time; a jump far larger than the deletions since would mean
+chain jobs are escaping `chain_query`.
 
 Unlike the files below, this directory *is* part of the repo.
 
