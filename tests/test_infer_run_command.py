@@ -83,10 +83,10 @@ def test_infer_run_command_with_space_in_filename(submission_dir):
     submission = {"workspace_dir": str(submission_dir)}
     stage = {"image_name": "rocker/r-ver", "main_file": "my submission.R"}
 
-    _entrypoint, command, sub_dir, home_dir = _infer_run_command(submission, stage)
-    assert command == '"my submission.R"'
-    assert sub_dir == ""
-    assert home_dir == "/workspace"
+    run = _infer_run_command(submission, stage)
+    assert run.command == '"my submission.R"'
+    assert run.sub_dir == ""
+    assert run.home_dir == "/workspace"
 
 
 def test_infer_run_command_with_renv_lock(submission_dir):
@@ -101,10 +101,10 @@ def test_infer_run_command_with_renv_lock(submission_dir):
     submission = {"workspace_dir": str(submission_dir)}
     stage = {"image_name": "rocker/r-ver", "main_file": "main.R"}
 
-    _entrypoint, command, sub_dir, home_dir = _infer_run_command(submission, stage)
-    assert sub_dir == "."
-    assert str(command) == "code/main.R"
-    assert home_dir == "/workspace"
+    run = _infer_run_command(submission, stage)
+    assert run.sub_dir == "."
+    assert str(run.command) == "code/main.R"
+    assert run.home_dir == "/workspace"
 
 
 def test_infer_run_command_with_renv_lock_in_subdir(submission_dir):
@@ -120,10 +120,10 @@ def test_infer_run_command_with_renv_lock_in_subdir(submission_dir):
     submission = {"workspace_dir": str(submission_dir)}
     stage = {"image_name": "rocker/r-ver", "main_file": "main.R"}
 
-    _entrypoint, command, sub_dir, home_dir = _infer_run_command(submission, stage)
-    assert sub_dir == "analysis"
-    assert str(command) == "code/main.R"
-    assert home_dir == "/workspace"
+    run = _infer_run_command(submission, stage)
+    assert run.sub_dir == "analysis"
+    assert str(run.command) == "code/main.R"
+    assert run.home_dir == "/workspace"
 
 
 def test_infer_run_command_with_matlab(submission_dir):
@@ -136,10 +136,10 @@ def test_infer_run_command_with_matlab(submission_dir):
     submission = {"workspace_dir": str(submission_dir)}
     stage = {"image_name": "dynare/matlab", "main_file": "script.m"}
 
-    _entrypoint, command, sub_dir, home_dir = _infer_run_command(submission, stage)
-    assert command == "script"
-    assert sub_dir == ""
-    assert home_dir == "/home/matlab"
+    run = _infer_run_command(submission, stage)
+    assert run.command == "script"
+    assert run.sub_dir == ""
+    assert run.home_dir == "/home/matlab"
 
 
 JULIA_IMAGE = "ghcr.io/sivacor/julia1.11"
@@ -159,11 +159,11 @@ def test_infer_run_command_julia_project_at_root(submission_dir):
     submission = {"workspace_dir": str(submission_dir)}
     stage = {"image_name": JULIA_IMAGE, "main_file": "main.jl"}
 
-    entrypoint, command, sub_dir, home_dir = _infer_run_command(submission, stage)
-    assert entrypoint == JULIA_ENTRYPOINT
-    assert command == "main.jl"
-    assert sub_dir == ""
-    assert home_dir == "/workspace"
+    run = _infer_run_command(submission, stage)
+    assert run.entrypoint == JULIA_ENTRYPOINT
+    assert run.command == "main.jl"
+    assert run.sub_dir == ""
+    assert run.home_dir == "/workspace"
 
 
 def test_infer_run_command_julia_runs_where_the_main_file_is(submission_dir):
@@ -182,9 +182,9 @@ def test_infer_run_command_julia_runs_where_the_main_file_is(submission_dir):
     submission = {"workspace_dir": str(submission_dir)}
     stage = {"image_name": JULIA_IMAGE, "main_file": "main.jl"}
 
-    _, command, sub_dir, _ = _infer_run_command(submission, stage)
-    assert command == "main.jl"
-    assert sub_dir == "code"
+    run = _infer_run_command(submission, stage)
+    assert run.command == "main.jl"
+    assert run.sub_dir == "code"
 
 
 def test_infer_run_command_julia_without_project_file(submission_dir):
@@ -201,10 +201,10 @@ def test_infer_run_command_julia_without_project_file(submission_dir):
     submission = {"workspace_dir": str(submission_dir)}
     stage = {"image_name": JULIA_IMAGE, "main_file": "main.jl"}
 
-    entrypoint, command, sub_dir, _ = _infer_run_command(submission, stage)
-    assert entrypoint == JULIA_ENTRYPOINT
-    assert command == "main.jl"
-    assert sub_dir == ""
+    run = _infer_run_command(submission, stage)
+    assert run.entrypoint == JULIA_ENTRYPOINT
+    assert run.command == "main.jl"
+    assert run.sub_dir == ""
 
 
 def test_infer_run_command_julia_ignores_an_renv_lock(submission_dir):
@@ -223,6 +223,20 @@ def test_infer_run_command_julia_ignores_an_renv_lock(submission_dir):
     submission = {"workspace_dir": str(submission_dir)}
     stage = {"image_name": JULIA_IMAGE, "main_file": "main.jl"}
 
-    _, command, sub_dir, _ = _infer_run_command(submission, stage)
-    assert sub_dir == ""
-    assert command == "main.jl"
+    run = _infer_run_command(submission, stage)
+    assert run.sub_dir == ""
+    assert run.command == "main.jl"
+
+
+def test_infer_run_command_returns_the_main_file_it_resolved(submission_dir):
+    """Relative to the project, whatever renv.lock does to the working
+    directory, and not recorded as a side effect."""
+    project_dir = get_project_dir({"workspace_dir": str(submission_dir)})
+    (Path(project_dir) / "analysis" / "code").mkdir(parents=True)
+    (Path(project_dir) / "analysis" / "renv.lock").touch()
+    (Path(project_dir) / "analysis" / "code" / "main.R").touch()
+    submission = {"workspace_dir": str(submission_dir)}
+    stage = {"image_name": "rocker/r-ver", "main_file": "main.R"}
+    run = _infer_run_command(submission, stage)
+    assert run.main_file == "analysis/code/main.R"
+    assert submission == {"workspace_dir": str(submission_dir)}

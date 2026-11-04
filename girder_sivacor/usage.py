@@ -152,6 +152,10 @@ USER_PAYS: dict[FailureCode, bool] = {
     # Their package; cheap anyway, it fails early.
     FailureCode.MAIN_FILE_MISSING: True,
     FailureCode.MAIN_FILE_AMBIGUOUS: True,
+    FailureCode.IGNORE_FILE_INVALID: True,
+    # Only a stage can leave one, and free compute for an `ln -s` at the end
+    # of an expensive run is the abuse vector 09-U12 rules out.
+    FailureCode.IGNORE_FILE_UNREADABLE: True,
     # Retired -- nothing raises either -- but still enum members, because an
     # execution record outlives the release that wrote it. They keep their
     # entries so the exhaustiveness check below stays meaningful.
@@ -168,6 +172,9 @@ USER_PAYS: dict[FailureCode, bool] = {
     FailureCode.IMAGE_PULL_FAILED: False,
     # An image the operator allow-listed that our engine cannot run.
     FailureCode.NO_ENTRYPOINT: False,
+    # What the worker cannot delete after taking back what it owns: a MATLAB
+    # stage's other uid, or our own ACL setup (09-U10). Publishes nothing.
+    FailureCode.PRUNE_BLOCKED: False,
     # We lost the worker.
     FailureCode.REAPED_NO_HEARTBEAT: False,
     # Fleet or config fault -- and moot, no instance ever booted, so no

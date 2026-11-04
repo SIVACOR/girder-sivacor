@@ -71,6 +71,18 @@ class FailureCode(str, Enum):
     MAIN_FILE_MISSING = "main_file_missing"
     #: The declared main file appears more than once. ``detail`` is the count.
     MAIN_FILE_AMBIGUOUS = "main_file_ambiguous"
+    #: The package's ``.sivacorignore`` cannot be honoured: it would prune a
+    #: main file or itself, has a line that is not a pattern, is over
+    #: ``IGNORE_FILE_READ_LIMIT``, or was changed by the run. No ``detail``:
+    #: the paths are the researcher's and stay in the job log.
+    IGNORE_FILE_INVALID = "ignore_file_invalid"
+    #: At prune time ``.sivacorignore`` was a link, a special file, or could
+    #: not be opened. Only a stage can leave one. No ``detail``.
+    IGNORE_FILE_UNREADABLE = "ignore_file_unreadable"
+    #: Pruning could not delete a path the rules name even after the worker
+    #: took back permissions on what it owns (a MATLAB stage runs as another
+    #: uid). No ``detail``.
+    PRUNE_BLOCKED = "prune_blocked"
     #: The upload is neither a readable zip nor a readable tar.
     UNSUPPORTED_ARCHIVE = "unsupported_archive"
     #: The archive tried to escape the extraction root.

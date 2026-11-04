@@ -1,10 +1,13 @@
-import copy
 import datetime
+import errno
+import hashlib
 import json
 import logging
 import os
 import pathlib
+import posixpath
 import shutil
+import stat
 import tarfile
 import tempfile
 import traceback
@@ -14,7 +17,6 @@ from importlib.metadata import version
 from zoneinfo import ZoneInfo
 
 import docker
-import pathspec
 import posix1e
 import randomname
 from celery.signals import celeryd_after_setup, worker_ready
@@ -25,6 +27,7 @@ from girder_worker.utils import JobStatus
 from tro_utils import TRPAttribute
 from tro_utils.tro_utils import TRO
 
+from .. import sivacorignore
 from ..errors import FailureCode, SubmissionError, classify, failure_record
 from ..settings import PluginSettings
 from ..statuses import CANCELING, FAILED
@@ -34,6 +37,7 @@ from .lib import (
     CancelWatcher,
     ProgressBeat,
     _redis_client_sync,
+    find_named_files,
     get_project_dir,
     is_julia,
     performance_data_name,
@@ -54,33 +58,6 @@ from .routing import (
 )
 
 IGNORE_DIRS = [".git", "__pycache__"]
-DEFAULT_SIVACOR_IGNORE = [
-    # Python
-    "__pycache__/",
-    "*.py[cod]",
-    "*$py.class",
-    ".venv/",
-    "venv/",
-    ".env",
-    # Version Control & IDEs
-    ".git/",
-    ".svn/",
-    ".idea/",
-    ".vscode/",
-    "*.swp",
-    ".DS_Store",  # macOS noise
-    "Thumbs.db",  # Windows noise
-    # Common Research/Data temporary files
-    "*.tmp",
-    "node_modules/",
-    # Jupyter Notebook checkpoints
-    ".ipynb_checkpoints/",
-    # Stata/R temporary files
-    "*.smcl",
-    ".Rhistory",
-    ".RData",
-    ".Ruserdata",
-]
 logger = logging.getLogger(__name__)
 
 
@@ -570,6 +547,279 @@ def prepare_submission(
         raise
 
 
+#: Ends every refusal that can only happen after the run.
+_AFTER_RUN = "The run finished, but nothing was pruned or published."
+
+
+# Paths in these messages are the researcher's: they go to the job log, never
+# into a detail, which is kept forever.
+
+
+def read_ignore_file(project_dir, source):
+    """The bytes of the ``.sivacorignore`` at ``source`` (package-relative).
+
+    A stage can leave a link or a special file there, so neither is followed:
+    ``O_NOFOLLOW``, ``O_NONBLOCK`` so a FIFO cannot hang the open, and the
+    type checked on the descriptor opened. A file over the limit is refused.
+    """
+    path = pathlib.Path(project_dir) / source
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        # ELOOP is O_NOFOLLOW meeting a symlink; ENXIO is opening a socket.
+        if exc.errno in (errno.ELOOP, errno.ENXIO):
+            raise _unreadable(source, "it is a link or a special file") from None
+        raise _unreadable(source, exc.strerror) from None
+    with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise _unreadable(source, "it is a link or a special file")
+        try:
+            data = handle.read(sivacorignore.IGNORE_FILE_READ_LIMIT + 1)
+        except OSError as exc:
+            raise _unreadable(source, exc.strerror) from None
+    if len(data) > sivacorignore.IGNORE_FILE_READ_LIMIT:
+        raise SubmissionError(
+            FailureCode.IGNORE_FILE_INVALID,
+            f"{sivacorignore.printable(source)} is larger than "
+            f"{sivacorignore.IGNORE_FILE_READ_LIMIT // (1024 * 1024)} MB, so its "
+            "rules for pruning the replication package were not read. A "
+            ".sivacorignore holds patterns, not file lists: replace long lists "
+            "of paths with the directories or wildcards that cover them.",
+        )
+    return data
+
+
+def _unreadable(source, reason):
+    return SubmissionError(
+        FailureCode.IGNORE_FILE_UNREADABLE,
+        f"{sivacorignore.printable(source)} could not be read ({reason}), so "
+        f"the rules for pruning the replication package cannot be read. "
+        f"{_AFTER_RUN} Make sure your code does not replace .sivacorignore or "
+        "change its permissions.",
+    )
+
+
+def _rules_at(project_dir, source):
+    """``(rules, pin)`` for the ``.sivacorignore`` at ``source``, or the
+    defaults; ``pin`` is its path and sha256, or ``None``."""
+    data = read_ignore_file(project_dir, source) if source else b""
+    try:
+        rules = sivacorignore.Rules.from_text(source, sivacorignore.decode(data))
+    except sivacorignore.InvalidPattern as exc:
+        raise SubmissionError(
+            FailureCode.IGNORE_FILE_INVALID,
+            f"Line {exc.lineno} of {sivacorignore.printable(source)}, "
+            f"'{sivacorignore.printable(exc.pattern)}', is not a valid pattern: "
+            f"{exc.reason}, so it would remove nothing.",
+        ) from None
+    pin = {"path": source, "sha256": hashlib.sha256(data).hexdigest()} if source else None
+    return rules, pin
+
+
+def _refuse_violations(rules, main_file_paths):
+    violations = sivacorignore.find_violations(rules, main_file_paths)
+    if not violations:
+        return
+    listed = "\n".join(f"  - {v}" for v in violations)
+    raise SubmissionError(
+        FailureCode.IGNORE_FILE_INVALID,
+        ".sivacorignore would delete files that must stay in the replication "
+        "package: the main file of every stage, which the certificate says was "
+        "run, and .sivacorignore itself, which records what was removed.\n"
+        f"{listed}\n"
+        "Narrow those patterns, or add a negation such as '!main.do' after "
+        "them (a negation cannot rescue a file inside an ignored directory -- "
+        "ignore the directory's other contents instead).",
+    )
+
+
+def protected_files_check(project_dir, stages):
+    """Refuse an extracted package whose ``.sivacorignore`` would delete a
+    main file or itself, before any image is pulled. Returns its pin."""
+    project_dir = pathlib.Path(project_dir)
+    main_files = [stage["main_file"] for stage in stages]
+    found = find_named_files(project_dir, [*main_files, sivacorignore.IGNORE_FILENAME])
+    source = sivacorignore.choose_ignore_file(found.pop(sivacorignore.IGNORE_FILENAME))
+    rules, pin = _rules_at(project_dir, source)
+    # Which copy a stage runs is not known yet, so every one is protected. A
+    # name found twice fails as MAIN_FILE_AMBIGUOUS before it runs instead.
+    _refuse_violations(rules, [p[0] for p in found.values() if len(p) == 1])
+    return pin
+
+
+def _is_listed_file(project_dir, relative):
+    """Whether ``os.walk`` would list ``relative`` as a file: no symlinked
+    directory on the way, and not a directory or a link to one itself."""
+    path = project_dir
+    for part in pathlib.PurePosixPath(relative).parent.parts:
+        path = path / part
+        try:
+            if not stat.S_ISDIR(os.lstat(path).st_mode):
+                return False
+        except OSError:
+            return False
+    path = project_dir / relative
+    return os.path.lexists(path) and not os.path.isdir(path)
+
+
+def _governing_after_run(project_dir, resolved, pinned):
+    """The pinned ``.sivacorignore``, or one beside or above a main file the
+    stages ran, whichever governs. One anywhere else belongs to a dependency
+    the run fetched (``renv/library``, a clone), not to the researcher."""
+    directories = {""}
+    for path in resolved:
+        directory = posixpath.dirname(path)
+        while directory not in directories:
+            directories.add(directory)
+            directory = posixpath.dirname(directory)
+    candidates = [posixpath.join(d, sivacorignore.IGNORE_FILENAME) for d in directories]
+    if pinned:
+        candidates.append(pinned["path"])
+    return sivacorignore.choose_ignore_file(
+        [c for c in candidates if _is_listed_file(project_dir, c)]
+    )
+
+
+def prune_rules(project_dir, resolved, pinned):
+    """The uploaded rules, refused if the run changed them or they would
+    delete a main file the stages ran (``resolved``): an earlier stage can
+    write a later one's. ``pinned`` is :func:`protected_files_check`'s."""
+    project_dir = pathlib.Path(project_dir)
+    source = _governing_after_run(project_dir, resolved, pinned)
+    rules, pin = _rules_at(project_dir, source)
+    if pin != pinned:
+        raise _ignore_file_changed(pinned, pin)
+    _refuse_violations(rules, resolved)
+    return rules
+
+
+def _ignore_file_changed(pinned, found):
+    def name(pin):
+        return sivacorignore.printable(pin["path"])
+
+    if pinned is None:
+        what = f"the package had no .sivacorignore, and the run created {name(found)}"
+    elif found is None or found["path"] != pinned["path"]:
+        what = f"{name(pinned)} was removed, moved or replaced"
+        if found is not None:
+            what += f", and {name(found)} would now take its place"
+    else:
+        what = f"{name(pinned)} was modified"
+    return SubmissionError(
+        FailureCode.IGNORE_FILE_INVALID,
+        "The rules for pruning the replication package are the .sivacorignore "
+        f"it was uploaded with, and the run changed them: {what}. "
+        f"{_AFTER_RUN} Make sure your code does not create, edit, move or "
+        "delete .sivacorignore files beside your own code.",
+    )
+
+
+def _prune(project_dir, rules):
+    """Delete what ``rules`` match; the package-relative paths deleted.
+
+    Removed directories are not descended into, so judging each entry with
+    :meth:`Rules.excluded_by` agrees with :meth:`Rules.pruned_by`. A symlink
+    is judged as a file, as git judges one, and unlinked, never followed.
+    """
+    project_dir = pathlib.Path(project_dir)
+    removed = []
+    for root, dirs, files in os.walk(project_dir / rules.base, topdown=True):
+        root_path = pathlib.Path(root)
+        kept_dirs = []
+        for d in dirs:
+            dir_p = root_path / d
+            relative = dir_p.relative_to(project_dir).as_posix()
+            link = dir_p.is_symlink()
+            if rules.excluded_by(relative, is_dir=not link):
+                _delete(project_dir, dir_p, tree=not link)
+                removed.append(relative if link else relative + "/")
+            else:
+                kept_dirs.append(d)
+        dirs[:] = kept_dirs
+        for f in files:
+            file_p = root_path / f
+            relative = file_p.relative_to(project_dir).as_posix()
+            if rules.excluded_by(relative):
+                _delete(project_dir, file_p, tree=False)
+                removed.append(relative)
+    return removed
+
+
+def _rmtree(path):
+    """``shutil.rmtree``, raising with the full path of the first failure;
+    which failure it re-raises differs between Python patch releases."""
+    failures = []
+
+    def onexc(function, failed, exc):
+        failures.append(failed)
+        raise exc
+
+    try:
+        shutil.rmtree(path, onexc=onexc)
+    except OSError as exc:
+        if failures:
+            exc.filename = failures[0]
+        raise
+
+
+def _owned(st):
+    return st.st_uid == os.geteuid()
+
+
+def _take_back_permissions(directories):
+    """Add ``u+rwx`` to each of ``directories`` the worker owns, and below,
+    never following a link: a stage runs as the worker and can lock what it
+    made (``chmod -w``, ``mkdtemp``, ``umask 077``)."""
+    pending = list(directories)
+    while pending:
+        directory = pending.pop()
+        try:
+            st = os.lstat(directory)
+            if not stat.S_ISDIR(st.st_mode) or not _owned(st):
+                continue
+            if st.st_mode & 0o700 != 0o700:
+                os.chmod(directory, stat.S_IMODE(st.st_mode) | 0o700)
+            with os.scandir(directory) as entries:
+                pending.extend(
+                    e.path for e in entries if e.is_dir(follow_symlinks=False)
+                )
+        except OSError:
+            continue
+
+
+def _delete(project_dir, path, tree):
+    """Remove ``path`` (a whole tree if ``tree``), retrying a permission error
+    after :func:`_take_back_permissions`. What still cannot go is not the
+    worker's -- a MATLAB stage runs as another uid -- so the house pays."""
+    remove = _rmtree if tree else os.unlink
+    try:
+        remove(path)
+        return
+    except OSError as exc:
+        if exc.errno not in (errno.EACCES, errno.EPERM):
+            raise
+    _take_back_permissions([path.parent, path] if tree else [path.parent])
+    try:
+        remove(path)
+    except OSError as exc:
+        if exc.errno not in (errno.EACCES, errno.EPERM):
+            raise
+        # The entry it failed on, which may be deep inside a pruned directory.
+        failed = pathlib.Path(exc.filename or path)
+        try:
+            where = failed.relative_to(project_dir).as_posix()
+        except ValueError:
+            where = failed.name
+        raise SubmissionError(
+            FailureCode.PRUNE_BLOCKED,
+            f"{sivacorignore.printable(where)} could not be removed "
+            f"({exc.strerror}), so the files .sivacorignore names could not "
+            f"all be pruned. {_AFTER_RUN} This is not charged to you; if your "
+            "code makes files or directories private or read-only, leaving "
+            "them writable avoids it.",
+        ) from None
+
+
 @app.task(queue=DISPATCH_QUEUE, bind=True)
 @submission_task("Failed to create workspace")
 def create_workspace(task, api, submission):
@@ -666,6 +916,9 @@ def create_workspace(task, api, submission):
         if os.path.exists(temp_filename):
             os.remove(temp_filename)
 
+    submission["ignore_file"] = protected_files_check(
+        project_dir, submission.get("stages", [])
+    )
     return submission
 
 
@@ -986,45 +1239,22 @@ def prune_workspace(task, api, submission):
     # UTC for the same reason as in execute_workflow above.
     start_time = datetime.datetime.now(datetime.UTC)
     project_dir = pathlib.Path(get_project_dir(submission))
-    patterns = copy.deepcopy(DEFAULT_SIVACOR_IGNORE)
-    # Check if user provided a custom .sivacorignore
-    if ignore_path := next(project_dir.rglob(".sivacorignore"), None):
+    # The last moment before anything is deleted. Refusing loses the run's
+    # outputs, but publishing files the researcher asked to have removed is
+    # not an option either.
+    rules = prune_rules(
+        project_dir,
+        resolved=list(submission.get("main_file_paths", {}).values()),
+        # A KeyError, so UNEXPECTED, if an older release created the workspace.
+        pinned=submission["ignore_file"],
+    )
+    if rules.source:
         logger.info(
-            f"Found custom .sivacorignore at {ignore_path}, applying user patterns."
+            f"Found custom .sivacorignore at {rules.source}, applying user patterns."
         )
-        ignore_base_dir = ignore_path.parent
-        with open(ignore_path, "r") as f:
-            user_patterns = [
-                line.strip() for line in f if line.strip() and not line.startswith("#")
-            ]
-            patterns += user_patterns
     else:
         logger.info("No custom .sivacorignore found, using default ignore patterns.")
-        ignore_base_dir = project_dir
-
-    removed_paths = []
-    spec = pathspec.PathSpec.from_lines("gitignore", list(patterns))
-
-    for root, dirs, files in os.walk(ignore_base_dir, topdown=True):
-        root_path = pathlib.Path(root)
-
-        kept_dirs = []
-        for d in dirs:
-            dir_p = root_path / d
-            relative_dir_str = str(dir_p.relative_to(ignore_base_dir)) + "/"
-            if spec.match_file(relative_dir_str):
-                removed_paths.append(relative_dir_str)
-                shutil.rmtree(dir_p, ignore_errors=True)
-            else:
-                kept_dirs.append(d)
-
-        dirs[:] = kept_dirs
-        for f in files:
-            file_p = root_path / f
-            relative_file_str = str(file_p.relative_to(ignore_base_dir))
-            if spec.match_file(relative_file_str):
-                removed_paths.append(relative_file_str)
-                file_p.unlink()
+    removed_paths = _prune(project_dir, rules)
 
     end_time = datetime.datetime.now(datetime.UTC)
     if removed_paths:

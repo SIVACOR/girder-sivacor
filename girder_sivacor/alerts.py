@@ -100,12 +100,18 @@ ALERT_POLICY: dict[FailureCode, Alert] = {
     FailureCode.OUT_OF_MEMORY: Alert.DIGEST,
     FailureCode.OUT_OF_DISK: Alert.DIGEST,
     FailureCode.REAPED_MAX_RUNTIME: Alert.DIGEST,
+    #: A link or special file in place of .sivacorignore is also what probing
+    #: the worker's filesystem looks like; a blocked prune can be a worker or
+    #: ACL misconfiguration. Either way an operator should see the count.
+    FailureCode.IGNORE_FILE_UNREADABLE: Alert.DIGEST,
+    FailureCode.PRUNE_BLOCKED: Alert.DIGEST,
     # --- the researcher's own code or package -------------------------------
     #: The bulk of all failures. Alerting on these would bury everything above.
     FailureCode.STATA_ERROR: Alert.NEVER,
     FailureCode.NONZERO_EXIT: Alert.NEVER,
     FailureCode.MAIN_FILE_MISSING: Alert.NEVER,
     FailureCode.MAIN_FILE_AMBIGUOUS: Alert.NEVER,
+    FailureCode.IGNORE_FILE_INVALID: Alert.NEVER,
     FailureCode.UNSUPPORTED_ARCHIVE: Alert.NEVER,
     #: Documented as "Not a defect": the researcher cancelled and then deleted
     #: inside the ~12 s the write-back takes.
