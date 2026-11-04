@@ -164,6 +164,28 @@ RAISE_SITES = [
         id="unsupported_archive",  # run_submission.py:421, detail omitted
     ),
     pytest.param(
+        FailureCode.IGNORE_FILE_INVALID,
+        ".sivacorignore would delete files that must stay in the replication "
+        "package:\n  - code/main.do (main file) is matched by '*.do' on line 1 "
+        "of .sivacorignore",
+        None,
+        id="ignore_file_invalid",  # _refuse_violations, detail omitted
+    ),
+    pytest.param(
+        FailureCode.IGNORE_FILE_UNREADABLE,
+        "proj/.sivacorignore could not be read (it is a link or a special "
+        "file), so the rules for pruning the replication package cannot be read.",
+        None,
+        id="ignore_file_unreadable",  # read_ignore_file, detail omitted
+    ),
+    pytest.param(
+        FailureCode.PRUNE_BLOCKED,
+        "restricted/sub could not be removed (Permission denied), so the "
+        "files .sivacorignore names could not all be pruned.",
+        None,
+        id="prune_blocked",  # _delete, detail omitted
+    ),
+    pytest.param(
         FailureCode.NONZERO_EXIT,
         "Error executing recorded run. Check stdout/stderr for details.",
         1,

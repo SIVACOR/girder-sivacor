@@ -14,6 +14,7 @@ import time
 import zipfile
 from pathlib import Path
 from threading import Event, Thread
+from typing import NamedTuple
 
 import cpuinfo
 import docker
@@ -928,6 +929,28 @@ def stop_container(container: docker.models.containers.Container):
         raise
 
 
+def find_named_files(project_dir, names):
+    """``{name: [package-relative paths]}`` for every file named one of
+    ``names``: how the worker finds a main file, and so what it protects."""
+    found = {name: [] for name in names}
+    for root, _, files in os.walk(project_dir):
+        relative_root = Path(root).relative_to(project_dir).as_posix()
+        prefix = "" if relative_root == "." else relative_root + "/"
+        for name in files:
+            if name in found:
+                found[name].append(prefix + name)
+    return found
+
+
+class RunCommand(NamedTuple):
+    entrypoint: list
+    command: str
+    sub_dir: str
+    home_dir: str
+    #: Package-relative, for ``prune_workspace`` to protect.
+    main_file: str
+
+
 def _infer_run_command(submission, stage):
     project_dir = get_project_dir(submission)
     entrypoint = ["/bin/sh", "-c"]
@@ -969,19 +992,11 @@ def _infer_run_command(submission, stage):
         )
 
     # Find the main file, by walking into subdirectories if needed
-    base_path = Path(project_dir).resolve()
-    relative_paths = []
-    renv_paths = []
-    for current_dir, _, filenames in os.walk(base_path):
-        if stage["main_file"] in filenames:
-            full_main_file_path = Path(current_dir) / stage["main_file"]
-            relative_path = full_main_file_path.relative_to(base_path)
-            relative_paths.append(relative_path)
-
-        if "renv.lock" in filenames:
-            full_renv_path = Path(current_dir) / "renv.lock"
-            relative_renv_path = full_renv_path.relative_to(base_path)
-            renv_paths.append(relative_renv_path)
+    found = find_named_files(
+        Path(project_dir).resolve(), [stage["main_file"], "renv.lock"]
+    )
+    relative_paths = [Path(p) for p in found[stage["main_file"]]]
+    renv_paths = [Path(p) for p in found["renv.lock"]]
 
     if len(relative_paths) == 0:
         raise SubmissionError(
@@ -992,11 +1007,11 @@ def _infer_run_command(submission, stage):
         # The paths are what makes this actionable -- the researcher has to know
         # which copies to remove -- so they stay in the message. Only the count
         # is kept in the permanent record.
-        found = ", ".join(str(path) for path in sorted(relative_paths))
+        listed = ", ".join(str(path) for path in sorted(relative_paths))
         raise SubmissionError(
             FailureCode.MAIN_FILE_AMBIGUOUS,
             f"Cannot infer run command for submission. Multiple "
-            f"{stage['main_file']} files found: {found}",
+            f"{stage['main_file']} files found: {listed}",
             detail=len(relative_paths),
         )
 
@@ -1028,7 +1043,9 @@ def _infer_run_command(submission, stage):
     elif " " in command:
         command = f'"{command}"'
 
-    return entrypoint, command, sub_dir, home_dir
+    return RunCommand(
+        entrypoint, command, sub_dir, home_dir, relative_paths[0].as_posix()
+    )
 
 
 #: Abort a run when free space on the workspace filesystem drops below this.
@@ -2335,7 +2352,11 @@ def recorded_run(api, submission, stage, env_vars):
     # instead of surfacing as an ImageNotFound out of containers.create.
     assert_image_present(cli, image_reference)
 
-    entrypoint, command, sub_dir, home_dir = _infer_run_command(submission, stage)
+    entrypoint, command, sub_dir, home_dir, main_file = _infer_run_command(
+        submission, stage
+    )
+    # Keyed by stage, so a stage run again replaces its entry.
+    submission.setdefault("main_file_paths", {})[str(stage_num)] = main_file
     project_dir = get_project_dir(submission)
     logger.info(
         "Setting working directory to: "

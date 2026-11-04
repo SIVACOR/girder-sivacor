@@ -23,7 +23,6 @@ requirements = [
     f"girder-plugin-worker>={girder_version}",
     f"girder-user-quota>={girder_version}",
     "pandas",
-    "pathspec",
     "pylibacl",
     "py-cpuinfo",
     "randomname",
