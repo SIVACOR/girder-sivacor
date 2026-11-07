@@ -138,7 +138,7 @@ tox -e test -- test_stata.py     # must print "5 passed"
 If that does not print 5 passed, the environment is wrong and **the full suite's failure list
 carries no information** — stop and fix the environment first.
 
-Tests that submit real `dataeditors/stata18_5-mp` jobs fail without a license, most as
+Tests that submit real `sscng/stata18_5-mp` jobs fail without a license, most as
 `assert 4 == 3` (`JobStatus.ERROR` vs `SUCCESS`) and a few on unrelated-looking string assertions.
 None of them mention licensing at the assertion, which is what makes them easy to misread.
 

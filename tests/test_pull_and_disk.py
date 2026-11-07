@@ -36,7 +36,7 @@ from girder_sivacor.worker_plugin.lib import (
     workspace_has_own_filesystem,
 )
 
-IMAGE = "dataeditors/stata19_5-mp:2026-04-15"
+IMAGE = "sscng/stata19_5-mp:2026-04-15"
 
 
 @pytest.fixture(autouse=True)
@@ -1072,12 +1072,12 @@ def test_eight_stages_on_two_images_resolve_to_two_pulls():
     """The shape of the submission that died: 8 stages, 2 distinct images."""
     stages = [
         _stage("rocker/geospatial", "4.4.2"),
-        _stage("dataeditors/stata19_5-mp", "2026-04-15"),
+        _stage("sscng/stata19_5-mp", "2026-04-15"),
     ] * 4
 
     assert distinct_images(stages) == [
         "rocker/geospatial:4.4.2",
-        "dataeditors/stata19_5-mp:2026-04-15",
+        "sscng/stata19_5-mp:2026-04-15",
     ]
 
 

@@ -17,7 +17,7 @@ from .conftest import submit_sivacor_job, upload_test_file
 
 STAGES = [
     {
-        "image_name": "dataeditors/stata18_5-mp",
+        "image_name": "sscng/stata18_5-mp",
         "image_tag": "2025-02-26",
         "main_file": "main.do",
     }

@@ -163,7 +163,7 @@ forvalues i = 1/20 {
         # 1 GiB rather than 256 MiB because Stata needs headroom to get as far
         # as reading its license.
         pytest.param(
-            "dataeditors/stata18_5-mp",
+            "sscng/stata18_5-mp",
             "2025-02-26",
             "main.do",
             _STATA_HOG,

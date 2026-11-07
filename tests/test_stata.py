@@ -32,7 +32,7 @@ def test_simple_run(
     testFile,
 ):
     """Test a successful Stata submission workflow."""
-    image_name = "dataeditors/stata18_5-mp"
+    image_name = "sscng/stata18_5-mp"
     image_tag = "2025-02-26"
     main_file = "main.do"
     stages = [
@@ -93,7 +93,7 @@ def test_error_detection(
     submission_collection,
 ):
     """Test error detection in Stata submission workflow."""
-    image_name = "dataeditors/stata18_5-mp"
+    image_name = "sscng/stata18_5-mp"
     image_tag = "2025-02-26"
     main_file = "fail.do"
     stages = [
@@ -156,7 +156,7 @@ def test_dual_stdout(
     submission_collection,
 ):
     """Test error detection in Stata submission workflow."""
-    image_name = "dataeditors/stata18_5-mp"
+    image_name = "sscng/stata18_5-mp"
     image_tag = "2025-02-26"
     main_file = "main.do"
     stages = [
@@ -205,7 +205,7 @@ def test_secrets(
     submission_collection,
 ):
     """Test if secrets are properly passed to the Stata job."""
-    image_name = "dataeditors/stata18_5-mp"
+    image_name = "sscng/stata18_5-mp"
     image_tag = "2025-02-26"
     main_file = "check_secrets.do"
     stages = [
