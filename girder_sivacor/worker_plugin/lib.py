@@ -781,8 +781,26 @@ class LogRelay:
             pass
 
 
+#: Docker Hub namespaces the Stata images have been published under.
+#: ``dataeditors`` is the original; upstream moved to ``sscng`` in 2026-11
+#: (SIVACOR/sivacor-repo-choice#7). Both stay: workflows exported before the
+#: move still name ``dataeditors``, and that namespace remains on Docker Hub.
+#: The tags were re-pushed rather than mirrored -- the same tag carries a
+#: different digest in each -- so the two are not interchangeable in a TRO.
+STATA_NAMESPACES = frozenset({"dataeditors", "sscng"})
+
+
 def is_stata(image_reference: str) -> bool:
-    return image_reference.startswith("dataeditors/stata")
+    """Whether this is a Stata image, in either namespace it has lived in.
+
+    The one definition: the license mount, the main-file quoting, the entrypoint
+    and the exit-0 ``r(NNN)`` check all key on it, and a second spelling of it
+    is how a namespace move breaks some of those and not others.
+    """
+    repo = str(image_reference).rsplit("/", 1)[-1]
+    return image_family(image_reference) in STATA_NAMESPACES and repo.startswith(
+        "stata"
+    )
 
 
 def is_matlab(image_reference: str) -> bool:
@@ -796,7 +814,7 @@ def is_julia(image_reference: str) -> bool:
     only images SIVACOR builds and publishes itself (10-D14 in
     development_notes/10_julia_support_plan.md). The bare ``julia`` prefix spans
     every per-line repo -- ``julia1.10``, ``julia1.11``, ``julia1.13`` -- the
-    same way one ``dataeditors/stata`` prefix spans stata15 through
+    same way one Stata namespace spans stata15 through
     stata19_5-mp-i-python.
     """
     return image_reference.startswith("ghcr.io/sivacor/julia")
@@ -967,7 +985,7 @@ def _infer_run_command(submission, stage):
     home_dir = "/workspace"
     if image_name.startswith("rocker"):
         entrypoint = ["/usr/local/bin/R", "--no-save", "--no-restore", "-f"]
-    elif image_name.startswith("dataeditors/stata"):
+    elif is_stata(image_name):
         entrypoint = ["/usr/local/stata/stata-mp", "-b", "do"]
     elif image_name.startswith("dynare"):
         entrypoint = ["/usr/local/bin/matlab", "-batch"]
@@ -1470,6 +1488,10 @@ _IMAGE_FAMILY_COMPRESSED_GB = {
     # ~1.3 GiB, which is affordable precisely because Stata footprints are small:
     # the check has ~6 GiB of slack in the cases where a Stata pull is decided.
     "dataeditors": 0.9,
+    # The same images re-pushed under the namespace upstream moved to (see
+    # STATA_NAMESPACES). Checked 2026-11-07: sscng/stata19_5-mp-i-python:2026-06-03
+    # is 0.89 GiB compressed, identical to its dataeditors twin.
+    "sscng": 0.9,
     # SIVACOR's own Julia images, keyed on the namespace after image_family()
     # strips the ``ghcr.io`` host -- see that function for why the host must go.
     #

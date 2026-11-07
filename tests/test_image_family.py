@@ -7,7 +7,7 @@ keys them on the registry host instead of the namespace.
 
 import pytest
 
-from girder_sivacor.worker_plugin.lib import image_family, is_julia
+from girder_sivacor.worker_plugin.lib import image_family, is_julia, is_stata
 
 
 @pytest.mark.parametrize(
@@ -16,6 +16,7 @@ from girder_sivacor.worker_plugin.lib import image_family, is_julia
         # Bare Docker Hub references: unchanged, and this is the half that must
         # not regress -- every existing entry in the size table is one of these.
         ("dataeditors/stata18-mp", "dataeditors"),
+        ("sscng/stata18-mp", "sscng"),
         ("rocker/r-ver:4.6.1", "rocker"),
         ("dynare/dynare:6.5-R2025b", "dynare"),
         # Registry-qualified: the host is stripped, so the key is the namespace.
@@ -78,3 +79,39 @@ def test_the_julia_family_has_a_measured_entry():
         v for k, v in _IMAGE_FAMILY_COMPRESSED_GB.items() if k != family
     )
     assert compressed * IMAGE_ON_DISK_MULTIPLIER < 2.0
+
+
+@pytest.mark.parametrize(
+    "reference,expected",
+    [
+        # Both namespaces Stata has been published under: sivacor-repo-choice#7
+        # moved it, and workflows exported before that still name the old one.
+        ("dataeditors/stata18_5-mp", True),
+        ("dataeditors/stata19_5-mp-i-python:2026-06-03", True),
+        ("sscng/stata18_5-mp", True),
+        ("sscng/stata19_5-mp-i-python:2026-06-03", True),
+        ("docker.io/sscng/stata17", True),
+        # A Stata namespace is not enough, and neither is a stata repo name.
+        ("sscng/notstata", False),
+        ("someoneelse/stata18-mp", False),
+        ("rocker/r-ver:4.6.1", False),
+        ("dynare/dynare:6.5-R2025b", False),
+    ],
+)
+def test_is_stata(reference, expected):
+    assert is_stata(reference) is expected
+
+
+def test_every_stata_namespace_has_a_measured_entry():
+    """The size table must reach Stata under either namespace.
+
+    The same silent failure as the Julia test above: an unknown family makes
+    ``image_on_disk_estimate`` return ``None`` and the pull goes unchecked.
+    """
+    from girder_sivacor.worker_plugin.lib import (
+        _IMAGE_FAMILY_COMPRESSED_GB,
+        STATA_NAMESPACES,
+    )
+
+    for namespace in STATA_NAMESPACES:
+        assert _IMAGE_FAMILY_COMPRESSED_GB[namespace] >= 0.89
