@@ -209,12 +209,12 @@ SettingDefault.defaults.update(
             },
         ],
         PluginSettings.IMAGE_TAGS: {
-            "dataeditors/stata15": ["latest", "2023-01-27"],
-            "dataeditors/stata16": ["latest", "2023-06-13", "2022-10-14"],
-            "dataeditors/stata17": ["latest", "2024-05-21", "2024-02-13"],
-            "dataeditors/stata18-mp": ["2025-11-12", "2025-08-12", "2025-02-26"],
-            "dataeditors/stata18_5-mp": ["2025-02-26", "2024-12-18", "2024-10-16"],
-            "dataeditors/stata19_5-mp": ["2025-11-12", "2025-08-14", "2025-08-13"],
+            "sscng/stata15": ["latest", "2023-01-27"],
+            "sscng/stata16": ["latest", "2023-06-13", "2022-10-14"],
+            "sscng/stata17": ["latest", "2024-05-21", "2024-02-13"],
+            "sscng/stata18-mp": ["2025-11-12", "2025-08-12", "2025-02-26"],
+            "sscng/stata18_5-mp": ["2025-02-26", "2024-12-18", "2024-10-16"],
+            "sscng/stata19_5-mp": ["2025-11-12", "2025-08-14", "2025-08-13"],
             "rocker/geospatial": [
                 "4.5.2",
                 "4.5.1",
