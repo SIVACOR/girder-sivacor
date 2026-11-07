@@ -41,7 +41,7 @@ replaced the count deliberately; please do not reintroduce one.
 
 - **`STATA_LICENSE_HOSTPATH`** — the path above exists on this machine and is gitignored, so it
   never arrives with a fresh clone. Without it, every test that submits a real
-  `dataeditors/stata18_5-mp` job fails as `assert 4 == 3` (`JobStatus.ERROR` vs `SUCCESS`), and a
+  `sscng/stata18_5-mp` job fails as `assert 4 == 3` (`JobStatus.ERROR` vs `SUCCESS`), and a
   few on unrelated-looking string assertions. None of them mention licensing at the assertion.
   Since the run-time license fetch landed, `lib.py::stata_license_mount_source` does raise a clear
   `ValueError` naming the missing setting, and it reaches the job log — so if you *are* already

@@ -31,7 +31,7 @@ def test_multistage_run(
     """Test a successful Stata submission workflow."""
     stages = [
         {
-            "image_name": "dataeditors/stata18_5-mp",
+            "image_name": "sscng/stata18_5-mp",
             "image_tag": "2025-02-26",
             "main_file": "main.do",
         },
@@ -61,7 +61,7 @@ def test_multistage_run(
     log = "".join(logged.get("log") or [])
     assert "Fetching analysis image 1 of 2" in log
     assert "Fetching analysis image 2 of 2" in log
-    assert "dataeditors/stata18_5-mp:2025-02-26" in log
+    assert "sscng/stata18_5-mp:2025-02-26" in log
     assert "rocker/r-ver:4.3.1" in log
     assert log.count("All analysis images are ready") == 1
     assert "GiB free" in log

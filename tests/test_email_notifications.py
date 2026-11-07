@@ -32,7 +32,7 @@ def test_success_email_notification(
     submission_collection,
 ):
     """Test that success email notification is sent when job completes successfully."""
-    image_name = "dataeditors/stata18_5-mp"
+    image_name = "sscng/stata18_5-mp"
     image_tag = "2025-02-26"
     main_file = "main.do"
     stages = [
@@ -96,7 +96,7 @@ def _test_failure_email_notification(
     submission_collection,
 ):
     """Test that failure email notification is sent when job fails."""
-    image_name = "dataeditors/stata18_5-mp"
+    image_name = "sscng/stata18_5-mp"
     image_tag = "2025-02-26"
     main_file = "fail.do"
     stages = [
@@ -166,7 +166,7 @@ def test_email_template_rendering(
     submission_collection,
 ):
     """Test that email template is correctly rendered with job information."""
-    image_name = "dataeditors/stata18_5-mp"
+    image_name = "sscng/stata18_5-mp"
     image_tag = "2025-02-26"
     main_file = "main.do"
     stages = [
@@ -231,7 +231,7 @@ def test_email_notification_error_handling(
     submission_collection,
 ):
     """Test that email notification errors are logged but don't crash the job."""
-    image_name = "dataeditors/stata18_5-mp"
+    image_name = "sscng/stata18_5-mp"
     image_tag = "2025-02-26"
     main_file = "main.do"
     stages = [
@@ -280,12 +280,12 @@ def test_email_content_for_multistage_job(
     """Test email content includes all stages for multi-stage jobs."""
     stages = [
         {
-            "image_name": "dataeditors/stata18_5-mp",
+            "image_name": "sscng/stata18_5-mp",
             "image_tag": "2025-02-26",
             "main_file": "step1.do",
         },
         {
-            "image_name": "dataeditors/stata18_5-mp",
+            "image_name": "sscng/stata18_5-mp",
             "image_tag": "2025-02-26",
             "main_file": "step2.do",
         },
@@ -328,7 +328,7 @@ def test_timestamp_formatting_in_email(
     submission_collection,
 ):
     """Test that timestamps are properly formatted in the email."""
-    image_name = "dataeditors/stata18_5-mp"
+    image_name = "sscng/stata18_5-mp"
     image_tag = "2025-02-26"
     main_file = "main.do"
     stages = [
@@ -379,7 +379,7 @@ def test_duration_calculation_in_email(
     submission_collection,
 ):
     """Test that execution duration is properly calculated and formatted in the email."""
-    image_name = "dataeditors/stata18_5-mp"
+    image_name = "sscng/stata18_5-mp"
     image_tag = "2025-02-26"
     main_file = "main.do"
     stages = [
