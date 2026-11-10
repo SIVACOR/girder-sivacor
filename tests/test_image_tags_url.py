@@ -38,12 +38,19 @@ def _serve(url_to_tags):
     return mock.patch.object(rest.requests, "get", side_effect=get)
 
 
+UPSTREAM = (
+    "https://raw.githubusercontent.com/SIVACOR/sivacor-repo-choice"
+    "/refs/heads/main/allowed_repos.yaml"
+)
+
+
 @pytest.mark.plugin("sivacor")
-def test_the_default_is_the_url_every_deployment_used_before(server):
-    assert Setting().get(PluginSettings.IMAGE_TAGS_URL) == (
-        "https://raw.githubusercontent.com/SIVACOR/sivacor-repo-choice"
-        "/refs/heads/main/allowed_repos.yaml"
-    )
+def test_by_default_nothing_is_fetched(server, cache):
+    """A deployment's allow-list is its own until its operator says otherwise."""
+    assert Setting().get(PluginSettings.IMAGE_TAGS_URL) == ""
+    with mock.patch.object(rest.requests, "get") as get:
+        assert SIVACOR._get_tags() == Setting().get(PluginSettings.IMAGE_TAGS)
+    get.assert_not_called()
 
 
 @pytest.mark.plugin("sivacor")
@@ -59,8 +66,8 @@ def test_the_list_is_fetched_from_the_configured_url(server, cache):
 @pytest.mark.plugin("sivacor")
 def test_changing_the_url_invalidates_the_cache_at_once(server, cache):
     """Not up to four hours later: the cache records where it came from."""
-    upstream = Setting().get(PluginSettings.IMAGE_TAGS_URL)
-    with _serve({upstream: UPSTREAM_TAGS, FORK: FORK_TAGS}):
+    Setting().set(PluginSettings.IMAGE_TAGS_URL, UPSTREAM)
+    with _serve({UPSTREAM: UPSTREAM_TAGS, FORK: FORK_TAGS}):
         assert SIVACOR._get_tags() == UPSTREAM_TAGS
         Setting().set(PluginSettings.IMAGE_TAGS_URL, FORK)
         assert SIVACOR._get_tags() == FORK_TAGS
@@ -107,7 +114,26 @@ def test_an_empty_url_never_fetches_and_uses_the_setting_as_is(server, cache):
 
 
 @pytest.mark.plugin("sivacor")
-@pytest.mark.parametrize("value", [None, 123, "ftp://example.org/x.yaml", "file:///etc/passwd"])
+@pytest.mark.parametrize(
+    "value", [None, 123, "ftp://example.org/x.yaml", "file:///etc/passwd"]
+)
 def test_a_url_that_is_not_http_is_refused(server, value):
     with pytest.raises(ValidationException):
         Setting().set(PluginSettings.IMAGE_TAGS_URL, value)
+
+
+@pytest.mark.plugin("sivacor")
+@pytest.mark.parametrize(
+    "value",
+    [
+        [],
+        {"rocker/r-ver": "4.6.1"},
+        {"rocker/r-ver": [4.6]},
+        {"": ["4.6.1"]},
+        {"rocker/r-ver": [""]},
+    ],
+)
+def test_a_malformed_image_list_is_refused(server, value):
+    """The config page writes this by hand, so typos must not reach it."""
+    with pytest.raises(ValidationException):
+        Setting().set(PluginSettings.IMAGE_TAGS, value)

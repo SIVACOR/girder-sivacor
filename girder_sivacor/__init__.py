@@ -144,6 +144,17 @@ def _validate_image_tags(doc):
     value = doc.get("value")
     if not isinstance(value, dict):
         raise ValidationException("Image tags must be a dictionary.")
+    # Every consumer does `tag in tags[image]`, which a bare string satisfies
+    # by substring -- "4.6" would allow-list a typo'd "4.6.1" as "4.6".
+    for image, tags in value.items():
+        if not isinstance(image, str) or not image.strip():
+            raise ValidationException("Image names must be non-empty strings.")
+        if not isinstance(tags, list) or not all(
+            isinstance(tag, str) and tag.strip() for tag in tags
+        ):
+            raise ValidationException(
+                f"Tags for {image} must be a list of non-empty strings."
+            )
     return value
 
 
