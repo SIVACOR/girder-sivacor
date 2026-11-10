@@ -24,12 +24,11 @@ from girder.constants import AccessType
 from girder_client import HttpError
 from girder_worker.app import app
 from girder_worker.utils import JobStatus
-from tro_utils import TRPAttribute
 from tro_utils.tro_utils import TRO
 
 from .. import sivacorignore
 from ..errors import FailureCode, SubmissionError, classify, failure_record
-from ..settings import PluginSettings
+from ..settings import ALWAYS_CLAIMED, CLAIMED_ON_REQUEST, PluginSettings
 from ..statuses import CANCELING, FAILED
 from ..telemetry import size_bucket
 from .girder_api import GirderApi, dump_to_zip
@@ -1230,13 +1229,12 @@ def execute_workflow(task, api, submission, stage, env_vars):
 
     if submission.get("runs") is None:
         submission["runs"] = []
-    attrs = [
-        TRPAttribute.ENV_ISOLATION.value,
-        TRPAttribute.NON_INTERACTIVE.value,
-        TRPAttribute.MACHINE_ENFORCEMENT.value,
+    # Every capability these need is required of sivacor.tro_profile by its
+    # validator, so a claim added here must be added to the lists it reads.
+    attrs = [attr.value for attr in ALWAYS_CLAIMED]
+    attrs += [
+        attr.value for field, attr in CLAIMED_ON_REQUEST.items() if stage.get(field, False)
     ]
-    if stage.get("network_isolation", False):
-        attrs.append(TRPAttribute.NET_ISOLATION.value)
     submission["runs"].append(
         {
             "run_start_time": start_time.isoformat(),

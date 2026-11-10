@@ -24,7 +24,7 @@ from girder_jobs.constants import REST_CREATE_JOB_TOKEN_SCOPE, JobStatus
 from girder_jobs.models.job import Job
 from girder_plugin_worker.utils import getWorkerApiUrl
 
-from . import alerts, chain, image_tags, usage
+from . import alerts, chain, image_tags, tro_profile, usage
 from .errors import FailureCode
 from .models.execution_record import ExecutionRecord
 from .settings import PluginSettings, support_email
@@ -847,6 +847,8 @@ class SIVACOR(Resource):
         self.route("GET", ("image_tags",), self.get_image_tags)
         self.route("GET", ("image_tags", "status"), self.get_image_tags_status)
         self.route("PUT", ("image_tags", "config"), self.set_image_tags_config)
+        self.route("GET", ("tro_profile",), self.get_tro_profile)
+        self.route("PUT", ("tro_profile",), self.set_tro_profile)
         self.route("GET", ("worker_sizes",), self.get_worker_sizes)
         self.route("GET", ("volume_quota",), self.get_volume_quota)
         self.route("GET", ("volume_usage",), self.get_volume_usage)
@@ -937,6 +939,21 @@ class SIVACOR(Resource):
             image_reference = f"{image_name}:{tag}"
             if image_name not in tags or tag not in tags.get(image_name, []):
                 raise ValidationException(f"Invalid image: {image_reference}")
+
+        # A claim the TRS profile does not back fails the submission when its
+        # run is recorded, after the analysis has run -- so it is refused here.
+        # The profile is not made to declare it instead: that would have a
+        # deployment that cannot enforce it say that it can, in every TRO.
+        undeclared = tro_profile.undeclared_requests(
+            Setting().get(PluginSettings.TRO_PROFILE) or {}
+        )
+        for stage in stages:
+            for field, capability in undeclared.items():
+                if stage.get(field, False):
+                    raise ValidationException(
+                        f"This deployment cannot provide {field.replace('_', ' ')}: "
+                        f"its TRS profile does not declare {capability}."
+                    )
 
         # Resolved server-side, before anything is created: an unknown size must
         # never reach the controller, where the flavour it names does not exist,
@@ -2259,6 +2276,33 @@ class SIVACOR(Resource):
     def set_image_tags_config(self, config):
         image_tags.set_config(config.get("url", ""), config.get("tags"))
         return image_tags.status()
+
+    @access.admin
+    @autoDescribeRoute(
+        Description("The TRS profile every signed TRO declares.").notes(
+            "'warnings' lists what is wrong with the stored profile: that it "
+            "names SIVACOR on a deployment that is not sivacor.org, or that it "
+            "lacks a capability every run claims. 'required_capabilities' are "
+            "those claims' capabilities, which the profile must declare."
+        )
+    )
+    def get_tro_profile(self):
+        return tro_profile.status()
+
+    @access.admin
+    @autoDescribeRoute(
+        Description("Set sivacor.tro_profile.")
+        .notes("Validated as the setting is. Returns the resulting status.")
+        .jsonParam(
+            "profile",
+            "The TRS profile, as JSON-LD.",
+            paramType="body",
+            requireObject=True,
+        )
+    )
+    def set_tro_profile(self, profile):
+        tro_profile.set_profile(profile)
+        return tro_profile.status()
 
     # DATA_READ rather than the bare @access.user every other handler here uses,
     # and that is deliberate: sivacor-girderfs authenticates with a DATA_READ

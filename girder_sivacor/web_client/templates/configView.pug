@@ -36,3 +36,25 @@ form#g-sivacor-image-tags-form(role="form")
     .g-sivacor-image-list
   p#g-sivacor-image-tags-error-message.g-validation-failed-message
   input.btn.btn-sm.btn-primary(type="submit", value="Save")
+
+h3.g-sivacor-trs-heading Trusted Research System
+p.g-sivacor-config-lede
+  | Who this deployment says it is. Every TRO it signs names this system as
+  |  the one that certified the run, and lists the capabilities below as what
+  |  backs each claim it makes about the run.
+
+.g-sivacor-trs-warnings.alert.alert-danger(style="display: none")
+  strong Every TRO this deployment signs is affected.
+  ul.g-sivacor-trs-warnings-list
+
+form#g-sivacor-trs-form(role="form")
+  .form-group
+    label.control-label(for="g-sivacor-trs-profile") TRS profile (JSON-LD)
+    textarea#g-sivacor-trs-profile.form-control(rows="20", spellcheck="false")
+    p.help-block
+      | Declare only capabilities this deployment actually enforces: each one
+      |  backs a claim in every TRO it signs. The #[code @id] must be an
+      |  absolute IRI, the same in every declaration.
+    p.help-block.g-sivacor-trs-required
+  p#g-sivacor-trs-error-message.g-validation-failed-message
+  input.btn.btn-sm.btn-primary(type="submit", value="Save")

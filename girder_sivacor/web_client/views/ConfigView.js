@@ -4,6 +4,7 @@ import '../stylesheets/configView.styl';
 import ImageListWidget from './ImageListWidget';
 
 const PluginConfigBreadcrumbWidget = girder.views.widgets.PluginConfigBreadcrumbWidget;
+const $ = girder.$;
 const View = girder.views.View;
 const { restRequest } = girder.rest;
 const events = girder.events;
@@ -12,11 +13,12 @@ const IMAGE_TAGS = 'sivacor.image_tags';
 const IMAGE_TAGS_URL = 'sivacor.image_tags_url';
 
 /**
- * Where the analysis-image allow-list comes from (issue #151).
+ * Where the analysis-image allow-list comes from (issue #151), and the TRS
+ * profile every signed TRO declares (issue #153).
  *
- * The two settings are saved together because each changes what the other
- * means: with a URL the list is only the fallback for a failed fetch, without
- * one it is the allow-list itself.
+ * The two image settings are saved together because each changes what the
+ * other means: with a URL the list is only the fallback for a failed fetch,
+ * without one it is the allow-list itself.
  */
 const ConfigView = View.extend({
     events: {
@@ -30,6 +32,19 @@ const ConfigView = View.extend({
                 return;
             }
             this._save(this.$('#g-sivacor-image-tags-url').val(), tags.value);
+        },
+
+        'submit #g-sivacor-trs-form'(event) {
+            event.preventDefault();
+            this.$('#g-sivacor-trs-error-message').empty();
+            let profile;
+            try {
+                profile = JSON.parse(this.$('#g-sivacor-trs-profile').val());
+            } catch (err) {
+                this.$('#g-sivacor-trs-error-message').text(`The profile is not valid JSON: ${err.message}`);
+                return;
+            }
+            this._saveProfile(profile);
         },
 
         'click .g-sivacor-copy-effective'(event) {
@@ -54,6 +69,8 @@ const ConfigView = View.extend({
             this.imageList.setValue(resp[IMAGE_TAGS] || {});
             this._fetchStatus();
         });
+        restRequest({ method: 'GET', url: 'sivacor/tro_profile' })
+            .done((status) => this._showProfile(status));
     },
 
     render() {
@@ -128,6 +145,45 @@ const ConfigView = View.extend({
             this._showError(
                 (resp.responseJSON && resp.responseJSON.message) ||
                 'The settings were not saved. Neither has changed.'
+            );
+        });
+    },
+
+    _showProfile(status) {
+        this.$('#g-sivacor-trs-profile').val(JSON.stringify(status.profile || {}, null, 2));
+        const required = status.required_capabilities;
+        this.$('.g-sivacor-trs-required').text(
+            `Every run claims attributes backed by ${required.join(', ')}, ` +
+            'so the profile must declare each of them in trov:hasCapability. ' +
+            'Without trov:CanProvideInternetIsolation, submissions asking for ' +
+            'network isolation are refused.');
+        const warnings = this.$('.g-sivacor-trs-warnings');
+        const list = warnings.find('.g-sivacor-trs-warnings-list').empty();
+        for (const message of status.warnings) {
+            list.append($('<li>').text(message));
+        }
+        warnings.toggle(status.warnings.length > 0);
+    },
+
+    _saveProfile(profile) {
+        restRequest({
+            method: 'PUT',
+            url: 'sivacor/tro_profile',
+            contentType: 'application/json',
+            data: JSON.stringify(profile),
+            error: null
+        }).done((status) => {
+            events.trigger('g:alert', {
+                icon: 'ok',
+                text: 'TRS profile saved.',
+                type: 'success',
+                timeout: 4000
+            });
+            this._showProfile(status);
+        }).fail((resp) => {
+            this.$('#g-sivacor-trs-error-message').text(
+                (resp.responseJSON && resp.responseJSON.message) ||
+                'The profile was not saved.'
             );
         });
     },
