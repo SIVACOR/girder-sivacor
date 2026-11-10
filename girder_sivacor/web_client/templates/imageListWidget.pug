@@ -1,0 +1,55 @@
+if jsonMode
+  textarea.g-sivacor-image-json.form-control(rows="18", spellcheck="false")= jsonText
+  .g-sivacor-image-footer
+    span.help-block
+      | A JSON object of image name to tags, for example
+      = ' '
+      code {"rocker/r-ver": ["4.6.1", "4.6.0"]}
+      | .
+    button.g-sivacor-toggle-json.btn.btn-sm.btn-default(type="button") Back to the editor
+else
+  .g-sivacor-image-toolbar
+    input.g-sivacor-image-filter.input-sm.form-control(
+      type="search", placeholder="Filter images and tags", value=filter,
+      aria-label="Filter images and tags")
+    button.g-sivacor-add-image.btn.btn-sm.btn-default(type="button")
+      i.icon-plus
+      |  Add image
+
+  table.table.g-sivacor-image-table
+    thead
+      tr
+        th.g-sivacor-col-image Image
+        th Tags
+        th.g-sivacor-col-actions
+          span.sr-only Remove
+    tbody
+      each row, index in rows
+        tr(data-index=index)
+          td.g-sivacor-col-image
+            input.g-sivacor-image-name.input-sm.form-control(
+              type="text", value=row.image, placeholder="e.g. rocker/r-ver",
+              aria-label="Image name", spellcheck="false")
+          td
+            ul.g-sivacor-tags(aria-label=`Tags for ${row.image || 'new image'}`)
+              each tag, position in row.tags
+                != tagTemplate({ tag, first: position === 0 })
+              li.g-sivacor-tag-entry
+                input.g-sivacor-tag-input(
+                  type="text", placeholder=row.tags.length ? 'Add tag' : 'Add tags, e.g. 4.6.1, 4.6.0',
+                  aria-label=`Add a tag to ${row.image || 'new image'}`, spellcheck="false")
+          td.g-sivacor-col-actions
+            button.g-sivacor-remove-image.btn.btn-link.btn-sm(
+              type="button", title="Remove this image", aria-label=`Remove ${row.image || 'this image'}`)
+              i.icon-trash
+  p.help-block
+    | The first tag of each image is the one the submission form pre-selects.
+    |  Click another tag to put it first. New tags are added at the front.
+  p.g-sivacor-filter-empty(style="display: none") No image or tag matches the filter.
+  if !rows.length
+    p.g-sivacor-image-empty
+      | No images yet. Add one, or switch to JSON to paste a whole list.
+
+  .g-sivacor-image-footer
+    span.g-sivacor-image-count
+    button.g-sivacor-toggle-json.btn.btn-sm.btn-link(type="button") Edit as JSON

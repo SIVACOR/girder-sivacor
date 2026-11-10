@@ -1,0 +1,134 @@
+// The image allow-list editor on the plugin config page. Bootstrap 3 supplies
+// the buttons, inputs and table; only the tag chips are this page's own. The
+// filled chip is the tag the submission form pre-selects, which is the one fact
+// about a row that is otherwise invisible.
+
+$primary = #337ab7
+$border = #ccc
+$muted = #777
+
+.g-sivacor-image-toolbar
+  display flex
+  gap 8px
+  margin-bottom 8px
+
+  .g-sivacor-image-filter
+    max-width 22em
+
+.g-sivacor-image-table
+  margin-bottom 4px
+
+  > tbody > tr > td
+    vertical-align top
+    padding-top 6px
+    padding-bottom 6px
+
+  .g-sivacor-col-image
+    width 30%
+    min-width 12em
+
+  .g-sivacor-col-actions
+    width 1%
+    white-space nowrap
+
+.g-sivacor-tags
+  display flex
+  flex-wrap wrap
+  gap 4px
+  list-style none
+  margin 0
+  padding 2px 0
+
+.g-sivacor-tag
+  display inline-flex
+  align-items stretch
+  border 1px solid $border
+  border-radius 3px
+  background #fff
+  font-size 12px
+  line-height 20px
+
+  button
+    border 0
+    background transparent
+    padding 0 6px
+
+  .g-sivacor-tag-default
+    color #333
+    font-variant-numeric tabular-nums
+
+    &:hover:not([disabled])
+      color $primary
+      text-decoration underline
+
+    &[disabled]
+      cursor default
+      opacity 1
+
+  .g-sivacor-tag-remove
+    color $muted
+    padding 0 6px 0 2px
+
+    &:hover
+      color #a94442
+
+  button:focus-visible
+    outline 2px solid $primary
+    outline-offset -2px
+
+  &.g-sivacor-tag-first
+    border-color $primary
+    background $primary
+
+    .g-sivacor-tag-default,
+    .g-sivacor-tag-remove
+      color #fff
+
+  &.g-sivacor-tag-flash
+    animation g-sivacor-flash 1.2s ease-out
+
+@keyframes g-sivacor-flash
+  from
+    box-shadow 0 0 0 3px #f0ad4e
+
+@media (prefers-reduced-motion: reduce)
+  .g-sivacor-tag.g-sivacor-tag-flash
+    animation none
+    box-shadow 0 0 0 2px #f0ad4e
+
+.g-sivacor-tag-entry
+  flex 1 0 8em
+
+.g-sivacor-tag-input
+  width 100%
+  border 0
+  border-bottom 1px dashed $border
+  font-size 12px
+  line-height 20px
+  padding 0 2px
+  background transparent
+
+  &:focus
+    outline none
+    border-bottom 1px solid $primary
+
+.g-sivacor-image-footer
+  display flex
+  align-items center
+  justify-content space-between
+  margin-bottom 10px
+
+  .help-block
+    margin 0
+
+.g-sivacor-image-count
+  color $muted
+
+.g-sivacor-filter-empty,
+.g-sivacor-image-empty
+  color $muted
+  font-style italic
+
+.g-sivacor-image-json
+  font-family monospace
+  font-size 12px

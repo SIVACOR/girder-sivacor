@@ -23,6 +23,7 @@ from tro_utils.models.trs import is_conforming_capability_id, is_conforming_trs_
 
 from .auth.orcid import ORCID
 from .chain import chain_query
+from .image_tags import check_image_tags, check_url
 from .notifications import (
     _createMessage,
     _sendmail,
@@ -141,10 +142,14 @@ def _validate_tro_profile(doc):
 
 @setting_utilities.validator(PluginSettings.IMAGE_TAGS)
 def _validate_image_tags(doc):
-    value = doc.get("value")
-    if not isinstance(value, dict):
-        raise ValidationException("Image tags must be a dictionary.")
-    return value
+    check_image_tags(doc.get("value"))
+
+
+@setting_utilities.validator(PluginSettings.IMAGE_TAGS_URL)
+def _validate_image_tags_url(doc):
+    # Assigned back, not returned: Setting.validate ignores a validator's
+    # return value, so returning the stripped URL would store "   " as set.
+    doc["value"] = check_url(doc.get("value"))
 
 
 @setting_utilities.validator(PluginSettings.WORKER_SIZES)

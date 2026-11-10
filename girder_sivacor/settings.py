@@ -7,6 +7,18 @@ class PluginSettings:
     SUBMISSION_COLLECTION_NAME = "sivacor.submission_collection_name"
     EDITORS_GROUP_NAME = "sivacor.editors_group_name"
     IMAGE_TAGS = "sivacor.image_tags"
+    #: Where ``GET /sivacor/image_tags`` refreshes the allow-list from, every 4
+    #: hours (issue #151): a YAML mapping of image name to allowed tags, such as
+    #: ``allowed_repos.yaml`` in SIVACOR/sivacor-repo-choice. Point it at a
+    #: pinned commit rather than a branch to keep a merge there from reaching
+    #: the deployment without a deploy.
+    #:
+    #: **Unset by default**, and unset means "never fetch": :attr:`IMAGE_TAGS`
+    #: is the list, as is. A deployment's allow-list is then whatever its
+    #: operator configured, not whatever someone else's repository says.
+    #: Otherwise :attr:`IMAGE_TAGS` is only the fallback for a failed fetch.
+    #: Both are editable on the plugin's config page.
+    IMAGE_TAGS_URL = "sivacor.image_tags_url"
     TRO_GPG_FINGERPRINT = "sivacor.tro_gpg_fingerprint"
     TRO_GPG_PASSPHRASE = "sivacor.tro_gpg_passphrase"
     TRO_PROFILE = "sivacor.tro_profile"
@@ -231,6 +243,7 @@ SettingDefault.defaults.update(
                 "su_per_hour": 16,
             },
         ],
+        PluginSettings.IMAGE_TAGS_URL: "",
         PluginSettings.IMAGE_TAGS: {
             "sscng/stata15": ["latest", "2023-01-27"],
             "sscng/stata16": ["latest", "2023-06-13", "2022-10-14"],

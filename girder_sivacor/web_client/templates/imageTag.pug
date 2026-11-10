@@ -1,0 +1,7 @@
+//- One tag chip. Its own template so the editor can add a chip without
+//- re-rendering the row around it -- see ImageListWidget._syncChips.
+li.g-sivacor-tag(data-tag=tag, class=first ? 'g-sivacor-tag-first' : '')
+  button.g-sivacor-tag-default(
+    type="button", disabled=first,
+    title=first ? 'Pre-selected on the submission form' : 'Make this the pre-selected tag')= tag
+  button.g-sivacor-tag-remove(type="button", aria-label=`Remove ${tag}`, title=`Remove ${tag}`) ×

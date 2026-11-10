@@ -1,0 +1,38 @@
+.g-config-breadcrumb-container
+h3 Analysis images
+p.g-sivacor-config-lede
+  | The Docker images and tags a submission may use. Everything outside this
+  |  allow-list is refused by #[code submit_job], and the submission form offers
+  |  only what is on it.
+
+p.g-sivacor-effective
+  span.g-sivacor-effective-summary Loading the current allow-list…
+  |&nbsp;
+  button.g-sivacor-copy-effective.btn.btn-xs.btn-default(disabled)
+    | Copy into the list below
+
+.g-sivacor-fetch-error.alert.alert-warning(style="display: none")
+  strong The allow-list URL could not be used,
+  |  so submissions are validated against the list below. It is retried every
+  |  few minutes.
+  .g-sivacor-fetch-error-detail
+
+form#g-sivacor-image-tags-form(role="form")
+  .form-group
+    label.control-label(for="g-sivacor-image-tags-url") Allow-list URL
+    input#g-sivacor-image-tags-url.input-sm.form-control(
+      type="text", placeholder="Empty: use the list below")
+    p.help-block
+      | Optional. A YAML file mapping each image name to its allowed tags, such
+      |  as #[code allowed_repos.yaml] in SIVACOR/sivacor-repo-choice. It is
+      |  re-fetched every 4 hours, so a URL that names a branch lets a merge
+      |  there change this deployment without a deploy; name a commit to avoid
+      |  that. Leave it empty to curate the list here.
+  .form-group
+    label.control-label Image list
+    p.help-block.g-sivacor-image-list-role
+      | The allow-list itself when the URL is empty; otherwise only the fallback
+      |  for a fetch that fails.
+    .g-sivacor-image-list
+  p#g-sivacor-image-tags-error-message.g-validation-failed-message
+  input.btn.btn-sm.btn-primary(type="submit", value="Save")
