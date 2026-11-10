@@ -15,6 +15,57 @@ from girder_plugin_worker.constants import PluginSettings as WorkerSettings
 from girder_sivacor.settings import PluginSettings
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "starts_first: run before everything else; for the few tests that alone "
+        "take longer than a worker's whole share of the suite",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    """Move ``starts_first`` tests to the front, otherwise keeping the order.
+
+    Under ``-n 16`` every other worker was done by ~80s while one sat until
+    ~110s, because the 74s Julia test had been handed out ~33s in. Starting it
+    at t=0 hides it behind the rest of the suite instead.
+
+    Keep the marker rare. xdist's load scheduler deals out the *front* of the
+    collection as one consecutive chunk per worker -- two tests each, because
+    tox.ini passes ``--maxschedchunk 2``; without it, len/workers/4 -- so marked
+    tests pair up on the first workers and run back to back there. One or two
+    is a head start; a dozen is a new tail.
+    """
+    items.sort(key=lambda item: item.get_closest_marker("starts_first") is None)
+
+
+@pytest.fixture(autouse=True)
+def _forget_dead_model_singletons():
+    """Stop pytest-girder's ``db`` fixture from making the suite quadratic.
+
+    Girder appends every model singleton it creates to
+    ``model_base._modelSingletons`` and never removes one. pytest-girder's
+    ``db`` teardown resets each model's ``_instance`` to None (which Girder's
+    own comment in ``_ModelSingleton`` warns against) but leaves the list
+    alone, so every test adds ~10 dead instances, and the next ``db`` setup
+    calls ``reconnect()`` -- i.e. rebuilds every index -- on all of them. The
+    cost of a test grew with how many had run before it in the same worker:
+    81 tests of test_usage.py made 25,428 ``reconnect()`` and 81,885
+    ``create_index`` calls. Measured 2026-11-10, full suite at CI's -n 4:
+    437s before, 204s after.
+
+    Autouse, so it runs before ``db`` sets up. Only instances that are still
+    their class's live singleton are kept; a dead one is only reachable through
+    an old reference, and nothing in the suite uses one -- if something did,
+    it would now fail against a closed client rather than quietly reconnect.
+    """
+    from girder.models import model_base
+
+    model_base._modelSingletons[:] = [
+        m for m in model_base._modelSingletons if type(m)._instance is m
+    ]
+
+
 @pytest.fixture
 def server(boundServer, admin, monkeypatch):
     """A listening server, overriding pytest-girder's in-process ``server``.
