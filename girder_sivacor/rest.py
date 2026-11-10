@@ -1,12 +1,9 @@
 import datetime
-import json
 import logging
 import math
 import os
 from zoneinfo import ZoneInfo
 
-import requests
-import yaml
 from bson.errors import InvalidId
 from girder.api import access
 from girder.api.describe import Description, autoDescribeRoute
@@ -27,7 +24,7 @@ from girder_jobs.constants import REST_CREATE_JOB_TOKEN_SCOPE, JobStatus
 from girder_jobs.models.job import Job
 from girder_plugin_worker.utils import getWorkerApiUrl
 
-from . import alerts, chain, usage
+from . import alerts, chain, image_tags, usage
 from .errors import FailureCode
 from .models.execution_record import ExecutionRecord
 from .settings import PluginSettings, support_email
@@ -821,9 +818,6 @@ stage_schema = {
     "required": ["stages"],
 }
 
-#: Cache of the allow-list fetched from ``sivacor.image_tags_url``.
-IMAGE_TAGS_CACHE = "/tmp/sivacor_image_tags.json"
-
 # Statuses in which a submission is still in flight. A user is allowed at most
 # one submission in one of these states at a time.
 ACTIVE_JOB_STATUSES = (JobStatus.INACTIVE, JobStatus.QUEUED, JobStatus.RUNNING)
@@ -851,6 +845,8 @@ class SIVACOR(Resource):
             "GET", ("execution_record", "summary"), self.summarise_execution_records
         )
         self.route("GET", ("image_tags",), self.get_image_tags)
+        self.route("GET", ("image_tags", "status"), self.get_image_tags_status)
+        self.route("PUT", ("image_tags", "config"), self.set_image_tags_config)
         self.route("GET", ("worker_sizes",), self.get_worker_sizes)
         self.route("GET", ("volume_quota",), self.get_volume_quota)
         self.route("GET", ("volume_usage",), self.get_volume_usage)
@@ -2230,41 +2226,39 @@ class SIVACOR(Resource):
 
     @staticmethod
     def _get_tags():
-        source_url = Setting().get(PluginSettings.IMAGE_TAGS_URL)
-        if not source_url:
-            # A deployment that curates its own list: no fetch, and no cache,
-            # so an edit to the setting takes effect on the next request.
-            return Setting().get(PluginSettings.IMAGE_TAGS)
+        return image_tags.get_tags()
 
-        cutoff = datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=4)
-        cached = None
-        try:
-            if os.path.getmtime(IMAGE_TAGS_CACHE) >= cutoff.timestamp():
-                with open(IMAGE_TAGS_CACHE) as f:
-                    cached = json.load(f)
-        except (OSError, ValueError):
-            pass
-        # The cache records the URL it came from, so changing the setting takes
-        # effect now rather than up to four hours later. A cache written before
-        # it recorded one is a bare tag dict, and is refetched for the same
-        # reason.
-        if isinstance(cached, dict) and cached.get("source_url") == source_url:
-            return cached["tags"]
+    @access.admin
+    @autoDescribeRoute(
+        Description("Where the image allow-list currently comes from.").notes(
+            "'source' is 'setting' (no URL configured), 'url' (fetched from "
+            "sivacor.image_tags_url) or 'fallback' (that fetch failed, and "
+            "sivacor.image_tags is being served; 'error' says why)."
+        )
+    )
+    def get_image_tags_status(self):
+        return image_tags.status()
 
-        tags = Setting().get(PluginSettings.IMAGE_TAGS)
-        try:
-            response = requests.get(source_url, timeout=10)
-            response.raise_for_status()
-            tags = yaml.safe_load(response.text)
-        except Exception as e:
-            print(f"Error fetching image tags from {source_url}: {e}")
-        # Atomically: every gunicorn worker shares this file, and a reader must
-        # never see a half-written one.
-        tmp = f"{IMAGE_TAGS_CACHE}.{os.getpid()}"
-        with open(tmp, "w") as f:
-            json.dump({"source_url": source_url, "tags": tags}, f)
-        os.replace(tmp, IMAGE_TAGS_CACHE)
-        return tags
+    @access.admin
+    @autoDescribeRoute(
+        Description(
+            "Set sivacor.image_tags_url and sivacor.image_tags together."
+        )
+        .notes(
+            "Both are validated before either is saved, unlike PUT "
+            "/system/setting with a list, which saves its entries one at a "
+            "time. Returns the resulting status."
+        )
+        .jsonParam(
+            "config",
+            "{\"url\": <string, empty to never fetch>, \"tags\": {image: [tag]}}",
+            paramType="body",
+            requireObject=True,
+        )
+    )
+    def set_image_tags_config(self, config):
+        image_tags.set_config(config.get("url", ""), config.get("tags"))
+        return image_tags.status()
 
     # DATA_READ rather than the bare @access.user every other handler here uses,
     # and that is deliberate: sivacor-girderfs authenticates with a DATA_READ

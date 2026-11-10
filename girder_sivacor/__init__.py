@@ -23,6 +23,7 @@ from tro_utils.models.trs import is_conforming_capability_id, is_conforming_trs_
 
 from .auth.orcid import ORCID
 from .chain import chain_query
+from .image_tags import check_image_tags, check_url
 from .notifications import (
     _createMessage,
     _sendmail,
@@ -141,35 +142,14 @@ def _validate_tro_profile(doc):
 
 @setting_utilities.validator(PluginSettings.IMAGE_TAGS)
 def _validate_image_tags(doc):
-    value = doc.get("value")
-    if not isinstance(value, dict):
-        raise ValidationException("Image tags must be a dictionary.")
-    # Every consumer does `tag in tags[image]`, which a bare string satisfies
-    # by substring -- "4.6" would allow-list a typo'd "4.6.1" as "4.6".
-    for image, tags in value.items():
-        if not isinstance(image, str) or not image.strip():
-            raise ValidationException("Image names must be non-empty strings.")
-        if not isinstance(tags, list) or not all(
-            isinstance(tag, str) and tag.strip() for tag in tags
-        ):
-            raise ValidationException(
-                f"Tags for {image} must be a list of non-empty strings."
-            )
-    return value
+    check_image_tags(doc.get("value"))
 
 
 @setting_utilities.validator(PluginSettings.IMAGE_TAGS_URL)
 def _validate_image_tags_url(doc):
-    value = doc.get("value")
-    if not isinstance(value, str):
-        raise ValidationException("Image tags URL must be a string.")
-    value = value.strip()
-    # Empty is allowed and means "use sivacor.image_tags as is".
-    if value and not value.startswith(("https://", "http://")):
-        raise ValidationException(
-            "Image tags URL must be an http(s) URL, or empty to never fetch."
-        )
-    return value
+    # Assigned back, not returned: Setting.validate ignores a validator's
+    # return value, so returning the stripped URL would store "   " as set.
+    doc["value"] = check_url(doc.get("value"))
 
 
 @setting_utilities.validator(PluginSettings.WORKER_SIZES)

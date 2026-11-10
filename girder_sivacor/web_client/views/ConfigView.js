@@ -29,10 +29,7 @@ const ConfigView = View.extend({
                 this._showError(tags.error);
                 return;
             }
-            this._saveSettings([
-                { key: IMAGE_TAGS_URL, value: this.$('#g-sivacor-image-tags-url').val().trim() },
-                { key: IMAGE_TAGS, value: tags.value }
-            ]);
+            this._save(this.$('#g-sivacor-image-tags-url').val(), tags.value);
         },
 
         'click .g-sivacor-copy-effective'(event) {
@@ -55,7 +52,7 @@ const ConfigView = View.extend({
         }).done((resp) => {
             this.$('#g-sivacor-image-tags-url').val(resp[IMAGE_TAGS_URL] || '');
             this.imageList.setValue(resp[IMAGE_TAGS] || {});
-            this._fetchEffective(resp[IMAGE_TAGS_URL]);
+            this._fetchStatus();
         });
     },
 
@@ -75,42 +72,62 @@ const ConfigView = View.extend({
     },
 
     /**
-     * What submit_job validates against right now, so the effect of a save is
-     * visible -- and so a list fetched from a URL can be kept as the
-     * deployment's own before the URL is cleared.
+     * What submit_job validates against right now and where it came from, so
+     * the effect of a save is visible -- and so a list fetched from a URL can
+     * be kept as the deployment's own before the URL is cleared.
      */
-    _fetchEffective(url) {
-        restRequest({ method: 'GET', url: 'sivacor/image_tags' }).done((tags) => {
-            this.effective = tags || {};
-            const images = Object.keys(this.effective).length;
-            const total = Object.values(this.effective)
-                .reduce((sum, list) => sum + (list ? list.length : 0), 0);
-            this.$('.g-sivacor-effective-summary').text(
-                `Submissions are validated against ${images} image(s), ${total} tag(s), ` +
-                (url ? `fetched from ${url} (or the list below, if that fetch failed).`
-                    : 'taken from the list below.')
-            );
-            this.$('.g-sivacor-copy-effective').prop('disabled', false);
-        });
+    _fetchStatus() {
+        restRequest({ method: 'GET', url: 'sivacor/image_tags/status' })
+            .done((state) => this._showStatus(state));
     },
 
-    _saveSettings(settings) {
+    _showStatus(state) {
+        this.effective = state.tags || {};
+        const images = Object.keys(this.effective).length;
+        const total = Object.values(this.effective)
+            .reduce((sum, list) => sum + (list ? list.length : 0), 0);
+        const counts = `${images} ${images === 1 ? 'image' : 'images'}, ` +
+            `${total} ${total === 1 ? 'tag' : 'tags'}`;
+        const where = {
+            setting: 'taken from the list below.',
+            url: `fetched from ${state.url}.`,
+            fallback: 'taken from the list below, because the allow-list URL could not be used.'
+        }[state.source];
+        this.$('.g-sivacor-effective-summary').text(
+            `Submissions are validated against ${counts}, ${where}`);
+        this.$('.g-sivacor-copy-effective').prop('disabled', false);
+
+        const warning = this.$('.g-sivacor-fetch-error');
+        if (state.source === 'fallback') {
+            warning.find('.g-sivacor-fetch-error-detail').text(state.error || '');
+            warning.show();
+        } else {
+            warning.hide();
+        }
+    },
+
+    /** Both settings, or neither: see image_tags.set_config on the server. */
+    _save(url, tags) {
         restRequest({
             method: 'PUT',
-            url: 'system/setting',
-            data: { list: JSON.stringify(settings) },
+            url: 'sivacor/image_tags/config',
+            contentType: 'application/json',
+            data: JSON.stringify({ url, tags }),
             error: null
-        }).done(() => {
+        }).done((state) => {
             events.trigger('g:alert', {
                 icon: 'ok',
                 text: 'Settings saved.',
                 type: 'success',
                 timeout: 4000
             });
-            this._fetchEffective(settings[0].value);
+            // The server stores the URL trimmed; show what it stored.
+            this.$('#g-sivacor-image-tags-url').val(state.url || '');
+            this._showStatus(state);
         }).fail((resp) => {
             this._showError(
-                (resp.responseJSON && resp.responseJSON.message) || 'Could not save the settings.'
+                (resp.responseJSON && resp.responseJSON.message) ||
+                'The settings were not saved. Neither has changed.'
             );
         });
     },

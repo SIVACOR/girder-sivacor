@@ -11,6 +11,12 @@ p.g-sivacor-effective
   button.g-sivacor-copy-effective.btn.btn-xs.btn-default(disabled)
     | Copy into the list below
 
+.g-sivacor-fetch-error.alert.alert-warning(style="display: none")
+  strong The allow-list URL could not be used,
+  |  so submissions are validated against the list below. It is retried every
+  |  few minutes.
+  .g-sivacor-fetch-error-detail
+
 form#g-sivacor-image-tags-form(role="form")
   .form-group
     label.control-label(for="g-sivacor-image-tags-url") Allow-list URL
