@@ -1,6 +1,8 @@
 import ConfigViewTemplate from '../templates/configView.pug';
 import '../stylesheets/configView.styl';
 
+import ImageListWidget from './ImageListWidget';
+
 const PluginConfigBreadcrumbWidget = girder.views.widgets.PluginConfigBreadcrumbWidget;
 const View = girder.views.View;
 const { restRequest } = girder.rest;
@@ -22,29 +24,29 @@ const ConfigView = View.extend({
             event.preventDefault();
             this._clearError();
 
-            let tags;
-            try {
-                tags = JSON.parse(this.$('#g-sivacor-image-tags').val());
-            } catch (err) {
-                this._showError(`The image list is not valid JSON: ${err.message}`);
+            const tags = this.imageList.getValue();
+            if (tags.error) {
+                this._showError(tags.error);
                 return;
             }
             this._saveSettings([
                 { key: IMAGE_TAGS_URL, value: this.$('#g-sivacor-image-tags-url').val().trim() },
-                { key: IMAGE_TAGS, value: tags }
+                { key: IMAGE_TAGS, value: tags.value }
             ]);
         },
 
         'click .g-sivacor-copy-effective'(event) {
             event.preventDefault();
             if (this.effective) {
-                this.$('#g-sivacor-image-tags').val(JSON.stringify(this.effective, null, 2));
+                this.imageList.setValue(this.effective);
             }
         }
     },
 
     initialize() {
         this.effective = null;
+        this.imageList = new ImageListWidget({ parentView: this });
+        this.imageList.on('g:error', (message) => this._showError(message));
         this.render();
         restRequest({
             method: 'GET',
@@ -52,13 +54,14 @@ const ConfigView = View.extend({
             data: { list: JSON.stringify([IMAGE_TAGS_URL, IMAGE_TAGS]) }
         }).done((resp) => {
             this.$('#g-sivacor-image-tags-url').val(resp[IMAGE_TAGS_URL] || '');
-            this.$('#g-sivacor-image-tags').val(JSON.stringify(resp[IMAGE_TAGS] || {}, null, 2));
+            this.imageList.setValue(resp[IMAGE_TAGS] || {});
             this._fetchEffective(resp[IMAGE_TAGS_URL]);
         });
     },
 
     render() {
         this.$el.html(ConfigViewTemplate());
+        this.imageList.setElement(this.$('.g-sivacor-image-list')).render();
 
         if (!this.breadcrumb) {
             this.breadcrumb = new PluginConfigBreadcrumbWidget({

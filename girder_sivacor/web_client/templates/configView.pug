@@ -23,14 +23,10 @@ form#g-sivacor-image-tags-form(role="form")
       |  there change this deployment without a deploy; name a commit to avoid
       |  that. Leave it empty to curate the list here.
   .form-group
-    label.control-label(for="g-sivacor-image-tags") Image list
-    textarea#g-sivacor-image-tags.form-control(rows="16", spellcheck="false")
-    p.help-block
-      //- Not #[code ...]: that form ends at the example's first "]".
-      | JSON, for example
-      = ' '
-      code {"rocker/r-ver": ["4.6.1", "4.6.0"]}
-      | . The allow-list itself when the URL is empty; otherwise only the
-      |  fallback for a fetch that fails.
+    label.control-label Image list
+    p.help-block.g-sivacor-image-list-role
+      | The allow-list itself when the URL is empty; otherwise only the fallback
+      |  for a fetch that fails.
+    .g-sivacor-image-list
   p#g-sivacor-image-tags-error-message.g-validation-failed-message
   input.btn.btn-sm.btn-primary(type="submit", value="Save")
