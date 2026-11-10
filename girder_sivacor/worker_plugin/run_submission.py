@@ -1232,8 +1232,9 @@ def execute_workflow(task, api, submission, stage, env_vars):
     # Every capability these need is required of sivacor.tro_profile by its
     # validator, so a claim added here must be added to the lists it reads.
     attrs = [attr.value for attr in ALWAYS_CLAIMED]
-    if stage.get("network_isolation", False):
-        attrs += [attr.value for attr in CLAIMED_ON_REQUEST]
+    attrs += [
+        attr.value for field, attr in CLAIMED_ON_REQUEST.items() if stage.get(field, False)
+    ]
     submission["runs"].append(
         {
             "run_start_time": start_time.isoformat(),

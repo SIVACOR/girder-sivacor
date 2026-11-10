@@ -4,6 +4,7 @@ import '../stylesheets/configView.styl';
 import ImageListWidget from './ImageListWidget';
 
 const PluginConfigBreadcrumbWidget = girder.views.widgets.PluginConfigBreadcrumbWidget;
+const $ = girder.$;
 const View = girder.views.View;
 const { restRequest } = girder.rest;
 const events = girder.events;
@@ -152,16 +153,16 @@ const ConfigView = View.extend({
         this.$('#g-sivacor-trs-profile').val(JSON.stringify(status.profile || {}, null, 2));
         const required = status.required_capabilities;
         this.$('.g-sivacor-trs-required').text(
-            `SIVACOR's runs claim attributes backed by ${required.join(', ')}, ` +
-            'so the profile must declare each of them in trov:hasCapability.');
-        const warning = this.$('.g-sivacor-trs-builtin');
-        if (status.builtin) {
-            warning.find('.g-sivacor-trs-builtin-detail').text(
-                status.warning || 'That is right only on sivacor.org itself.');
-            warning.show();
-        } else {
-            warning.hide();
+            `Every run claims attributes backed by ${required.join(', ')}, ` +
+            'so the profile must declare each of them in trov:hasCapability. ' +
+            'Without trov:CanProvideInternetIsolation, submissions asking for ' +
+            'network isolation are refused.');
+        const warnings = this.$('.g-sivacor-trs-warnings');
+        const list = warnings.find('.g-sivacor-trs-warnings-list').empty();
+        for (const message of status.warnings) {
+            list.append($('<li>').text(message));
         }
+        warnings.toggle(status.warnings.length > 0);
     },
 
     _saveProfile(profile) {

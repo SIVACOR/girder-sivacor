@@ -3,22 +3,25 @@ from tro_utils import TROVCapability as Caps
 from tro_utils import TRPAttribute
 
 #: The performance attributes ``execute_workflow`` claims for every stage it
-#: runs, and the one it claims when the stage asks for network isolation.
+#: runs, and those it claims when the stage field naming them is true.
 #: tro-utils refuses to record a performance attribute whose capability the TRS
-#: profile does not declare, so these decide :data:`REQUIRED_CAPABILITIES`.
+#: profile does not declare.
 ALWAYS_CLAIMED = (
     TRPAttribute.ENV_ISOLATION,
     TRPAttribute.NON_INTERACTIVE,
     TRPAttribute.MACHINE_ENFORCEMENT,
 )
-CLAIMED_ON_REQUEST = (TRPAttribute.NET_ISOLATION,)
+CLAIMED_ON_REQUEST = {"network_isolation": TRPAttribute.NET_ISOLATION}
 
 #: Capabilities a ``sivacor.tro_profile`` must declare. A profile without one
 #: of them saves fine and then fails every submission at its first performance
 #: step -- after the analysis has run -- so the validator refuses it instead.
-REQUIRED_CAPABILITIES = tuple(
-    Caps.translate(attr) for attr in ALWAYS_CLAIMED + CLAIMED_ON_REQUEST
-)
+#:
+#: Only what every run claims. Requiring the on-request ones too would force a
+#: deployment that cannot isolate the network to declare that it can, in every
+#: TRO it signs; ``submit_job`` refuses a stage asking for an undeclared one
+#: instead.
+REQUIRED_CAPABILITIES = tuple(Caps.translate(attr) for attr in ALWAYS_CLAIMED)
 
 
 class PluginSettings:

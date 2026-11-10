@@ -940,6 +940,21 @@ class SIVACOR(Resource):
             if image_name not in tags or tag not in tags.get(image_name, []):
                 raise ValidationException(f"Invalid image: {image_reference}")
 
+        # A claim the TRS profile does not back fails the submission when its
+        # run is recorded, after the analysis has run -- so it is refused here.
+        # The profile is not made to declare it instead: that would have a
+        # deployment that cannot enforce it say that it can, in every TRO.
+        undeclared = tro_profile.undeclared_requests(
+            Setting().get(PluginSettings.TRO_PROFILE) or {}
+        )
+        for stage in stages:
+            for field, capability in undeclared.items():
+                if stage.get(field, False):
+                    raise ValidationException(
+                        f"This deployment cannot provide {field.replace('_', ' ')}: "
+                        f"its TRS profile does not declare {capability}."
+                    )
+
         # Resolved server-side, before anything is created: an unknown size must
         # never reach the controller, where the flavour it names does not exist,
         # create_instance raises, and three of those trip the circuit breaker
@@ -2265,10 +2280,10 @@ class SIVACOR(Resource):
     @access.admin
     @autoDescribeRoute(
         Description("The TRS profile every signed TRO declares.").notes(
-            "'builtin' is true while the deployment is still on SIVACOR's own "
-            "profile, and 'warning' says why that matters here when it does. "
-            "'required_capabilities' are those SIVACOR's runs claim, which the "
-            "profile must declare."
+            "'warnings' lists what is wrong with the stored profile: that it "
+            "names SIVACOR on a deployment that is not sivacor.org, or that it "
+            "lacks a capability every run claims. 'required_capabilities' are "
+            "those claims' capabilities, which the profile must declare."
         )
     )
     def get_tro_profile(self):
