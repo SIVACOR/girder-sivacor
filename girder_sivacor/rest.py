@@ -821,6 +821,9 @@ stage_schema = {
     "required": ["stages"],
 }
 
+#: Cache of the allow-list fetched from ``sivacor.image_tags_url``.
+IMAGE_TAGS_CACHE = "/tmp/sivacor_image_tags.json"
+
 # Statuses in which a submission is still in flight. A user is allowed at most
 # one submission in one of these states at a time.
 ACTIVE_JOB_STATUSES = (JobStatus.INACTIVE, JobStatus.QUEUED, JobStatus.RUNNING)
@@ -2227,31 +2230,40 @@ class SIVACOR(Resource):
 
     @staticmethod
     def _get_tags():
-        now = datetime.datetime.now(datetime.UTC)
-        cutoff = now - datetime.timedelta(hours=4)
+        source_url = Setting().get(PluginSettings.IMAGE_TAGS_URL)
+        if not source_url:
+            # A deployment that curates its own list: no fetch, and no cache,
+            # so an edit to the setting takes effect on the next request.
+            return Setting().get(PluginSettings.IMAGE_TAGS)
 
-        fetch = not os.path.exists("/tmp/sivacor_image_tags.json") or (
-            os.path.getmtime("/tmp/sivacor_image_tags.json") < cutoff.timestamp()
-        )
+        cutoff = datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=4)
+        cached = None
+        try:
+            if os.path.getmtime(IMAGE_TAGS_CACHE) >= cutoff.timestamp():
+                with open(IMAGE_TAGS_CACHE) as f:
+                    cached = json.load(f)
+        except (OSError, ValueError):
+            pass
+        # The cache records the URL it came from, so changing the setting takes
+        # effect now rather than up to four hours later. A cache written before
+        # it recorded one is a bare tag dict, and is refetched for the same
+        # reason.
+        if isinstance(cached, dict) and cached.get("source_url") == source_url:
+            return cached["tags"]
 
-        if fetch:
-            source_url = (
-                "https://raw.githubusercontent.com/SIVACOR/sivacor-repo-choice"
-                "/refs/heads/main/allowed_repos.yaml"
-            )
-            tags = Setting().get(PluginSettings.IMAGE_TAGS)
-            try:
-                response = requests.get(source_url, timeout=10)
-                response.raise_for_status()
-                tags = yaml.safe_load(response.text)
-            except Exception as e:
-                print(f"Error fetching image tags: {e}")
-            with open("/tmp/sivacor_image_tags.json", "w") as f:
-                json.dump(tags, f)
-
-        with open("/tmp/sivacor_image_tags.json", "r") as f:
-            return json.load(f)
-
+        tags = Setting().get(PluginSettings.IMAGE_TAGS)
+        try:
+            response = requests.get(source_url, timeout=10)
+            response.raise_for_status()
+            tags = yaml.safe_load(response.text)
+        except Exception as e:
+            print(f"Error fetching image tags from {source_url}: {e}")
+        # Atomically: every gunicorn worker shares this file, and a reader must
+        # never see a half-written one.
+        tmp = f"{IMAGE_TAGS_CACHE}.{os.getpid()}"
+        with open(tmp, "w") as f:
+            json.dump({"source_url": source_url, "tags": tags}, f)
+        os.replace(tmp, IMAGE_TAGS_CACHE)
         return tags
 
     # DATA_READ rather than the bare @access.user every other handler here uses,

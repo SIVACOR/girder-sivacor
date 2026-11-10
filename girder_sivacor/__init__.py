@@ -147,6 +147,20 @@ def _validate_image_tags(doc):
     return value
 
 
+@setting_utilities.validator(PluginSettings.IMAGE_TAGS_URL)
+def _validate_image_tags_url(doc):
+    value = doc.get("value")
+    if not isinstance(value, str):
+        raise ValidationException("Image tags URL must be a string.")
+    value = value.strip()
+    # Empty is allowed and means "use sivacor.image_tags as is".
+    if value and not value.startswith(("https://", "http://")):
+        raise ValidationException(
+            "Image tags URL must be an http(s) URL, or empty to never fetch."
+        )
+    return value
+
+
 @setting_utilities.validator(PluginSettings.WORKER_SIZES)
 def _validate_worker_sizes(doc):
     """Check the worker-size catalogue at write time.
