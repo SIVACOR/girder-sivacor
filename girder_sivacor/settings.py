@@ -181,7 +181,9 @@ class PluginSettings:
     #: ``27007@license.example.org``. A setting rather than a worker env var
     #: for the same reason as :attr:`STATA_LICENSE`: fleet workers boot from
     #: one cloud-init template shared by every deployment on the host, and a
-    #: setting reaches them with no template change (issue #154).
+    #: setting reaches them with no template change (issue #154). It cannot
+    #: be blank: a deployment without MATLAB simply leaves the default. The
+    #: value is masked in the run arguments the signed TRO records.
     MLM_LICENSE_FILE = "sivacor.mlm_license_file"
 
     #: HMAC key for the pseudonyms a redacted chain job carries.

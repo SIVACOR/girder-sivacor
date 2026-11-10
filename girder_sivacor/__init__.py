@@ -87,7 +87,6 @@ def _validate_reaper_thresholds(doc):
         PluginSettings.TRO_GPG_FINGERPRINT,
         PluginSettings.TRO_GPG_PASSPHRASE,
         PluginSettings.STATA_LICENSE,
-        PluginSettings.MLM_LICENSE_FILE,
     }
 )
 def _validate_string_settings(doc):
@@ -95,6 +94,20 @@ def _validate_string_settings(doc):
     if not isinstance(value, str) or not value:
         raise ValidationException("This setting must be a non-empty string.")
     return value
+
+
+@setting_utilities.validator(PluginSettings.MLM_LICENSE_FILE)
+def _validate_mlm_license_file(doc):
+    # Stripped and refused when blank here, not only by the worker: a value of
+    # "   " would otherwise save cleanly and then silently run every MATLAB
+    # stage against the default server. There is no "no MATLAB" value (#154).
+    value = doc.get("value")
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationException(
+            "This setting must be a license server (port@host) or file path."
+        )
+    doc["value"] = value.strip()
+    return doc["value"]
 
 
 @setting_utilities.validator(PluginSettings.TRO_PROFILE)
