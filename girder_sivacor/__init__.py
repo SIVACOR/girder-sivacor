@@ -30,7 +30,7 @@ from .notifications import (
     set_submission_status,
 )
 from .rest import SIVACOR, get_submission_child_jobs
-from .settings import PluginSettings
+from .settings import PluginSettings, support_email
 
 logger = logging.getLogger(__name__)
 
@@ -262,6 +262,14 @@ def _validate_volume_total_gb(doc):
     return value
 
 
+@setting_utilities.validator(PluginSettings.SUPPORT_EMAIL)
+def _validate_support_email(doc):
+    value = doc.get("value")
+    if not isinstance(value, str) or not mail_utils.validateEmailAddress(value):
+        raise ValidationException("Support email must be a valid email address.")
+    return value
+
+
 @setting_utilities.validator(PluginSettings.BANNER_MESSAGE)
 def _validate_banner_message(doc):
     value = doc.get("value")
@@ -307,6 +315,7 @@ def send_approval_email(event: events.Event) -> None:
     context = {
         "user": user,
         **email_urls(),
+        "support_email": support_email(),
         "current_year": datetime.datetime.now().year,
     }
     text_content = (
@@ -330,6 +339,7 @@ def send_approved_email(event: events.Event) -> None:
     context = {
         "user": user,
         **email_urls(),
+        "support_email": support_email(),
         "current_year": datetime.datetime.now().year,
     }
     text_content = (
@@ -391,6 +401,7 @@ def add_public_settings(self, event):
         PluginSettings.BANNER_ENABLED,
         PluginSettings.BANNER_MESSAGE,
         PluginSettings.UPLOADS_FOLDER_NAME,
+        PluginSettings.SUPPORT_EMAIL,
     ]
     settings.update({key: Setting().get(key) for key in public_settings})
 

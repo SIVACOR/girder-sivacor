@@ -110,7 +110,7 @@
                                     </td>
                                     <td style="padding: 0 8px; color: #e0e0e0;">|</td>
                                     <td style="padding: 0 8px;">
-                                        <a href="mailto:support@sivacor.org" style="color: #1976d2; text-decoration: none; font-size: 12px;">Support</a>
+                                        <a href="mailto:${support_email}" style="color: #1976d2; text-decoration: none; font-size: 12px;">Support</a>
                                     </td>
                                 </tr>
                             </table>
