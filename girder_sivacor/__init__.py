@@ -1,6 +1,7 @@
 import datetime
 import logging
 from pathlib import Path
+from urllib.parse import urlparse
 
 from bson import ObjectId
 from girder import events
@@ -291,6 +292,18 @@ def _validate_volume_total_gb(doc):
     return value
 
 
+@setting_utilities.validator(PluginSettings.DOCS_URL)
+def _validate_docs_url(doc):
+    """An http(s) URL with a host. Never blank: every email links to it."""
+    value = doc.get("value")
+    value = value.strip() if isinstance(value, str) else ""
+    parsed = urlparse(value)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValidationException("Docs URL must be an http(s) URL with a host.")
+    doc["value"] = value
+    return value
+
+
 @setting_utilities.validator(PluginSettings.SUPPORT_EMAIL)
 def _validate_support_email(doc):
     value = doc.get("value")
@@ -431,6 +444,10 @@ def add_public_settings(self, event):
         PluginSettings.BANNER_MESSAGE,
         PluginSettings.UPLOADS_FOLDER_NAME,
         PluginSettings.SUPPORT_EMAIL,
+        PluginSettings.DOCS_URL,
+        # Read-only here, like every key in this list: the UI uses it to tell
+        # whether a queued submission is waiting for the fleet to assign it.
+        PluginSettings.TARGETED_ASSIGNMENT,
     ]
     settings.update({key: Setting().get(key) for key in public_settings})
 

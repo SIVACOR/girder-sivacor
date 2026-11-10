@@ -415,7 +415,8 @@ def test_duration_calculation_in_email(
         )
 
 
-def test_email_urls_follow_the_deployment_domain(monkeypatch):
+@pytest.mark.plugin("sivacor")
+def test_email_urls_follow_the_deployment_domain(server, monkeypatch):
     """Emails must not point a test deployment's users at production.
 
     All three mail contexts hardcoded submit.sivacor.org, so the test stack sent
@@ -431,7 +432,7 @@ def test_email_urls_follow_the_deployment_domain(monkeypatch):
     assert urls["base_url"] == "https://submit.test.sivacor.org"
     assert urls["feedback_url"] == "https://feedback.test.sivacor.org"
     assert urls["logo_url"].startswith("https://submit.test.sivacor.org/")
-    # One docs site for every deployment; a test stack has none of its own.
+    # Not derived from DOMAIN: one docs site, a test stack has none of its own.
     assert urls["docs_url"] == "https://docs.sivacor.org"
 
     # Unset DOMAIN must reproduce the previous production values exactly.
@@ -440,3 +441,49 @@ def test_email_urls_follow_the_deployment_domain(monkeypatch):
     assert prod["submission_url"] == "https://submit.sivacor.org/"
     assert prod["base_url"] == "https://submit.sivacor.org"
     assert prod["feedback_url"] == "https://feedback.sivacor.org"
+
+
+@pytest.mark.plugin("sivacor")
+def test_docs_url_is_a_setting(server):
+    """A third-party deployment can point its emails at its own docs."""
+    from girder.models.setting import Setting
+
+    from girder_sivacor.notifications import email_urls
+    from girder_sivacor.settings import PluginSettings
+
+    Setting().set(PluginSettings.DOCS_URL, "  https://docs.example.org/  ")
+    assert Setting().get(PluginSettings.DOCS_URL) == "https://docs.example.org/"
+    assert email_urls()["docs_url"] == "https://docs.example.org/"
+
+
+@pytest.mark.plugin("sivacor")
+@pytest.mark.parametrize(
+    "value", ["", "   ", None, 123, "docs.example.org", "ftp://docs.example.org"]
+)
+def test_an_unusable_docs_url_is_refused(server, value):
+    from girder.exceptions import ValidationException
+    from girder.models.setting import Setting
+
+    from girder_sivacor.settings import PluginSettings
+
+    with pytest.raises(ValidationException):
+        Setting().set(PluginSettings.DOCS_URL, value)
+
+
+@pytest.mark.plugin("sivacor")
+def test_docs_url_and_targeted_assignment_are_public(server, admin):
+    from girder.models.setting import Setting
+
+    from girder_sivacor.settings import DEFAULT_DOCS_URL, PluginSettings
+
+    resp = server.request(path="/system/public_settings", method="GET")
+    assertStatusOk(resp)
+    assert resp.json[PluginSettings.DOCS_URL] == DEFAULT_DOCS_URL
+    assert resp.json[PluginSettings.TARGETED_ASSIGNMENT] is False
+
+    Setting().set(PluginSettings.DOCS_URL, "https://docs.example.org")
+    Setting().set(PluginSettings.TARGETED_ASSIGNMENT, True)
+    resp = server.request(path="/system/public_settings", method="GET")
+    assertStatusOk(resp)
+    assert resp.json[PluginSettings.DOCS_URL] == "https://docs.example.org"
+    assert resp.json[PluginSettings.TARGETED_ASSIGNMENT] is True
