@@ -884,6 +884,59 @@ def stata_license_mount_source(api, submission, host_tmp_root: str) -> str:
     return os.path.join(host_tmp_root, container_path.lstrip("/"))
 
 
+def matlab_license_file(api) -> str:
+    """``MLM_LICENSE_FILE`` for a MATLAB stage, from ``sivacor.mlm_license_file``.
+
+    Read at run time with the task's token, like the Stata license, so a fleet
+    worker booted from the shared cloud-init template gets the deployment's
+    value with no template change (issue #154).
+
+    An empty or missing value falls back to the default rather than meaning
+    "this deployment has no MATLAB": a server that predates the setting
+    returns nothing for it, and leaving the variable unset would break every
+    dynare run there instead of keeping the behaviour it always had.
+    """
+    from ..settings import DEFAULT_MLM_LICENSE_FILE, PluginSettings
+
+    settings = api.settings([PluginSettings.MLM_LICENSE_FILE])
+    value = (settings.get(PluginSettings.MLM_LICENSE_FILE) or "").strip()
+    return value or DEFAULT_MLM_LICENSE_FILE
+
+
+def container_environment(api, image_reference, home_dir, user_env) -> dict:
+    """The analysis container's environment.
+
+    Only MATLAB stages get ``MLM_LICENSE_FILE`` (issue #154); it used to be set
+    for every image. ``user_env`` is applied last, so a stage that sets its own
+    ``MLM_LICENSE_FILE`` still wins.
+    """
+    environment = {
+        "TMPDIR": "/tmp",
+        "TEMP": "/tmp",
+        "TMP": "/tmp",
+        "HOME": home_dir,
+        "R_LIBS": os.path.join(home_dir, "R", "library"),
+        "R_LIBS_USER": os.path.join(home_dir, "R", "library"),
+    }
+    if is_matlab(image_reference):
+        environment["MLM_LICENSE_FILE"] = matlab_license_file(api)
+    environment.update(user_env)
+    return environment
+
+
+def recorded_environment(environment, user_env) -> dict:
+    """The container environment as the signed TRO records it.
+
+    The stage's secrets are masked, and so is the MATLAB license server: it is
+    deployment infrastructure, possibly an internal host or a file path, and
+    nothing a reader of the TRO needs to reproduce the research (#154).
+    """
+    return {
+        k: (MASK if k in user_env or k == "MLM_LICENSE_FILE" else v)
+        for k, v in environment.items()
+    }
+
+
 def stata_error(log_content: str) -> str | None:
     # if any of the lines contains r([0-9]+); return True
     regex = r"r\(\d+\);"
@@ -2405,16 +2458,7 @@ def recorded_run(api, submission, stage, env_vars):
         user = f"{os.getuid()}:{os.getgid()}"
         read_only = True
 
-    environment = {
-        "TMPDIR": "/tmp",
-        "TEMP": "/tmp",
-        "TMP": "/tmp",
-        "HOME": home_dir,
-        "R_LIBS": os.path.join(home_dir, "R", "library"),
-        "R_LIBS_USER": os.path.join(home_dir, "R", "library"),
-        "MLM_LICENSE_FILE": "27007@rtlicense1.uits.indiana.edu",
-    }
-    environment.update(user_env)
+    environment = container_environment(api, image_reference, home_dir, user_env)
 
     container_kwargs = {
         "image": image_reference,
@@ -2459,10 +2503,9 @@ def recorded_run(api, submission, stage, env_vars):
         )
     container = cli.containers.create(**container_kwargs)
     # redact env in container_kwargs since we dump them later
-    container_kwargs["environment"] = {
-        k: (MASK if k in user_env else v)
-        for k, v in container_kwargs["environment"].items()
-    }
+    container_kwargs["environment"] = recorded_environment(
+        container_kwargs["environment"], user_env
+    )
 
     logging_thread = Thread(target=logging_worker, args=(log_queue, container))
     with tempfile.TemporaryDirectory() as container_temp_path:

@@ -177,6 +177,15 @@ class PluginSettings:
     #: every worker rather than only the ones running Stata.
     STATA_LICENSE = "sivacor.stata_license"
 
+    #: ``MLM_LICENSE_FILE`` given to MATLAB (dynare) containers, e.g.
+    #: ``27007@license.example.org``. A setting rather than a worker env var
+    #: for the same reason as :attr:`STATA_LICENSE`: fleet workers boot from
+    #: one cloud-init template shared by every deployment on the host, and a
+    #: setting reaches them with no template change (issue #154). It cannot
+    #: be blank: a deployment without MATLAB simply leaves the default. The
+    #: value is masked in the run arguments the signed TRO records.
+    MLM_LICENSE_FILE = "sivacor.mlm_license_file"
+
     #: HMAC key for the pseudonyms a redacted chain job carries.
     #:
     #: Generated on first use and never rotated, because rotating it would
@@ -205,6 +214,12 @@ class PluginSettings:
 #: The default for :attr:`PluginSettings.SUPPORT_EMAIL`, and the fallback a
 #: worker uses for a chain published by a server that predates the setting.
 DEFAULT_SUPPORT_EMAIL = "support@sivacor.org"
+
+
+#: The default for :attr:`PluginSettings.MLM_LICENSE_FILE`, and the fallback a
+#: worker uses when the server returns nothing for it -- the license server
+#: every MATLAB container was hardwired to before the setting existed.
+DEFAULT_MLM_LICENSE_FILE = "27007@rtlicense1.uits.indiana.edu"
 
 
 def support_email() -> str:
@@ -241,6 +256,7 @@ SettingDefault.defaults.update(
         # Empty by default: a deployment with no Stata license set simply cannot
         # run Stata images, and says so at container-create time.
         PluginSettings.STATA_LICENSE: "",
+        PluginSettings.MLM_LICENSE_FILE: DEFAULT_MLM_LICENSE_FILE,
         # Off: the shared dispatch queue is still how a submission reaches a
         # worker. Turn it on only against a controller that assigns -- an older
         # one ignores the setting, so nothing would ever be published.
