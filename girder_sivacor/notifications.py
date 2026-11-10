@@ -26,7 +26,7 @@ from girder_jobs.constants import JobStatus
 from girder_jobs.models.job import Job
 
 from . import usage
-from .settings import support_email
+from .settings import PluginSettings, support_email
 from .statuses import CANCELING, COMPLETED, FAILED, PROCESSING
 from .worker_plugin.routing import instance_id_of
 
@@ -66,14 +66,15 @@ def email_urls() -> dict:
     ``${domain}``; the default reproduces the old values so production is
     unchanged.
 
-    ``docs_url`` stays on the apex domain on purpose: there is one docs site, and
-    a test deployment has no docs of its own.
+    ``docs_url`` is the ``sivacor.docs_url`` setting instead: there is one docs
+    site, and a test deployment has no docs of its own, so deriving it from
+    ``DOMAIN`` would make it a dead link. Server-side only: it reads Mongo.
     """
     domain = os.environ.get("DOMAIN") or "sivacor.org"
     base = f"https://submit.{domain}"
     return {
         "base_url": base,
-        "docs_url": "https://docs.sivacor.org",
+        "docs_url": Setting().get(PluginSettings.DOCS_URL),
         "feedback_url": f"https://feedback.{domain}",
         "logo_url": f"{base}/sivacor_logo_notext_trans.png",
         "submission_url": f"{base}/",

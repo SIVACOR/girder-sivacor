@@ -210,10 +210,22 @@ class PluginSettings:
     #: the API. Public, so the web UI reads the same address (issue #152).
     SUPPORT_EMAIL = "sivacor.support_email"
 
+    #: Root of the end-user documentation site, linked from every email and
+    #: read by the web UI through ``/system/public_settings``.
+    #:
+    #: A setting rather than derived from ``DOMAIN`` like the other email URLs:
+    #: there is one docs site, and a test deployment has none of its own, so
+    #: ``docs.{domain}`` would be a dead link everywhere but production. A
+    #: third party standing up the stack points it at their own docs instead.
+    DOCS_URL = "sivacor.docs_url"
+
 
 #: The default for :attr:`PluginSettings.SUPPORT_EMAIL`, and the fallback a
 #: worker uses for a chain published by a server that predates the setting.
 DEFAULT_SUPPORT_EMAIL = "support@sivacor.org"
+
+#: The default for :attr:`PluginSettings.DOCS_URL`.
+DEFAULT_DOCS_URL = "https://docs.sivacor.org"
 
 
 #: The default for :attr:`PluginSettings.MLM_LICENSE_FILE`, and the fallback a
@@ -242,6 +254,7 @@ SettingDefault.defaults.update(
         PluginSettings.BANNER_ENABLED: False,
         PluginSettings.BANNER_MESSAGE: "",
         PluginSettings.SUPPORT_EMAIL: DEFAULT_SUPPORT_EMAIL,
+        PluginSettings.DOCS_URL: DEFAULT_DOCS_URL,
         # Generous relative to the one-minute heartbeat: only the container run
         # ticks it, so the quiet stretches are whole pipeline steps -- zipping
         # and uploading a multi-gigabyte package chief among them. Better to
