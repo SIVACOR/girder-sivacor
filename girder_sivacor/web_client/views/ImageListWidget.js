@@ -1,4 +1,5 @@
 import ImageListWidgetTemplate from '../templates/imageListWidget.pug';
+import ImageTagTemplate from '../templates/imageTag.pug';
 import '../stylesheets/imageListWidget.styl';
 
 const $ = girder.$;
@@ -6,6 +7,38 @@ const View = girder.views.View;
 
 /** Splits "4.6.1, 4.6.0" or a pasted column of tags into separate tags. */
 const splitTags = (text) => text.split(/[\s,]+/).map((tag) => tag.trim()).filter(Boolean);
+
+/** Read with attr(), never data(): jQuery's data() turns "2023" into 2023. */
+const tagOf = (el) => $(el).attr('data-tag');
+
+/**
+ * What the server's ``image_tags.check_image_tags`` refuses, or ``null``.
+ *
+ * ``complete: false`` checks only that the value is a list the editor can
+ * show, so switching modes never refuses an empty or unfinished list -- the
+ * JSON view is where a whole list gets pasted in.
+ */
+const checkList = (value, { complete = true } = {}) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        return 'The image list must be a JSON object of image name to a list of tags.';
+    }
+    const entries = Object.entries(value);
+    if (complete && !entries.length) {
+        return 'Add at least one image. An empty list would refuse every submission.';
+    }
+    for (const [image, tags] of entries) {
+        if (complete && !image.trim()) {
+            return 'Every image needs a name.';
+        }
+        if (!Array.isArray(tags) || !tags.every((tag) => typeof tag === 'string' && tag.trim())) {
+            return `Tags for ${image || 'the unnamed image'} must be a list of non-empty strings, e.g. ["4.6.1"].`;
+        }
+        if (complete && !tags.length) {
+            return `${image} has no tags, so nothing on it could be used. Add a tag or remove the image.`;
+        }
+    }
+    return null;
+};
 
 /**
  * An editor for ``sivacor.image_tags``: one row per image, its tags as chips.
@@ -55,8 +88,9 @@ const ImageListWidget = View.extend({
             }
         },
 
-        // A pasted list, or a tag typed and then tabbed away from, is still
-        // meant to be added.
+        // A pasted list, or a tag typed and then clicked or tabbed away from,
+        // is still meant to be added.
+
         'paste .g-sivacor-tag-input'(event) {
             const input = this.$(event.currentTarget);
             setTimeout(() => this._addTags(input), 0);
@@ -64,16 +98,25 @@ const ImageListWidget = View.extend({
         'blur .g-sivacor-tag-input'(event) {
             const input = this.$(event.currentTarget);
             if (input.val().trim()) {
-                this._addTags(input, { refocus: false });
+                this._addTags(input, { refocus: false, defer: this._pointerDown });
             }
+        },
+
+        // mousedown runs before the blur it causes, so the blur can tell a
+        // click from a Tab.
+        mousedown() {
+            this._pointerDown = true;
+            $(document).one('mouseup', () => {
+                this._pointerDown = false;
+            });
         },
 
         'click .g-sivacor-tag-remove'(event) {
             event.preventDefault();
             const chip = this.$(event.currentTarget).closest('.g-sivacor-tag');
             const index = this._index(chip);
-            this.rows[index].tags.splice(chip.index(), 1);
-            this._renderRow(index);
+            this.rows[index].tags.splice(this.rows[index].tags.indexOf(tagOf(chip)), 1);
+            this._syncChips(index);
             this.$(`tr[data-index=${index}] .g-sivacor-tag-input`).trigger('focus');
         },
 
@@ -82,8 +125,8 @@ const ImageListWidget = View.extend({
             const chip = this.$(event.currentTarget).closest('.g-sivacor-tag');
             const index = this._index(chip);
             const tags = this.rows[index].tags;
-            tags.unshift(...tags.splice(chip.index(), 1));
-            this._renderRow(index);
+            tags.unshift(...tags.splice(tags.indexOf(tagOf(chip)), 1));
+            this._syncChips(index);
         },
 
         'input .g-sivacor-image-filter'(event) {
@@ -93,15 +136,21 @@ const ImageListWidget = View.extend({
 
         'click .g-sivacor-toggle-json'(event) {
             event.preventDefault();
+            // Either switch refuses rather than lose something: JSON the rows
+            // cannot show, or rows the JSON cannot hold.
             if (this.jsonMode) {
-                // Leaving JSON is the one switch that can fail; stay put if so.
-                const parsed = this._parseJson();
+                const parsed = this._parseJson({ complete: false });
                 if (parsed.error) {
                     this.trigger('g:error', parsed.error);
                     return;
                 }
                 this.setValue(parsed.value);
             } else {
+                const lost = this._rowsJsonCannotHold();
+                if (lost) {
+                    this.trigger('g:error', lost);
+                    return;
+                }
                 this.jsonText = JSON.stringify(this._toObject(), null, 2);
             }
             this.jsonMode = !this.jsonMode;
@@ -136,23 +185,35 @@ const ImageListWidget = View.extend({
         if (this.jsonMode) {
             return this._parseJson();
         }
+        const lost = this._rowsJsonCannotHold();
+        if (lost) {
+            return { error: lost };
+        }
+        const value = this._toObject();
+        const error = checkList(value);
+        return error ? { error } : { value };
+    },
+
+    /**
+     * A row with tags but no name, or two rows for one image. Neither survives
+     * conversion to an object -- the first is dropped, the second collapses to
+     * one row -- so both are refused rather than quietly lost.
+     */
+    _rowsJsonCannotHold() {
         const seen = new Set();
         for (const row of this.rows) {
-            if (!row.image && !row.tags.length) {
+            if (!row.image) {
+                if (row.tags.length) {
+                    return `Name the image that has the tags ${row.tags.join(', ')}.`;
+                }
                 continue;
             }
-            if (!row.image) {
-                return { error: `Name the image that has the tags ${row.tags.join(', ')}.` };
-            }
             if (seen.has(row.image)) {
-                return { error: `${row.image} is listed twice. Merge its tags into one row.` };
-            }
-            if (!row.tags.length) {
-                return { error: `${row.image} has no tags, so nothing on it could be used. Add a tag or remove the image.` };
+                return `${row.image} is listed twice. Merge its tags into one row.`;
             }
             seen.add(row.image);
         }
-        return { value: this._toObject() };
+        return null;
     },
 
     render() {
@@ -160,7 +221,8 @@ const ImageListWidget = View.extend({
             rows: this.rows,
             filter: this.filter,
             jsonMode: this.jsonMode,
-            jsonText: this.jsonText
+            jsonText: this.jsonText,
+            tagTemplate: ImageTagTemplate
         }));
         if (!this.jsonMode) {
             this._applyFilter();
@@ -169,33 +231,91 @@ const ImageListWidget = View.extend({
         return this;
     },
 
-    _addTags(input, { refocus = true } = {}) {
+    /**
+     * Add what is typed in ``input`` to its row.
+     *
+     * ``defer`` is for a blur caused by a click: the tag joins the row's data
+     * at once, but its chip waits until the pointer is released. Drawn now, it
+     * would push every chip after it along, the mouseup would land on a
+     * different element than the mousedown, and the browser would fire no
+     * click at all -- on the chip or the trash icon the user was aiming at.
+     * The click's own handler then acts on data that already holds the tag.
+     */
+    _addTags(input, { refocus = true, defer = false } = {}) {
         const index = this._index(input);
-        const tags = this.rows[index].tags;
+        const owner = this.rows[index];
+        const tags = owner.tags;
         const fresh = splitTags(input.val()).filter((tag) => !tags.includes(tag));
         const repeated = splitTags(input.val()).filter((tag) => tags.includes(tag));
         input.val('');
         // Newest first, in the order they were typed or pasted.
         tags.unshift(...[...new Set(fresh)]);
-        this._renderRow(index);
+        if (defer) {
+            $(document).one('mouseup', () => setTimeout(() => {
+                // By row, not index: the click may have removed a row above.
+                const now = this.rows.indexOf(owner);
+                if (now >= 0 && !this.jsonMode) {
+                    this._syncChips(now);
+                }
+            }, 0));
+            return;
+        }
+        this._syncChips(index);
         const row = this.$(`tr[data-index=${index}]`);
-        repeated.forEach((tag) => {
-            row.find('.g-sivacor-tag').filter((i, el) => $(el).data('tag') === tag)
-                .addClass('g-sivacor-tag-flash');
-        });
+        row.find('.g-sivacor-tag').filter((i, el) => repeated.includes(tagOf(el)))
+            .removeClass('g-sivacor-tag-flash')
+            .each((i, el) => el.offsetWidth) // restart the animation on a repeat
+            .addClass('g-sivacor-tag-flash');
         if (refocus) {
             row.find('.g-sivacor-tag-input').trigger('focus');
         }
     },
 
-    /** Re-render one row in place, so typing elsewhere keeps its focus. */
-    _renderRow(index) {
-        // girder.$, not this.$: the view's own $ is find() within the view,
-        // and would read the rendered HTML as a selector.
-        const fresh = $(ImageListWidgetTemplate({
-            rows: this.rows, filter: '', jsonMode: false, jsonText: ''
-        })).find(`tr[data-index=${index}]`);
-        this.$(`tr[data-index=${index}]`).replaceWith(fresh);
+    /**
+     * Bring one row's chips in line with its tags, keeping every chip element
+     * that is still wanted.
+     *
+     * Not a re-render, and that is the point: adding a typed tag happens on
+     * the input's blur, which fires on mousedown -- before the click it was
+     * caused by. Replacing the row there would detach the trash icon or chip
+     * under the pointer, and the click would land on nothing.
+     */
+    _syncChips(index) {
+        const list = this.$(`tr[data-index=${index}] .g-sivacor-tags`);
+        const entry = list.children('.g-sivacor-tag-entry');
+        const existing = new Map();
+        list.children('.g-sivacor-tag').each((i, el) => existing.set(tagOf(el), el));
+        const wanted = new Set(this.rows[index].tags);
+        existing.forEach((el, tag) => {
+            if (!wanted.has(tag)) {
+                $(el).remove();
+                existing.delete(tag);
+            }
+        });
+        // Walk the wanted order with a cursor, moving a chip only when it is
+        // out of place, so chips that did not change stay where they are.
+        let cursor = list.children('.g-sivacor-tag').get(0) || entry.get(0);
+        this.rows[index].tags.forEach((tag, position) => {
+            const known = existing.get(tag);
+            existing.delete(tag);
+            // girder.$, not this.$: the view's $ is find() within the view,
+            // and would read the rendered HTML as a selector.
+            const chip = known ? $(known) : $(ImageTagTemplate({ tag, first: false }));
+            if (chip.get(0) === cursor) {
+                cursor = cursor.nextElementSibling;
+            } else {
+                chip.insertBefore(cursor);
+            }
+            const first = position === 0;
+            chip.toggleClass('g-sivacor-tag-first', first);
+            chip.find('.g-sivacor-tag-default').prop('disabled', first).attr('title',
+                first ? 'Pre-selected on the submission form' : 'Make this the pre-selected tag');
+        });
+        // A duplicate tag in the data (possible from JSON) gets one chip each;
+        // any element left over is a second copy that is no longer wanted.
+        existing.forEach((el) => $(el).remove());
+        list.find('.g-sivacor-tag-input').attr('placeholder',
+            this.rows[index].tags.length ? 'Add tag' : 'Add tags, e.g. 4.6.1, 4.6.0');
         this._applyFilter();
         this._renderSummary();
     },
@@ -221,7 +341,7 @@ const ImageListWidget = View.extend({
         );
     },
 
-    _parseJson() {
+    _parseJson({ complete = true } = {}) {
         const text = this.$('.g-sivacor-image-json').val();
         let value;
         try {
@@ -229,8 +349,9 @@ const ImageListWidget = View.extend({
         } catch (err) {
             return { error: `The image list is not valid JSON: ${err.message}` };
         }
-        if (!value || typeof value !== 'object' || Array.isArray(value)) {
-            return { error: 'The image list must be a JSON object of image name to tags.' };
+        const error = checkList(value, { complete });
+        if (error) {
+            return { error };
         }
         this.jsonText = text;
         return { value };

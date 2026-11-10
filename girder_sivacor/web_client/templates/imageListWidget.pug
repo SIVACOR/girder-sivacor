@@ -33,11 +33,7 @@ else
           td
             ul.g-sivacor-tags(aria-label=`Tags for ${row.image || 'new image'}`)
               each tag, position in row.tags
-                li.g-sivacor-tag(data-tag=tag, class=position === 0 ? 'g-sivacor-tag-first' : '')
-                  button.g-sivacor-tag-default(
-                    type="button", disabled=position === 0,
-                    title=position === 0 ? 'Pre-selected on the submission form' : 'Make this the pre-selected tag')= tag
-                  button.g-sivacor-tag-remove(type="button", aria-label=`Remove ${tag}`, title=`Remove ${tag}`) ×
+                != tagTemplate({ tag, first: position === 0 })
               li.g-sivacor-tag-entry
                 input.g-sivacor-tag-input(
                   type="text", placeholder=row.tags.length ? 'Add tag' : 'Add tags, e.g. 4.6.1, 4.6.0',
