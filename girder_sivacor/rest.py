@@ -24,7 +24,7 @@ from girder_jobs.constants import REST_CREATE_JOB_TOKEN_SCOPE, JobStatus
 from girder_jobs.models.job import Job
 from girder_plugin_worker.utils import getWorkerApiUrl
 
-from . import alerts, chain, image_tags, usage
+from . import alerts, chain, image_tags, tro_profile, usage
 from .errors import FailureCode
 from .models.execution_record import ExecutionRecord
 from .settings import PluginSettings, support_email
@@ -847,6 +847,8 @@ class SIVACOR(Resource):
         self.route("GET", ("image_tags",), self.get_image_tags)
         self.route("GET", ("image_tags", "status"), self.get_image_tags_status)
         self.route("PUT", ("image_tags", "config"), self.set_image_tags_config)
+        self.route("GET", ("tro_profile",), self.get_tro_profile)
+        self.route("PUT", ("tro_profile",), self.set_tro_profile)
         self.route("GET", ("worker_sizes",), self.get_worker_sizes)
         self.route("GET", ("volume_quota",), self.get_volume_quota)
         self.route("GET", ("volume_usage",), self.get_volume_usage)
@@ -2259,6 +2261,33 @@ class SIVACOR(Resource):
     def set_image_tags_config(self, config):
         image_tags.set_config(config.get("url", ""), config.get("tags"))
         return image_tags.status()
+
+    @access.admin
+    @autoDescribeRoute(
+        Description("The TRS profile every signed TRO declares.").notes(
+            "'builtin' is true while the deployment is still on SIVACOR's own "
+            "profile, and 'warning' says why that matters here when it does. "
+            "'required_capabilities' are those SIVACOR's runs claim, which the "
+            "profile must declare."
+        )
+    )
+    def get_tro_profile(self):
+        return tro_profile.status()
+
+    @access.admin
+    @autoDescribeRoute(
+        Description("Set sivacor.tro_profile.")
+        .notes("Validated as the setting is. Returns the resulting status.")
+        .jsonParam(
+            "profile",
+            "The TRS profile, as JSON-LD.",
+            paramType="body",
+            requireObject=True,
+        )
+    )
+    def set_tro_profile(self, profile):
+        tro_profile.set_profile(profile)
+        return tro_profile.status()
 
     # DATA_READ rather than the bare @access.user every other handler here uses,
     # and that is deliberate: sivacor-girderfs authenticates with a DATA_READ

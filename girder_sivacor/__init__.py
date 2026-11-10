@@ -31,7 +31,8 @@ from .notifications import (
     set_submission_status,
 )
 from .rest import SIVACOR, get_submission_child_jobs
-from .settings import PluginSettings, support_email
+from .settings import REQUIRED_CAPABILITIES, PluginSettings, support_email
+from .tro_profile import warn_if_builtin
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +138,17 @@ def _validate_tro_profile(doc):
                 "IRI -- usually the capability's own term, e.g. "
                 f"'{capability['@type']}'; got {capability_id!r}."
             )
+    # tro-utils matches a claimed attribute to a capability by @type, and
+    # refuses the performance when none matches -- which would fail every
+    # submission after its analysis had already run.
+    declared = {capability["@type"] for capability in value.get("trov:hasCapability", [])}
+    missing = [cap.value for cap in REQUIRED_CAPABILITIES if cap.value not in declared]
+    if missing:
+        raise ValidationException(
+            "The TRO profile must declare every capability SIVACOR's runs "
+            "claim, or every submission fails when its run is recorded; "
+            f"missing {', '.join(missing)}."
+        )
     return value
 
 
@@ -491,6 +503,7 @@ class SIVACORPlugin(GirderPlugin):
         template_dir = (Path(__file__).parent / "mail_templates").as_posix()
         logger.warning(f"Adding {template_dir} as template directory")
         mail_utils.addTemplateDirectory(template_dir)
+        warn_if_builtin()
         registerPluginStaticContent(
             plugin="sivacor",
             css=["/style.css"],
