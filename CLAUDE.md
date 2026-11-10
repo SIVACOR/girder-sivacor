@@ -49,8 +49,9 @@ replaced the count deliberately; please do not reintroduce one.
 - **`tox`, not `pytest`** — only `tox.ini`'s `passenv` forwards `STATA_LICENSE_HOSTPATH`, and it
   sets `changedir = tests`, so posargs are relative to `tests/`. Passing `tests/test_foo.py`
   silently collects nothing and exits 4.
-- **`--ulimit nofile=64000:64000`** — load-bearing above `-n 8`. Every test gets its own database,
-  so a wide run holds hundreds of WiredTiger files open; a default-limit mongod aborts
+- **`--ulimit nofile=64000:64000`** — load-bearing above `-n 8` when every test got its own
+  database (until 2026-11-10; now one per module per worker, not re-measured without the flag),
+  since a wide run held hundreds of WiredTiger files open; a default-limit mongod aborts
   (`Too many open files` → `WT_PANIC` → exit 14) and every remaining test then errors against a
   dead database, reading like a mass regression. 64000 is MongoDB's own recommendation.
 - **`docker rm -f` first** — a stale `test-mongo` from a previous session keeps the name, the new
@@ -83,16 +84,21 @@ tests really do build and run containers; the suite is Docker-bound, not CPU-bou
 
 ## Test suite gotchas
 
-- **The suite runs in parallel** (`-n 4` by default). This is safe because
-  `pytest-girder` names each test's database from a hash of its node id, so isolation
-  is per-test, not per-process.
+- **One server and one database per test module, per xdist worker** — not per test.
+  `tests/conftest.py` overrides pytest-girder's `db`/`boundServer` with a module-scoped
+  `_module_girder`, and `_fresh_db` empties every collection (keeping indexes) before
+  each test. Isolation between tests is therefore *the database contents only*: a
+  module-level variable, a thread outliving its test, or anything a test does to the
+  plugin's process state carries into the next test of that module. All tests in a
+  module must share one `plugin(...)` marker list (a mismatch is a `UsageError`).
+  Before 2026-11-10 it was per test, and fixtures were 79% of the suite's worker-time;
+  see `_module_girder`'s docstring, including why model singletons are no longer reset.
 - **The default 4 is sized for CI, not for a workstation.** CI runs on a 4-vCPU
-  `ubuntu-latest`. On a big local box, `export PYTEST_XDIST_N=16` (or `-- -n 16`) is
-  **~2.5x faster** — measured 2026-08-21 on 32 threads: 122-132s at `-n 4` against
-  49-53s at `-n 16`, flattening from 16 to 32. tox.ini's `commands` line carries the
-  full table and the reasoning.
-- **Above `-n 8`, mongo needs `--ulimit nofile=64000:64000` or it aborts.** Every
-  test gets its own database, so a wide run opens hundreds of WiredTiger files;
+  `ubuntu-latest`. Measured 2026-11-10 on 32 threads, 1178 tests: ~96s at `-n 4`,
+  ~82s at `-n 16`. The floor is `test_julia.py`'s 74s setup-stage test, which the
+  `starts_first` marker launches at t=0; keep that marker rare (conftest explains).
+- **Above `-n 8`, mongo needed `--ulimit nofile=64000:64000` or it aborted** when
+  every test got its own database, because a wide run opened hundreds of WiredTiger files;
   a default-limit mongo hits 1024 fds and dies with `WT_PANIC`/exit 14, after which
   every remaining test errors against a dead database and it looks like a mass code
   regression. `CI_SETUP.md` has the corrected `docker run`. The

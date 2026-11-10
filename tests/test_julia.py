@@ -135,6 +135,8 @@ def isolated(performance):
     return "trov:InternetIsolation" in types
 
 
+# ~74s of real Pkg.instantiate() over the network: the longest test by far.
+@pytest.mark.starts_first
 @pytest.mark.plugin("sivacor")
 def test_a_setup_stage_installs_what_the_isolated_analysis_then_uses(
     server, db, user, eagerWorkerTasks, fsAssetstore, patched_gpg,

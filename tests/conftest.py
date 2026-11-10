@@ -15,6 +15,138 @@ from girder_plugin_worker.constants import PluginSettings as WorkerSettings
 from girder_sivacor.settings import PluginSettings
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "starts_first: run before everything else; for the few tests that alone "
+        "take longer than a worker's whole share of the suite",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    """Move ``starts_first`` tests to the front, otherwise keeping the order.
+
+    Under ``-n 16`` every other worker was done by ~80s while one sat until
+    ~110s, because the 74s Julia test had been handed out ~33s in. Starting it
+    at t=0 hides it behind the rest of the suite instead.
+
+    Keep the marker rare. xdist's load scheduler deals out the *front* of the
+    collection as one consecutive chunk per worker -- two tests each, because
+    tox.ini passes ``--maxschedchunk 2``; without it, len/workers/4 -- so marked
+    tests pair up on the first workers and run back to back there. One or two
+    is a head start; a dozen is a new tail.
+    """
+    items.sort(key=lambda item: item.get_closest_marker("starts_first") is None)
+
+
+def _module_plugins(module_node):
+    """The one ``plugin`` marker list every test in a module agrees on.
+
+    A module shares one server, so it can load only one set of plugins. Mixed
+    markers are a usage error rather than something to guess around: split the
+    module instead.
+    """
+    sets = set()
+    for item in module_node.session.items:
+        markers = list(item.iter_markers("plugin"))
+        if item.module is not module_node.obj or not markers:
+            continue
+        if any(len(m.args) > 1 for m in markers):
+            raise pytest.UsageError(
+                f"{item.nodeid}: test-registered plugins are not supported"
+            )
+        sets.add(tuple(m.args[0] for m in markers))
+    if len(sets) > 1:
+        raise pytest.UsageError(
+            f"{module_node.nodeid}: tests ask for different plugin sets "
+            f"{sorted(sets)}; one module shares one server, so split it"
+        )
+    return list(sets.pop()) if sets else []
+
+
+@pytest.fixture(scope="module")
+def _module_girder(request):
+    """One database and one listening server per test module, per worker.
+
+    Replaces pytest-girder's per-test ``db``/``boundServer``, which dropped the
+    database, rebuilt every index and started and stopped CherryPy for every
+    test: ~1s of fixture against a median test body of 0s, and 79% of the
+    suite's worker-time. ``_fresh_db`` empties the collections between tests
+    instead, which keeps their indexes. Measured 2026-11-10: test_usage.py's
+    81 tests went from 54.8s to 1.3s serially.
+
+    Two things pytest-girder did that this deliberately does not:
+
+    * reset each model's ``_instance`` on teardown. Girder's own comment in
+      ``_ModelSingleton`` says never to, and doing it without pruning
+      ``_modelSingletons`` made every ``db`` setup reconnect -- rebuild every
+      index on -- every dead instance any earlier test left, so a test's setup
+      cost grew with how many had run before it in the worker. The live
+      singletons are simply pointed at the next module's database below.
+    * honour ``--keep-db`` / ``--mock-db``. Nothing here uses them.
+
+    The database name carries the xdist worker id: two workers can each be
+    handed part of the same module, and a name from the module alone made them
+    truncate each other's data.
+    """
+    import hashlib
+
+    from girder.models import _dbClients, getDbConnection, model_base
+    from girder.models.user import User
+    from pytest_girder.plugin_registry import PluginRegistry
+    from pytest_girder.utils import serverContext
+
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "main")
+    digest = hashlib.md5(f"{worker}:{request.node.nodeid}".encode()).hexdigest()
+    name = f"girder_test_{digest}"
+    connection = getDbConnection(
+        uri=f"{request.config.getoption('--mongo-uri')}/{name}", quiet=False
+    )
+    _dbClients[(None, None)] = connection
+    connection.drop_database(name)
+    for model in model_base._modelSingletons:
+        try:
+            model.reconnect()
+        except OSError:
+            pass  # lazy index creation, as pytest-girder ignores it too
+    User()._cryptContext.scheme = "plaintext"  # skip bcrypt, as pytest-girder does
+
+    try:
+        with PluginRegistry()(), serverContext(
+            _module_plugins(request.node), bindPort=True
+        ) as server:
+            yield connection, server
+    finally:
+        connection.drop_database(name)
+        connection.close()
+        _dbClients.clear()
+
+
+@pytest.fixture
+def _fresh_db(_module_girder):
+    """Empty every collection, keeping it and its indexes, before each test.
+
+    Named apart from ``db`` because test_reattribute_usage.py overrides ``db``
+    with a fixture that itself needs ``server``.
+    """
+    connection, _ = _module_girder
+    database = connection.get_database()
+    for collection in database.list_collection_names():
+        if not collection.startswith("system."):
+            database[collection].delete_many({})
+    return connection
+
+
+@pytest.fixture
+def db(_fresh_db):
+    return _fresh_db
+
+
+@pytest.fixture
+def boundServer(_module_girder, _fresh_db):
+    return _module_girder[1]
+
+
 @pytest.fixture
 def server(boundServer, admin, monkeypatch):
     """A listening server, overriding pytest-girder's in-process ``server``.
