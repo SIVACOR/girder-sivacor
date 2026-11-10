@@ -157,6 +157,28 @@ class PluginSettings:
     #: :attr:`TRO_GPG_PASSPHRASE` rather than a tunable.
     PSEUDONYM_SALT = "sivacor.pseudonym_salt"
 
+    #: Where researcher-facing messages and mail send people for help.
+    #:
+    #: Its own setting rather than ``core.contact_email_address``, which looks
+    #: like the same thing and is not: deploy-sivacor sets that one from
+    #: ``GIRDER_ADMIN_EMAIL``, which is also the mail *sender*, and on
+    #: SIVACOR's deployments that is not the support mailbox. It is also pinned
+    #: by a ``GIRDER_SETTING_*`` override there, so it cannot be changed through
+    #: the API. Public, so the web UI reads the same address (issue #152).
+    SUPPORT_EMAIL = "sivacor.support_email"
+
+
+#: The default for :attr:`PluginSettings.SUPPORT_EMAIL`, and the fallback a
+#: worker uses for a chain published by a server that predates the setting.
+DEFAULT_SUPPORT_EMAIL = "support@sivacor.org"
+
+
+def support_email() -> str:
+    """The configured support address. Server-side only: it reads Mongo."""
+    from girder.models.setting import Setting
+
+    return Setting().get(PluginSettings.SUPPORT_EMAIL)
+
 
 SettingDefault.defaults.update(
     {
@@ -170,6 +192,7 @@ SettingDefault.defaults.update(
         PluginSettings.RETENTION_DAYS: 7,
         PluginSettings.BANNER_ENABLED: False,
         PluginSettings.BANNER_MESSAGE: "",
+        PluginSettings.SUPPORT_EMAIL: DEFAULT_SUPPORT_EMAIL,
         # Generous relative to the one-minute heartbeat: only the container run
         # ticks it, so the quiet stretches are whole pipeline steps -- zipping
         # and uploading a multi-gigabyte package chief among them. Better to

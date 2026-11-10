@@ -30,7 +30,7 @@ from girder_plugin_worker.utils import getWorkerApiUrl
 from . import alerts, chain, usage
 from .errors import FailureCode
 from .models.execution_record import ExecutionRecord
-from .settings import PluginSettings
+from .settings import PluginSettings, support_email
 from .statuses import CANCELING, DELETABLE, FAILED
 from .telemetry import safe_step, sanitize_failure, sanitize_record
 from .utils import encrypt_job_secrets
@@ -191,7 +191,7 @@ def resolve_worker_size(workflow, user):
     if match["gated"] and not gated_ok:
         raise ValidationException(
             f"The {requested} GB worker is not self-service. "
-            "Contact support@sivacor.org to request it. "
+            f"Contact {support_email()} to request it. "
             f"Available sizes: {', '.join(str(size) for size in selectable)}."
         )
     return requested
@@ -474,13 +474,13 @@ def resolve_volume_gb(workflow, user):
     if not targeted_assignment():
         raise ValidationException(
             "Extra scratch disk cannot be provided on this deployment right now. "
-            "Contact support@sivacor.org."
+            f"Contact {support_email()}."
         )
 
     ceiling = user_volume_quota(user)
     if ceiling <= 0:
         raise ValidationException(
-            "Extra scratch disk needs approval. Contact support@sivacor.org to "
+            f"Extra scratch disk needs approval. Contact {support_email()} to "
             "request it."
         )
 
@@ -494,7 +494,7 @@ def resolve_volume_gb(workflow, user):
         raise ValidationException(
             f"{requested} GB of extra scratch disk is more than your "
             f"{ceiling} GB limit. Ask for {ceiling} GB or less, or contact "
-            "support@sivacor.org to raise it."
+            f"{support_email()} to raise it."
         )
 
     reservation = volume_total_gb()
@@ -506,7 +506,7 @@ def resolve_volume_gb(workflow, user):
         raise ValidationException(
             f"{requested} GB of extra scratch disk is more than this deployment "
             f"currently has available ({reservation} GB). Contact "
-            "support@sivacor.org."
+            f"{support_email()}."
         )
     return granted
 
@@ -599,7 +599,7 @@ def verify_upload_complete(file):
         f"{stored:,} of {declared:,} bytes. This is a known fault in the "
         "upload, not in your package. Delete the uploaded file and upload it "
         "again -- a fresh upload stores a fresh copy. If it happens twice for "
-        "the same file, contact support@sivacor.org."
+        f"the same file, contact {support_email()}."
     )
 
 

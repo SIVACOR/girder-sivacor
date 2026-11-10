@@ -1226,7 +1226,19 @@ def workspace_usage(submission) -> int:
     return directory_usage(submission.get("workspace_dir"), submission.get("tmp_dir"))
 
 
-# Both disk messages below point at support@sivacor.org rather than naming
+def support_email(submission) -> str:
+    """Where this submission's failure messages send the researcher.
+
+    Read from the public settings by ``prepare_submission`` (issue #152). A
+    submission that started before that, or whose read failed, falls back to
+    the default.
+    """
+    from ..settings import DEFAULT_SUPPORT_EMAIL
+
+    return submission.get("support_email") or DEFAULT_SUPPORT_EMAIL
+
+
+# Both disk messages below point at the support address rather than naming
 # `resources.disk_gb`, and that is deliberate.
 #
 # Extra scratch disk is granted per user, and for almost every account the allowance is
@@ -1341,13 +1353,13 @@ def disk_shortfall(submission) -> str | None:
         return head + (
             f"This ran with {granted} GB of extra scratch disk and filled it. The "
             "replication package plus everything your code writes must fit there. "
-            "Reduce the size of the package, or contact support@sivacor.org about a "
-            "larger allowance."
+            "Reduce the size of the package, or contact "
+            f"{support_email(submission)} about a larger allowance."
         )
     return head + (
         "The replication package plus its outputs and the analysis image must fit in "
         "the worker's disk. Reduce the size of the package, or contact "
-        "support@sivacor.org about extra scratch disk."
+        f"{support_email(submission)} about extra scratch disk."
     )
 
 
@@ -1702,7 +1714,7 @@ def image_set_shortfall(cli, submission, image_references) -> str | None:
             "its outputs and the analysis images all share this worker's disk, "
             "and together they do not fit. Reduce the size of the package -- "
             "or, if this work genuinely needs more room than one worker has, "
-            "contact support@sivacor.org about extra scratch disk."
+            f"contact {support_email(submission)} about extra scratch disk."
         )
     # The scratch volume is not the constraint here and the package is not the
     # problem, so neither is mentioned: the software images alone do not fit the
@@ -1711,7 +1723,7 @@ def image_set_shortfall(cli, submission, image_references) -> str | None:
         f"{head}, on the worker's own disk. Sizes: {detail}. Your extra scratch "
         "disk holds the replication package and is not what is short -- the "
         "software images are unpacked onto the worker itself. Please contact "
-        "support@sivacor.org."
+        f"{support_email(submission)}."
     )
 
 
@@ -2768,7 +2780,7 @@ def recorded_run(api, submission, stage, env_vars):
                     f"({mem_limit / 1024**3:.1f} GiB) and was stopped. Reduce the "
                     "memory your code needs, or choose a larger worker size when "
                     "you resubmit. Sizes marked 'by request' need approval -- "
-                    "email support@sivacor.org for one of those."
+                    f"email {support_email(submission)} for one of those."
                     if mem_limit is not None
                     else "The analysis was stopped by the kernel for using too "
                     "much memory."

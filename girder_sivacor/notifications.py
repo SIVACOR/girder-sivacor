@@ -26,6 +26,7 @@ from girder_jobs.constants import JobStatus
 from girder_jobs.models.job import Job
 
 from . import usage
+from .settings import support_email
 from .statuses import CANCELING, COMPLETED, FAILED, PROCESSING
 from .worker_plugin.routing import instance_id_of
 
@@ -131,6 +132,7 @@ def notify_user(job, submission_folder, success: bool) -> None:
 
     context = {
         **email_urls(),
+        "support_email": support_email(),
         "current_year": datetime.datetime.now().year,
         "user_name": f"{user['firstName']} {user['lastName']}",
         "job_id": str(job["_id"]),

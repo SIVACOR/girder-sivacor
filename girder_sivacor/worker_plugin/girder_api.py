@@ -74,6 +74,10 @@ class GirderApi:
         """Fetch several system settings in one round trip."""
         return self.client.get("system/setting", parameters={"list": json.dumps(keys)})
 
+    def public_settings(self):
+        """The settings Girder and SIVACOR expose to anyone, admin or not."""
+        return self.client.get("system/public_settings")
+
     # -- jobs -------------------------------------------------------------
 
     def job(self, job_id, include_log=False):

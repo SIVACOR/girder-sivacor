@@ -445,6 +445,22 @@ def _matlab_perms(target_path, uid=1001):
             raise
 
 
+def _support_email(api):
+    """The deployment's support address, read once per submission (#152).
+
+    From ``/system/public_settings`` because a remote worker has no Mongo, and
+    here rather than where it is quoted because those are failure paths -- the
+    worst place for another API call. Best-effort: None makes
+    ``lib.support_email`` fall back to the default, which is never worth
+    failing a submission over.
+    """
+    try:
+        return api.public_settings().get(PluginSettings.SUPPORT_EMAIL)
+    except Exception:
+        logger.warning("Could not read the support address", exc_info=True)
+        return None
+
+
 @app.task(queue=DISPATCH_QUEUE, bind=True)
 def prepare_submission(
     task,
@@ -534,6 +550,7 @@ def prepare_submission(
             "job_id": str(job_id),
             "stages": stages,
             "queue": queue,
+            "support_email": _support_email(api),
             **telemetry,
         }
     except Exception as exc:
