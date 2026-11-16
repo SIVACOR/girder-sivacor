@@ -31,6 +31,7 @@ from .settings import PluginSettings, support_email
 from .statuses import CANCELING, DELETABLE, FAILED
 from .telemetry import safe_step, sanitize_failure, sanitize_record
 from .utils import encrypt_job_secrets
+from .worker_plugin.lib import image_software
 from .worker_plugin.routing import DISPATCH_QUEUE, instance_id_of
 from .worker_plugin.run_submission import (
     create_workspace,
@@ -847,6 +848,7 @@ class SIVACOR(Resource):
         self.route("GET", ("image_tags",), self.get_image_tags)
         self.route("GET", ("image_tags", "status"), self.get_image_tags_status)
         self.route("PUT", ("image_tags", "config"), self.set_image_tags_config)
+        self.route("GET", ("image_catalog",), self.get_image_catalog)
         self.route("GET", ("tro_profile",), self.get_tro_profile)
         self.route("PUT", ("tro_profile",), self.set_tro_profile)
         self.route("GET", ("worker_sizes",), self.get_worker_sizes)
@@ -2076,6 +2078,25 @@ class SIVACOR(Resource):
     def get_image_tags(self):
         tags = self._get_tags()
         return tags
+
+    @access.public
+    @autoDescribeRoute(
+        Description("Describe what software each allowed Docker image runs.")
+        .notes(
+            "Keyed by the same images image_tags lists, so a picker can label "
+            "them: 'software' names the stacks inside, e.g. ['stata', "
+            "'python'], and is empty for an image SIVACOR cannot infer an "
+            "entrypoint for.\n\n"
+            "A separate endpoint rather than a richer image_tags because the "
+            "UI and the API are deployed separately: image_tags' shape is "
+            "what every existing client reads, and changing it would break "
+            "whichever side was deployed first."
+        )
+    )
+    def get_image_catalog(self):
+        return {
+            image: {"software": image_software(image)} for image in self._get_tags()
+        }
 
     @access.public
     @autoDescribeRoute(
