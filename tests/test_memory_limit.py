@@ -154,7 +154,7 @@ forvalues i = 1/20 {
         ),
         # Stata is here because its process tree had to be checked rather than
         # assumed, and because it is the family with no fallback diagnosis.
-        # Verified by hand against dataeditors/stata18_5-mp:2025-02-26 on
+        # Verified by hand against stata18_5-mp:2025-02-26 (then dataeditors) on
         # 2026-08-13: OOMKilled=true, exit 137, dead 1.3 s in -- and the Stata
         # log stops mid-loop with no ``r(NNN);`` at all. So for Stata the daemon
         # flag is not merely the *best* diagnosis, it is the only one: without

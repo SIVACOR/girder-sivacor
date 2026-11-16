@@ -192,9 +192,9 @@ def test_unquoted_scalars_are_read_as_the_text_written(server, cache):
     """safe_load reads 2026-08-12 as a date (which broke the JSON cache) and
     4.10 as the float 4.1 -- allow-listing a tag the file never named."""
     Setting().set(PluginSettings.IMAGE_TAGS_URL, FORK)
-    with _serve({FORK: "dataeditors/stata19-mp:\n- 2026-08-12\nrocker/r-ver:\n- 4.10\n"}):
+    with _serve({FORK: "sscng/stata19-mp:\n- 2026-08-12\nrocker/r-ver:\n- 4.10\n"}):
         tags = SIVACOR._get_tags()
-    assert tags == {"dataeditors/stata19-mp": ["2026-08-12"], "rocker/r-ver": ["4.10"]}
+    assert tags == {"sscng/stata19-mp": ["2026-08-12"], "rocker/r-ver": ["4.10"]}
     assert json.loads(cache.read_text())["tags"] == tags
 
 

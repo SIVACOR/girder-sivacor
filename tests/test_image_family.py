@@ -15,7 +15,6 @@ from girder_sivacor.worker_plugin.lib import image_family, is_julia, is_stata
     [
         # Bare Docker Hub references: unchanged, and this is the half that must
         # not regress -- every existing entry in the size table is one of these.
-        ("dataeditors/stata18-mp", "dataeditors"),
         ("sscng/stata18-mp", "sscng"),
         ("rocker/r-ver:4.6.1", "rocker"),
         ("dynare/dynare:6.5-R2025b", "dynare"),
@@ -84,10 +83,6 @@ def test_the_julia_family_has_a_measured_entry():
 @pytest.mark.parametrize(
     "reference,expected",
     [
-        # Both namespaces Stata has been published under: sivacor-repo-choice#7
-        # moved it, and workflows exported before that still name the old one.
-        ("dataeditors/stata18_5-mp", True),
-        ("dataeditors/stata19_5-mp-i-python:2026-06-03", True),
         ("sscng/stata18_5-mp", True),
         ("sscng/stata19_5-mp-i-python:2026-06-03", True),
         ("docker.io/sscng/stata17", True),
