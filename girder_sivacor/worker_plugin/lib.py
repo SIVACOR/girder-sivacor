@@ -781,17 +781,18 @@ class LogRelay:
             pass
 
 
-#: Docker Hub namespaces the Stata images have been published under.
-#: ``dataeditors`` is the original; upstream moved to ``sscng`` in 2026-11
-#: (SIVACOR/sivacor-repo-choice#7). Both stay: workflows exported before the
-#: move still name ``dataeditors``, and that namespace remains on Docker Hub.
-#: The tags were re-pushed rather than mirrored -- the same tag carries a
-#: different digest in each -- so the two are not interchangeable in a TRO.
-STATA_NAMESPACES = frozenset({"dataeditors", "sscng"})
+#: Docker Hub namespaces the Stata images are published under. Upstream moved
+#: them from ``dataeditors`` to ``sscng`` in 2026-11
+#: (SIVACOR/sivacor-repo-choice#7), and the old namespace is no longer
+#: recognised: the allow-list names only ``sscng``, so a ``dataeditors`` image
+#: is refused at submission anyway, and the submission UI rewrites the old
+#: name on import (``movedImageName`` in aea-sivacor). A set rather than a
+#: single string so that the next move is a one-line change here.
+STATA_NAMESPACES = frozenset({"sscng"})
 
 
 def is_stata(image_reference: str) -> bool:
-    """Whether this is a Stata image, in either namespace it has lived in.
+    """Whether this is a Stata image, in a namespace it is published under.
 
     The one definition: the license mount, the main-file quoting, the entrypoint
     and the exit-0 ``r(NNN)`` check all key on it, and a second spelling of it
@@ -1457,10 +1458,10 @@ def disk_shortfall(submission) -> str | None:
 #: whole image download later, and the cost of over-estimating is a fast refusal.
 #: Catching it early is worth more than it used to be.
 #:
-#: **All three families are now measured** (dataeditors added 2026-08-22, same
+#: **All three families are now measured** (Stata added 2026-08-22, same
 #: method, same gate). 3.5 covers dynare's 3.41 -- the family responsible for every
 #: ENOSPC failure here and the one with by far the largest absolute error -- and
-#: dataeditors' 3.01-3.33, with a small margin over each. It sits 0.19 below rocker's
+#: Stata's 3.01-3.33, with a small margin over each. It sits 0.19 below rocker's
 #: 3.69, where that gap is 0.06 GiB of a 1.26 GiB image and cannot decide anything.
 #:
 #: Note the ratio *falls* as an image grows (3.69 -> 3.33 -> 3.01 -> 3.41), because
@@ -1506,8 +1507,9 @@ def _is_out_of_space(error_text) -> bool:
 #: Measured, not guessed: ``dynare/dynare:6.1-R2024a`` 6.2, ``:5.5-R2023a`` 6.3,
 #: ``rocker/geospatial:4.3.2`` 1.5, ``rocker/r-ver:4.6.1`` 0.3,
 #: ``dataeditors/stata19-mp:2026-06-03`` 0.5, ``dataeditors/stata16:2023-06-13``
-#: 0.4. Each entry below takes the **largest** tag seen in that family, because
-#: the check's job is to catch the case that will not fit.
+#: 0.4 (Stata was then published as ``dataeditors``). Each entry below takes the
+#: **largest** tag seen in that family, because the check's job is to catch the
+#: case that will not fit.
 #:
 #: **The spread is the point, and it is why only one family has ever caused this
 #: failure.** dynare is ~5x a Stata image on disk: 6.2 GiB against ~1.2 GiB. All
@@ -1517,7 +1519,7 @@ def _is_out_of_space(error_text) -> bool:
 #: **Refined 2026-08-22 (C5.3), and the multiplier survives the scrutiny.** Measured
 #: unpack ratios, same tag on both sides: dynare 6.16 GiB compressed -> 6.21 GiB
 #: unpacked (**1.01x** -- an already-compressed MATLAB runtime), rocker/r-ver 2.58x,
-#: dataeditors 2.26-2.82x. Taken alone that made 2.5x look 2.5x too pessimistic for
+#: Stata 2.26-2.82x. Taken alone that made 2.5x look 2.5x too pessimistic for
 #: dynare, and a per-family ratio looked like the fix.
 #:
 #: **It is not, because the fleet keeps both copies.** Workers install docker.io 29,
@@ -1544,7 +1546,7 @@ _IMAGE_FAMILY_COMPRESSED_GB = {
     "rocker": 1.5,
     # 0.9, not the 0.5 this held until 2026-08-22. The table's own rule is "the
     # largest tag seen in that family", and 0.5 had stopped satisfying it:
-    # dataeditors/stata19_5-mp-i-python:2026-06-03 is 0.89 GiB compressed, so the
+    # stata19_5-mp-i-python:2026-06-03 is 0.89 GiB compressed, so the
     # family's biggest image was being estimated at 1.75 GiB against a measured
     # 2.68 GiB footprint. Small in absolute terms against a 5 GiB floor, and the
     # same class of error as the multiplier it multiplies.
@@ -1552,10 +1554,10 @@ _IMAGE_FAMILY_COMPRESSED_GB = {
     # The cost of the correction is over-estimating the *smaller* Stata images by
     # ~1.3 GiB, which is affordable precisely because Stata footprints are small:
     # the check has ~6 GiB of slack in the cases where a Stata pull is decided.
-    "dataeditors": 0.9,
-    # The same images re-pushed under the namespace upstream moved to (see
-    # STATA_NAMESPACES). Checked 2026-11-07: sscng/stata19_5-mp-i-python:2026-06-03
-    # is 0.89 GiB compressed, identical to its dataeditors twin.
+    #
+    # Measured under ``dataeditors``, the namespace Stata was published under
+    # then (see STATA_NAMESPACES); rechecked 2026-11-07 under ``sscng``, where
+    # the same tag is 0.89 GiB too.
     "sscng": 0.9,
     # SIVACOR's own Julia images, keyed on the namespace after image_family()
     # strips the ``ghcr.io`` host -- see that function for why the host must go.
@@ -1586,7 +1588,7 @@ _IMAGE_FAMILY_COMPRESSED_GB = {
 def image_family(image_reference: str) -> str:
     """The namespace key :data:`_IMAGE_FAMILY_COMPRESSED_GB` is keyed by.
 
-    A bare Docker Hub reference starts with its namespace -- ``dataeditors``,
+    A bare Docker Hub reference starts with its namespace -- ``sscng``,
     ``rocker``, ``dynare`` -- but a registry-qualified one starts with the
     *host*, so ``ghcr.io/sivacor/julia1.11`` would key on ``ghcr.io``: a
     registry, not a family. An entry under that key would then claim to know the
@@ -2194,7 +2196,7 @@ def prefetch_images(cli, api, submission, checkin=None) -> bool:
       that actually exists before the workspace has grown -- see
       :func:`image_set_shortfall`;
     * each stage's recorded ``ImageRepoDigests`` is identical **by
-      construction**. ``rocker`` and ``dataeditors`` tags are mutable upstream,
+      construction**. ``rocker`` and Stata tags are mutable upstream,
       unlike the immutable-tag discipline SIVACOR holds itself to for its own
       images (10-D11), and re-pulling before each stage is the only thing that
       can make two stages of one run record different digests for the same

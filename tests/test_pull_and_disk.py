@@ -1011,7 +1011,7 @@ def test_a_full_volume_is_not_told_to_ask_for_a_volume():
 # --- C5.3: why the flat 2.5x multiplier stays -------------------------------
 #
 # Measured 2026-08-22, same tag on both sides: dynare 6.16 GiB compressed -> 6.21
-# unpacked (1.01x), rocker/r-ver 2.58x, dataeditors 2.26-2.82x. On those numbers
+# unpacked (1.01x), rocker/r-ver 2.58x, Stata 2.26-2.82x. On those numbers
 # alone 2.5x looks 2.5x too pessimistic for dynare, and a per-family ratio looks
 # like the fix -- it was written, and then reverted, because the fleet keeps both
 # copies: docker.io 29's containerd image store retains the compressed blobs *and*
@@ -1039,11 +1039,11 @@ def test_the_unpack_multiplier_is_flat_across_families():
 def test_the_family_entry_is_the_largest_image_in_that_family():
     """The table's stated rule, pinned because it stopped being true unnoticed.
 
-    `dataeditors` held 0.5 GiB while its largest image, stata19_5-mp-i-python, is
+    The Stata entry held 0.5 GiB while its largest image, stata19_5-mp-i-python, is
     0.89 GiB compressed -- so the family's biggest member was under-estimated by
     1.8x. Measured footprints for the family are 1.73 and 2.68 GiB.
     """
-    assert _IMAGE_FAMILY_COMPRESSED_GB["dataeditors"] >= 0.89
+    assert _IMAGE_FAMILY_COMPRESSED_GB["sscng"] >= 0.89
     assert _IMAGE_FAMILY_COMPRESSED_GB["dynare"] >= 6.16
     assert _IMAGE_FAMILY_COMPRESSED_GB["rocker"] >= 1.4
 

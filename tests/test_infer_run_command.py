@@ -35,7 +35,7 @@ def test_infer_run_command_main_file_not_found(submission_dir):
     Test that _infer_run_command reports a missing main file.
     """
     submission = {"workspace_dir": str(submission_dir)}
-    stage = {"image_name": "dataeditors/stata", "main_file": "nonexistent.do"}
+    stage = {"image_name": "sscng/stata", "main_file": "nonexistent.do"}
 
     with pytest.raises(
         SubmissionError,

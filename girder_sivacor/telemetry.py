@@ -52,7 +52,7 @@ _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 #: ``_MAX_TEXT``, so ``_matching``'s cap applies unchanged.
 _EXCEPTION_TYPE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*){0,8}$")
 
-#: A docker image reference without its tag (``dataeditors/stata18_5-mp``).
+#: A docker image reference without its tag (``sscng/stata18_5-mp``).
 #: Anchored and slash-bounded, so an absolute path or one containing ``..``
 #: cannot pass as one. A *relative* all-lowercase path would still match the
 #: shape -- this pattern is not what rules that out. What does is that image
