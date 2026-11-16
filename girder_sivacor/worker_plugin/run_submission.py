@@ -39,6 +39,7 @@ from .lib import (
     find_named_files,
     get_project_dir,
     is_julia,
+    is_r,
     performance_data_name,
     prefetch_images,
     reap_orphaned_containers,
@@ -856,7 +857,7 @@ def create_workspace(task, api, submission):
     _matlab_perms(project_dir, uid=1001)
     # Ensure R library directory for user install.packages exists
     for stage in submission.get("stages", []):
-        if stage["image_name"].startswith("rocker/"):
+        if is_r(stage["image_name"]):
             os.makedirs(os.path.join(workspace_dir, "R", "library"), exist_ok=True)
         # The Julia depot, for the same reason and in the same place: a sibling
         # of project/, never inside it. Arrangements are built by walking

@@ -821,6 +821,36 @@ def is_julia(image_reference: str) -> bool:
     return image_reference.startswith("ghcr.io/sivacor/julia")
 
 
+def is_r(image_reference: str) -> bool:
+    return image_reference.startswith("rocker/")
+
+
+def image_software(image_reference: str) -> list[str]:
+    """What a researcher would say this image runs, for labelling it in a picker.
+
+    Built on the same predicates that pick the entrypoint, so the label cannot
+    disagree with how the image is actually run: an image none of them
+    recognise gets ``[]``, and :func:`_infer_run_command` would refuse it with
+    ``NO_ENTRYPOINT`` too.
+
+    ``python`` is the one entry with no run-time meaning -- an ``-i-python``
+    image is still run through ``stata-mp``, and nothing in the worker cares
+    that Python is installed beside it. It is here only so the label says so.
+    """
+    if is_stata(image_reference):
+        software = ["stata"]
+        if image_reference.endswith("-i-python"):
+            software.append("python")
+        return software
+    if is_r(image_reference):
+        return ["r"]
+    if is_matlab(image_reference):
+        return ["matlab"]
+    if is_julia(image_reference):
+        return ["julia"]
+    return []
+
+
 def performance_data_name(stage_num: int) -> str:
     """Filename for a stage's performance data in the submission folder.
 
@@ -1037,11 +1067,11 @@ def _infer_run_command(submission, stage):
     # Determine entrypoint based on image
     image_name = stage["image_name"]
     home_dir = "/workspace"
-    if image_name.startswith("rocker"):
+    if is_r(image_name):
         entrypoint = ["/usr/local/bin/R", "--no-save", "--no-restore", "-f"]
     elif is_stata(image_name):
         entrypoint = ["/usr/local/stata/stata-mp", "-b", "do"]
-    elif image_name.startswith("dynare"):
+    elif is_matlab(image_name):
         entrypoint = ["/usr/local/bin/matlab", "-batch"]
         home_dir = "/home/matlab"
     elif is_julia(image_name):
@@ -1106,7 +1136,7 @@ def _infer_run_command(submission, stage):
             sub_dir = str(relative_paths[0].parent)
         command = str(relative_paths[0].name)
 
-    if image_name.startswith("dynare"):
+    if is_matlab(image_name):
         # For MATLAB, the command is just the main file name without extension
         command = os.path.splitext(command)[0]
 
